@@ -1,5 +1,7 @@
 # mmux Design
 
+[简体中文设计文档](design.zh-CN.md)
+
 mmux is not a smarter agent. It is a deterministic supervisor for multiple
 coding-agent workers.
 

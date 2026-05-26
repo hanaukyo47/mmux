@@ -119,4 +119,4 @@ mmux 现在可以安全地执行少量明确任务，但还不是成熟的无人
 - checkpoint / commit / rollback 策略。
 - `mmux run --minutes N` 这类顶层长跑入口。
 
-更多架构说明见 [docs/design.md](docs/design.md)。
+更多架构说明见 [中文设计文档](docs/design.zh-CN.md)，英文版见 [docs/design.md](docs/design.md)。
