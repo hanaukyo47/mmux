@@ -17,12 +17,16 @@ This repository starts as the control-plane skeleton:
 - `mmux start` creates a four-pane tmux workspace for supervisor, Codex worker,
   Claude worker, and logs.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
+- `mmux tasks` prints the deterministic task queue.
 - `mmux roles` prints role leases and worker heartbeats.
+- `mmux locks` prints resource locks.
 - `mmux lease acquire/release` exercises deterministic role leasing.
+- `mmux lock acquire/release` exercises deterministic resource locking.
 
-The current worker adapter records heartbeat and role-lease state, but it still
-does not let agents edit code. Real model adapters come after resource locks and
-policy checks are in place.
+By default, workers record heartbeat and lease state without editing code. Use
+`mmux start --execute-agents` to allow the worker holding `driver` to claim a
+pending task, acquire its resource lock, and run Codex or Claude Code
+non-interactively.
 
 ## Install For Local Development
 
@@ -46,11 +50,17 @@ PYTHONPATH=src python3 -m mmux.cli doctor
 mmux init /path/to/project --task "Improve this project continuously"
 mmux doctor
 mmux start /path/to/project
+mmux start /path/to/project --execute-agents
 mmux attach /path/to/project
 mmux status /path/to/project
+mmux tasks /path/to/project
+mmux task add "Add focused tests" --resource tests --project /path/to/project
 mmux roles /path/to/project
+mmux locks /path/to/project
 mmux lease acquire scout --agent codex --project /path/to/project
 mmux lease release scout --agent codex --project /path/to/project
+mmux lock acquire src --agent codex --project /path/to/project
+mmux lock release src --agent codex --project /path/to/project
 mmux stop /path/to/project
 ```
 

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import datetime as dt
 import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import shutil
+import select
 import sqlite3
 import subprocess
 import sys
@@ -18,9 +21,11 @@ from typing import Iterable, Optional
 ROLES = ("driver", "reviewer", "scout", "tester", "summarizer")
 AGENTS = ("codex", "claude")
 ROLE_LEASE_TTL_SECONDS = 2 * 60
+RESOURCE_LOCK_TTL_SECONDS = 10 * 60
 WORKER_REFRESH_SECONDS = 5
 SUPERVISOR_TICK_SECONDS = 30
 SUPERVISOR_ASSIGNMENT_SECONDS = 5 * 60
+AGENT_TIMEOUT_SECONDS = 20 * 60
 ASSIGNMENT_ROLE_PAIRS = (
     ("scout", "reviewer"),
     ("driver", "tester"),
@@ -39,6 +44,37 @@ class LeaseOutcome:
     lease_until: str
     status: str
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class LockOutcome:
+    ok: bool
+    resource: str
+    holder: str
+    mode: str
+    lease_until: str
+    status: str
+    reason: str = ""
+    conflict_resource: str = ""
+
+
+@dataclass(frozen=True)
+class TaskRecord:
+    id: int
+    title: str
+    status: str
+    payload: dict[str, object]
+    claimed_by: str = ""
+    claimed_role: str = ""
+    claimed_generation: int = 0
+
+
+@dataclass(frozen=True)
+class AdapterResult:
+    ok: bool
+    returncode: int
+    log_file: str
+    message: str
 
 
 def utc_now_dt() -> dt.datetime:
@@ -114,6 +150,25 @@ def connect(project: Path) -> sqlite3.Connection:
     return sqlite3.connect(state_path(project), timeout=30)
 
 
+@contextmanager
+def database(project: Path) -> Iterable[sqlite3.Connection]:
+    db = connect(project)
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def ensure_column(db: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    columns = {row[1] for row in db.execute(f"pragma table_info({table})").fetchall()}
+    if column not in columns:
+        db.execute(f"alter table {table} add column {column} {declaration}")
+
+
 def apply_schema(db: sqlite3.Connection) -> None:
     db.executescript(
         """
@@ -128,7 +183,13 @@ def apply_schema(db: sqlite3.Connection) -> None:
           status text not null,
           payload text not null default '{}',
           created_at text not null,
-          updated_at text not null
+          updated_at text not null,
+          claimed_by text not null default '',
+          claimed_role text not null default '',
+          claimed_generation integer not null default 0,
+          claimed_at text not null default '',
+          finished_at text not null default '',
+          last_error text not null default ''
         );
 
         create table if not exists role_leases (
@@ -152,7 +213,10 @@ def apply_schema(db: sqlite3.Connection) -> None:
           resource text primary key,
           holder text not null,
           mode text not null,
-          lease_until text not null
+          lease_until text not null,
+          role text not null default '',
+          role_generation integer not null default 0,
+          status text not null default 'active'
         );
 
         create table if not exists events (
@@ -172,11 +236,20 @@ def apply_schema(db: sqlite3.Connection) -> None:
         );
         """
     )
+    ensure_column(db, "tasks", "claimed_by", "text not null default ''")
+    ensure_column(db, "tasks", "claimed_role", "text not null default ''")
+    ensure_column(db, "tasks", "claimed_generation", "integer not null default 0")
+    ensure_column(db, "tasks", "claimed_at", "text not null default ''")
+    ensure_column(db, "tasks", "finished_at", "text not null default ''")
+    ensure_column(db, "tasks", "last_error", "text not null default ''")
+    ensure_column(db, "resource_locks", "role", "text not null default ''")
+    ensure_column(db, "resource_locks", "role_generation", "integer not null default 0")
+    ensure_column(db, "resource_locks", "status", "text not null default 'active'")
 
 
 def ensure_existing_schema(project: Path) -> None:
     require_project_state(project)
-    with connect(project) as db:
+    with database(project) as db:
         apply_schema(db)
 
 
@@ -191,6 +264,7 @@ def ensure_layout(project: Path, task: str = "") -> None:
     root = mmux_dir(project)
     (root / "logs").mkdir(parents=True, exist_ok=True)
     (root / "sessions").mkdir(parents=True, exist_ok=True)
+    (root / "runs").mkdir(parents=True, exist_ok=True)
     (root / "inbox").mkdir(parents=True, exist_ok=True)
 
     config = {
@@ -215,7 +289,7 @@ def ensure_layout(project: Path, task: str = "") -> None:
     if not config_path(project).exists():
         config_path(project).write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
-    with connect(project) as db:
+    with database(project) as db:
         apply_schema(db)
         db.execute(
             "insert or replace into meta(key, value) values (?, ?)",
@@ -226,11 +300,7 @@ def ensure_layout(project: Path, task: str = "") -> None:
             ("session_name", session_name(project)),
         )
         if task:
-            now = utc_now()
-            db.execute(
-                "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
-                (task, "pending", "{}", now, now),
-            )
+            enqueue_task_db(db, task, resource=".")
         record_event(db, "init", {"task": task})
 
 
@@ -242,6 +312,55 @@ def validate_role(role: str) -> None:
 def validate_agent(agent: str) -> None:
     if agent not in AGENTS:
         raise ValueError(f"unknown agent: {agent}")
+
+
+def validate_lock_mode(mode: str) -> None:
+    if mode != "write":
+        raise ValueError(f"unknown lock mode: {mode}")
+
+
+def decode_payload(payload: str) -> dict[str, object]:
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def encode_payload(payload: dict[str, object]) -> str:
+    return json.dumps(payload, sort_keys=True)
+
+
+def normalize_resource(project: Path, resource: str) -> str:
+    value = resource.strip()
+    if not value:
+        raise ValueError("resource must not be empty")
+    raw_path = Path(value)
+    candidate = raw_path if raw_path.is_absolute() else project / raw_path
+    resolved_project = project.resolve()
+    resolved_candidate = candidate.resolve(strict=False)
+    try:
+        relative = resolved_candidate.relative_to(resolved_project)
+    except ValueError as exc:
+        raise ValueError(f"resource escapes project: {resource}") from exc
+    normalized = relative.as_posix()
+    return normalized or "."
+
+
+def resource_parts(resource: str) -> tuple[str, ...]:
+    if resource == ".":
+        return ()
+    return tuple(part for part in PurePosixPath(resource).parts if part and part != ".")
+
+
+def resource_is_prefix(prefix: str, resource: str) -> bool:
+    prefix_parts = resource_parts(prefix)
+    resource_parts_value = resource_parts(resource)
+    return len(prefix_parts) <= len(resource_parts_value) and resource_parts_value[: len(prefix_parts)] == prefix_parts
+
+
+def resources_overlap(left: str, right: str) -> bool:
+    return resource_is_prefix(left, right) or resource_is_prefix(right, left)
 
 
 def expire_role_leases_db(db: sqlite3.Connection, now: dt.datetime) -> None:
@@ -414,7 +533,7 @@ def release_role(
 
 
 def list_role_leases(project: Path) -> list[tuple[str, str, int, str, str]]:
-    with connect(project) as db:
+    with database(project) as db:
         apply_schema(db)
         expire_role_leases_db(db, utc_now_dt())
         return db.execute(
@@ -424,7 +543,7 @@ def list_role_leases(project: Path) -> list[tuple[str, str, int, str, str]]:
 
 def active_roles_for_agent(project: Path, agent: str) -> list[tuple[str, int, str]]:
     validate_agent(agent)
-    with connect(project) as db:
+    with database(project) as db:
         apply_schema(db)
         expire_role_leases_db(db, utc_now_dt())
         return db.execute(
@@ -438,6 +557,248 @@ def active_roles_for_agent(project: Path, agent: str) -> list[tuple[str, int, st
         ).fetchall()
 
 
+def active_role_matches_db(
+    db: sqlite3.Connection,
+    role: str,
+    holder: str,
+    generation: Optional[int] = None,
+) -> bool:
+    row = db.execute(
+        """
+        select generation
+        from role_leases
+        where role = ? and holder = ? and status = ?
+        """,
+        (role, holder, "active"),
+    ).fetchone()
+    if not row:
+        return False
+    return generation is None or row[0] == generation
+
+
+def expire_resource_locks_db(db: sqlite3.Connection, now: dt.datetime) -> None:
+    db.execute(
+        "update resource_locks set status = ? where status = ? and lease_until <= ?",
+        ("expired", "active", format_utc(now)),
+    )
+
+
+def acquire_resource_lock(
+    project: Path,
+    resource: str,
+    holder: str,
+    ttl_seconds: int = RESOURCE_LOCK_TTL_SECONDS,
+    *,
+    mode: str = "write",
+    role: str = "",
+    role_generation: int = 0,
+    renew_if_same: bool = False,
+) -> LockOutcome:
+    validate_agent(holder)
+    validate_lock_mode(mode)
+    if role:
+        validate_role(role)
+    normalized = normalize_resource(project, resource)
+    now = utc_now_dt()
+    lease_until = format_utc(now + dt.timedelta(seconds=ttl_seconds))
+
+    db = connect(project)
+    try:
+        db.execute("begin immediate")
+        apply_schema(db)
+        expire_role_leases_db(db, now)
+        expire_resource_locks_db(db, now)
+        if role and role_generation <= 0:
+            db.rollback()
+            return LockOutcome(
+                False,
+                normalized,
+                holder,
+                mode,
+                "",
+                "stale_role",
+                f"{holder} must provide a positive {role} generation",
+            )
+        if role and not active_role_matches_db(db, role, holder, role_generation):
+            db.rollback()
+            return LockOutcome(
+                False,
+                normalized,
+                holder,
+                mode,
+                "",
+                "stale_role",
+                f"{holder} does not hold active {role} lease generation {role_generation}",
+            )
+
+        locks = db.execute(
+            """
+            select resource, holder, mode, lease_until, role, role_generation
+            from resource_locks
+            where status = ?
+            order by resource
+            """,
+            ("active",),
+        ).fetchall()
+        for current_resource, current_holder, current_mode, current_until, current_role, current_generation in locks:
+            if not resources_overlap(normalized, current_resource):
+                continue
+            if current_holder == holder and current_resource != normalized:
+                continue
+            if current_holder == holder and renew_if_same:
+                db.execute(
+                    """
+                    update resource_locks
+                    set lease_until = ?, mode = ?, role = ?, role_generation = ?, status = ?
+                    where resource = ?
+                    """,
+                    (
+                        lease_until,
+                        mode,
+                        role or current_role,
+                        role_generation or current_generation,
+                        "active",
+                        current_resource,
+                    ),
+                )
+                record_event(
+                    db,
+                    "resource_lock_renewed",
+                    {
+                        "resource": current_resource,
+                        "holder": holder,
+                        "mode": mode,
+                        "lease_until": lease_until,
+                    },
+                )
+                db.commit()
+                return LockOutcome(True, current_resource, holder, mode, lease_until, "renewed")
+            db.rollback()
+            return LockOutcome(
+                False,
+                normalized,
+                current_holder,
+                current_mode,
+                current_until,
+                "conflict",
+                f"{normalized} overlaps active lock {current_resource}",
+                conflict_resource=current_resource,
+            )
+
+        db.execute(
+            """
+            insert into resource_locks(resource, holder, mode, lease_until, role, role_generation, status)
+            values (?, ?, ?, ?, ?, ?, ?)
+            on conflict(resource) do update set
+              holder = excluded.holder,
+              mode = excluded.mode,
+              lease_until = excluded.lease_until,
+              role = excluded.role,
+              role_generation = excluded.role_generation,
+              status = excluded.status
+            """,
+            (normalized, holder, mode, lease_until, role, role_generation, "active"),
+        )
+        record_event(
+            db,
+            "resource_lock_acquired",
+            {
+                "resource": normalized,
+                "holder": holder,
+                "mode": mode,
+                "role": role,
+                "role_generation": role_generation,
+                "lease_until": lease_until,
+            },
+        )
+        db.commit()
+        return LockOutcome(True, normalized, holder, mode, lease_until, "acquired")
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def release_resource_lock(
+    project: Path,
+    resource: str,
+    *,
+    holder: Optional[str] = None,
+) -> LockOutcome:
+    if holder is not None:
+        validate_agent(holder)
+    normalized = normalize_resource(project, resource)
+
+    db = connect(project)
+    try:
+        db.execute("begin immediate")
+        apply_schema(db)
+        expire_resource_locks_db(db, utc_now_dt())
+        row = db.execute(
+            "select holder, mode, lease_until, status from resource_locks where resource = ?",
+            (normalized,),
+        ).fetchone()
+        if not row:
+            db.rollback()
+            return LockOutcome(False, normalized, holder or "", "", "", "missing", f"{normalized} is not locked")
+
+        current_holder, mode, lease_until, status = row
+        if status != "active":
+            db.rollback()
+            return LockOutcome(
+                False,
+                normalized,
+                current_holder,
+                mode,
+                lease_until,
+                status,
+                f"{normalized} is not active",
+            )
+        if holder is not None and holder != current_holder:
+            db.rollback()
+            return LockOutcome(
+                False,
+                normalized,
+                current_holder,
+                mode,
+                lease_until,
+                "conflict",
+                f"{normalized} is held by {current_holder}",
+            )
+
+        db.execute("update resource_locks set status = ? where resource = ?", ("released", normalized))
+        record_event(
+            db,
+            "resource_lock_released",
+            {
+                "resource": normalized,
+                "holder": current_holder,
+                "mode": mode,
+            },
+        )
+        db.commit()
+        return LockOutcome(True, normalized, current_holder, mode, lease_until, "released")
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def list_resource_locks(project: Path) -> list[tuple[str, str, str, str, str, int, str]]:
+    with database(project) as db:
+        apply_schema(db)
+        expire_resource_locks_db(db, utc_now_dt())
+        return db.execute(
+            """
+            select resource, holder, mode, lease_until, role, role_generation, status
+            from resource_locks
+            order by resource
+            """
+        ).fetchall()
+
+
 def update_worker_heartbeat(
     project: Path,
     agent: str,
@@ -447,7 +808,7 @@ def update_worker_heartbeat(
     generation: Optional[int] = None,
 ) -> None:
     validate_agent(agent)
-    with connect(project) as db:
+    with database(project) as db:
         apply_schema(db)
         db.execute(
             """
@@ -465,11 +826,146 @@ def update_worker_heartbeat(
 
 
 def list_worker_heartbeats(project: Path) -> list[tuple[str, int, str, Optional[str], Optional[int], str]]:
-    with connect(project) as db:
+    with database(project) as db:
         apply_schema(db)
         return db.execute(
             "select agent, pid, status, role, generation, updated_at from worker_heartbeats order by agent"
         ).fetchall()
+
+
+def enqueue_task_db(db: sqlite3.Connection, title: str, *, resource: str = ".") -> int:
+    now = utc_now()
+    payload = encode_payload({"resource": resource})
+    cursor = db.execute(
+        """
+        insert into tasks(title, status, payload, created_at, updated_at)
+        values (?, ?, ?, ?, ?)
+        """,
+        (title, "pending", payload, now, now),
+    )
+    task_id = int(cursor.lastrowid)
+    record_event(db, "task_added", {"id": task_id, "title": title, "resource": resource})
+    return task_id
+
+
+def enqueue_task(project: Path, title: str, *, resource: str = ".") -> int:
+    normalized = normalize_resource(project, resource)
+    with database(project) as db:
+        apply_schema(db)
+        return enqueue_task_db(db, title, resource=normalized)
+
+
+def task_from_row(row: tuple[object, ...]) -> TaskRecord:
+    return TaskRecord(
+        id=int(row[0]),
+        title=str(row[1]),
+        status=str(row[2]),
+        payload=decode_payload(str(row[3])),
+        claimed_by=str(row[4] or ""),
+        claimed_role=str(row[5] or ""),
+        claimed_generation=int(row[6] or 0),
+    )
+
+
+def list_tasks(project: Path) -> list[TaskRecord]:
+    with database(project) as db:
+        apply_schema(db)
+        rows = db.execute(
+            """
+            select id, title, status, payload, claimed_by, claimed_role, claimed_generation
+            from tasks
+            order by id
+            """
+        ).fetchall()
+        return [task_from_row(row) for row in rows]
+
+
+def claim_next_task(project: Path, agent: str, role: str, generation: int) -> Optional[TaskRecord]:
+    validate_agent(agent)
+    validate_role(role)
+    db = connect(project)
+    try:
+        db.execute("begin immediate")
+        apply_schema(db)
+        expire_role_leases_db(db, utc_now_dt())
+        if not active_role_matches_db(db, role, agent, generation):
+            db.rollback()
+            return None
+        row = db.execute(
+            """
+            select id, title, status, payload, claimed_by, claimed_role, claimed_generation
+            from tasks
+            where status = ?
+            order by id
+            limit 1
+            """,
+            ("pending",),
+        ).fetchone()
+        if not row:
+            db.rollback()
+            return None
+        task = task_from_row(row)
+        now = utc_now()
+        db.execute(
+            """
+            update tasks
+            set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?,
+                claimed_at = ?, updated_at = ?, last_error = ''
+            where id = ? and status = ?
+            """,
+            ("running", agent, role, generation, now, now, task.id, "pending"),
+        )
+        record_event(
+            db,
+            "task_claimed",
+            {"id": task.id, "agent": agent, "role": role, "generation": generation},
+        )
+        db.commit()
+        return TaskRecord(task.id, task.title, "running", task.payload, agent, role, generation)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def release_task_claim(project: Path, task_id: int, reason: str) -> None:
+    with database(project) as db:
+        apply_schema(db)
+        now = utc_now()
+        db.execute(
+            """
+            update tasks
+            set status = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
+                claimed_at = '', updated_at = ?, last_error = ?
+            where id = ? and status = ?
+            """,
+            ("pending", now, reason, task_id, "running"),
+        )
+        record_event(db, "task_requeued", {"id": task_id, "reason": reason})
+
+
+def finish_task(project: Path, task_id: int, status: str, *, message: str = "", log_file: str = "") -> None:
+    if status not in {"completed", "failed"}:
+        raise ValueError(f"unknown task terminal status: {status}")
+    with database(project) as db:
+        apply_schema(db)
+        row = db.execute("select payload from tasks where id = ?", (task_id,)).fetchone()
+        payload = decode_payload(row[0]) if row else {}
+        if log_file:
+            payload["last_run_log"] = log_file
+        if message:
+            payload["last_message"] = message[:2000]
+        now = utc_now()
+        db.execute(
+            """
+            update tasks
+            set status = ?, payload = ?, updated_at = ?, finished_at = ?, last_error = ?
+            where id = ?
+            """,
+            (status, encode_payload(payload), now, now, "" if status == "completed" else message, task_id),
+        )
+        record_event(db, "task_finished", {"id": task_id, "status": status, "log_file": log_file})
 
 
 def write_log(project: Path, message: str) -> None:
@@ -493,6 +989,138 @@ def run(cmd: Iterable[str], *, cwd: Optional[Path] = None, check: bool = True) -
         stderr=subprocess.PIPE,
         check=check,
     )
+
+
+def run_log_path(project: Path, agent: str, task_id: int) -> Path:
+    stamp = utc_now().replace(":", "").replace("+", "Z")
+    path = mmux_dir(project) / "runs" / f"{stamp}-{agent}-task-{task_id}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def relative_to_project(project: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(project.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def build_agent_prompt(agent: str, task: TaskRecord, role_generation: int, resource: str) -> str:
+    return "\n".join(
+        [
+            f"You are the {agent} worker running under mmux.",
+            "",
+            "The mmux supervisor is deterministic and has already granted you:",
+            f"- role: driver",
+            f"- role generation: {role_generation}",
+            f"- resource lock: {resource}",
+            "",
+            f"Task #{task.id}: {task.title}",
+            "",
+            "Work only inside this repository. Keep the change scoped to the task and the locked resource.",
+            "Do not start a long-running service. Run focused tests or checks when practical.",
+            "When done, leave a concise final summary including changed files and verification.",
+        ]
+    )
+
+
+def build_agent_command(agent: str, project: Path, prompt: str, output_file: Path) -> list[str]:
+    if agent == "codex":
+        return [
+            "codex",
+            "exec",
+            "--cd",
+            str(project),
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+            "--output-last-message",
+            str(output_file),
+            prompt,
+        ]
+    if agent == "claude":
+        return [
+            "claude",
+            "-p",
+            "--permission-mode",
+            "acceptEdits",
+            "--output-format",
+            "text",
+            prompt,
+        ]
+    raise ValueError(f"unknown agent: {agent}")
+
+
+def stream_agent_command(
+    project: Path,
+    cmd: list[str],
+    log_file: Path,
+    *,
+    timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+) -> AdapterResult:
+    started = time.monotonic()
+    command_text = " ".join(sh_quote(part) for part in cmd)
+    with log_file.open("w", encoding="utf-8") as handle:
+        handle.write(f"{utc_now()} command: {command_text}\n\n")
+        handle.flush()
+        print(f"running: {command_text}")
+        sys.stdout.flush()
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(project),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        timed_out = False
+        while True:
+            if time.monotonic() - started > timeout_seconds:
+                timed_out = True
+                process.kill()
+            ready, _write, _error = select.select([process.stdout], [], [], 1)
+            if ready:
+                chunk = process.stdout.readline()
+                if chunk:
+                    print(chunk, end="")
+                    handle.write(chunk)
+                    handle.flush()
+                    sys.stdout.flush()
+            returncode = process.poll()
+            if returncode is not None:
+                rest = process.stdout.read()
+                if rest:
+                    print(rest, end="")
+                    handle.write(rest)
+                break
+            if timed_out:
+                process.wait()
+                break
+        process.stdout.close()
+        returncode = process.returncode if process.returncode is not None else 124
+        if timed_out:
+            message = f"agent command timed out after {timeout_seconds}s"
+            handle.write(f"\n{utc_now()} {message}\n")
+            return AdapterResult(False, 124, relative_to_project(project, log_file), message)
+        message = f"agent command exited {returncode}"
+        handle.write(f"\n{utc_now()} {message}\n")
+        return AdapterResult(returncode == 0, returncode, relative_to_project(project, log_file), message)
+
+
+def invoke_agent_adapter(project: Path, agent: str, task: TaskRecord, role_generation: int, resource: str) -> AdapterResult:
+    prompt = build_agent_prompt(agent, task, role_generation, resource)
+    log_file = run_log_path(project, agent, task.id)
+    output_file = log_file.with_suffix(".last-message.txt")
+    cmd = build_agent_command(agent, project, prompt, output_file)
+    result = stream_agent_command(project, cmd, log_file)
+    if output_file.exists():
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("\n--- last message ---\n")
+            handle.write(output_file.read_text(encoding="utf-8", errors="replace"))
+            handle.write("\n")
+    return result
 
 
 def tmux_has_session(name: str) -> bool:
@@ -549,12 +1177,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     ensure_existing_schema(project)
-    with connect(project) as db:
+    with database(project) as db:
         apply_schema(db)
         expire_role_leases_db(db, utc_now_dt())
+        expire_resource_locks_db(db, utc_now_dt())
         tasks = db.execute("select status, count(*) from tasks group by status").fetchall()
         leases = db.execute(
             "select role, holder, generation, lease_until, status from role_leases order by role"
+        ).fetchall()
+        locks = db.execute(
+            """
+            select resource, holder, mode, lease_until, role, role_generation, status
+            from resource_locks
+            order by resource
+            """
         ).fetchall()
         heartbeats = db.execute(
             "select agent, pid, status, role, generation, updated_at from worker_heartbeats order by agent"
@@ -575,6 +1211,13 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  {role}: {holder} gen={generation} until={lease_until} status={status}")
     else:
         print("  none")
+    print("resource locks:")
+    if locks:
+        for resource, holder, mode, lease_until, role, role_generation, status in locks:
+            role_text = f" role={role} gen={role_generation}" if role else ""
+            print(f"  {resource}: {holder} mode={mode}{role_text} until={lease_until} status={status}")
+    else:
+        print("  none")
     print("workers:")
     if heartbeats:
         for agent, pid, status, role, generation, updated_at in heartbeats:
@@ -585,6 +1228,33 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("recent events:")
     for kind, created_at in events:
         print(f"  {created_at} {kind}")
+    return 0
+
+
+def cmd_tasks(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_existing_schema(project)
+    tasks = list_tasks(project)
+
+    print(f"project: {project}")
+    print("tasks:")
+    if not tasks:
+        print("  none")
+        return 0
+    for task in tasks:
+        resource = str(task.payload.get("resource", "."))
+        claim = ""
+        if task.claimed_by:
+            claim = f" claimed_by={task.claimed_by} role={task.claimed_role} gen={task.claimed_generation}"
+        print(f"  #{task.id} {task.status} resource={resource}{claim} {task.title}")
+    return 0
+
+
+def cmd_task_add(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_existing_schema(project)
+    task_id = enqueue_task(project, args.title, resource=args.resource)
+    print(f"task added: #{task_id} resource={normalize_resource(project, args.resource)}")
     return 0
 
 
@@ -611,6 +1281,22 @@ def cmd_roles(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_locks(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_existing_schema(project)
+    locks = list_resource_locks(project)
+
+    print(f"project: {project}")
+    print("resource locks:")
+    if not locks:
+        print("  none")
+        return 0
+    for resource, holder, mode, lease_until, role, role_generation, status in locks:
+        role_text = f" role={role} gen={role_generation}" if role else ""
+        print(f"  {resource}: {holder} mode={mode}{role_text} until={lease_until} status={status}")
+    return 0
+
+
 def positive_seconds(value: str) -> int:
     try:
         parsed = int(value)
@@ -618,6 +1304,16 @@ def positive_seconds(value: str) -> int:
         raise argparse.ArgumentTypeError("must be an integer") from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
     return parsed
 
 
@@ -658,6 +1354,48 @@ def cmd_lease_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lock_acquire(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_existing_schema(project)
+    if (args.role is None) != (args.generation is None):
+        raise SystemExit("--role and --generation must be provided together")
+    outcome = acquire_resource_lock(
+        project,
+        args.resource,
+        args.agent,
+        args.ttl,
+        role=args.role or "",
+        role_generation=args.generation if args.generation is not None else 0,
+        renew_if_same=args.renew,
+    )
+    if not outcome.ok:
+        print(f"lock denied: {outcome.reason}")
+        if outcome.conflict_resource:
+            print(f"conflict: {outcome.conflict_resource}")
+        return 2
+    print(
+        f"lock {outcome.status}: resource={outcome.resource} holder={outcome.holder} "
+        f"mode={outcome.mode} until={outcome.lease_until}"
+    )
+    return 0
+
+
+def cmd_lock_release(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_existing_schema(project)
+    outcome = release_resource_lock(project, args.resource, holder=args.agent)
+    if not outcome.ok:
+        print(f"release denied: {outcome.reason}")
+        if outcome.holder:
+            print(
+                f"current: resource={outcome.resource} holder={outcome.holder} "
+                f"mode={outcome.mode} until={outcome.lease_until} status={outcome.status}"
+            )
+        return 2
+    print(f"lock released: resource={outcome.resource} holder={outcome.holder}")
+    return 0
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     ensure_layout(project, args.task or "")
@@ -667,8 +1405,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         return 0
 
     supervisor_cmd = module_command(project, "supervisor")
-    codex_cmd = module_command(project, "worker", "codex")
-    claude_cmd = module_command(project, "worker", "claude")
+    worker_flags = ["--execute-agents"] if args.execute_agents else []
+    codex_cmd = module_command(project, "worker", *worker_flags, "codex")
+    claude_cmd = module_command(project, "worker", *worker_flags, "claude")
     log_cmd = f"mkdir -p .mmux/logs; touch .mmux/logs/supervisor.log; tail -f .mmux/logs/supervisor.log"
 
     run(["tmux", "new-session", "-d", "-s", name, "-c", str(project), supervisor_cmd])
@@ -680,6 +1419,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     write_log(project, f"started tmux session {name}")
     print(f"started tmux session: {name}")
     print(f"attach with: tmux attach -t {name}")
+    if args.execute_agents:
+        print("agent execution: enabled")
     return 0
 
 
@@ -744,6 +1485,55 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     return 0
 
 
+def task_resource(task: TaskRecord) -> str:
+    resource = task.payload.get("resource", ".")
+    return str(resource) if isinstance(resource, str) else "."
+
+
+def execute_driver_task(project: Path, agent: str, generation: int) -> str:
+    task = claim_next_task(project, agent, "driver", generation)
+    if task is None:
+        return "no pending task"
+    resource = task_resource(task)
+    lock = acquire_resource_lock(
+        project,
+        resource,
+        agent,
+        RESOURCE_LOCK_TTL_SECONDS,
+        role="driver",
+        role_generation=generation,
+        renew_if_same=True,
+    )
+    if not lock.ok:
+        release_task_claim(project, task.id, lock.reason)
+        return f"task #{task.id} requeued: {lock.reason}"
+
+    write_log(project, f"{agent} executing task #{task.id} resource={lock.resource}")
+    update_worker_heartbeat(project, agent, "running", role="driver", generation=generation)
+    print(f"executing task #{task.id}: {task.title}")
+    print(f"resource lock: {lock.resource}")
+    sys.stdout.flush()
+    try:
+        try:
+            result = invoke_agent_adapter(project, agent, task, generation, lock.resource)
+        except Exception as exc:
+            message = f"agent adapter failed: {exc}"
+            finish_task(project, task.id, "failed", message=message)
+            write_log(project, f"{agent} failed task #{task.id}: {exc}")
+            return f"task #{task.id} failed: {exc}"
+        finish_task(
+            project,
+            task.id,
+            "completed" if result.ok else "failed",
+            message=result.message,
+            log_file=result.log_file,
+        )
+        write_log(project, f"{agent} finished task #{task.id} ok={result.ok} log={result.log_file}")
+        return f"task #{task.id} {'completed' if result.ok else 'failed'} log={result.log_file}"
+    finally:
+        release_resource_lock(project, lock.resource, holder=agent)
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     agent = args.agent
@@ -772,16 +1562,25 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     f"mmux {agent} worker",
                     f"project: {project}",
                     f"status: {status}",
+                    f"agent execution: {'enabled' if args.execute_agents else 'disabled'}",
                     "role leases:",
                     *role_lines,
                     "",
-                    "adapter: parked until a real model adapter is enabled",
+                    "adapter: driver role executes pending tasks when enabled",
                 ]
             )
             if rendered != last_rendered:
                 print("\033[2J\033[H" + rendered)
                 sys.stdout.flush()
                 last_rendered = rendered
+            if args.execute_agents:
+                driver = next((role for role in roles if role[0] == "driver"), None)
+                if driver:
+                    message = execute_driver_task(project, agent, driver[1])
+                    if message != "no pending task":
+                        print(message)
+                        sys.stdout.flush()
+                        last_rendered = ""
             time.sleep(WORKER_REFRESH_SECONDS)
     except KeyboardInterrupt:
         write_log(project, f"{agent} worker interrupted")
@@ -806,9 +1605,26 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("project", nargs="?", default=".")
     status.set_defaults(func=cmd_status)
 
+    tasks = subparsers.add_parser("tasks", help="show task queue")
+    tasks.add_argument("project", nargs="?", default=".")
+    tasks.set_defaults(func=cmd_tasks)
+
+    task = subparsers.add_parser("task", help="manage tasks")
+    task_subparsers = task.add_subparsers(dest="task_command", required=True)
+
+    task_add = task_subparsers.add_parser("add", help="add a pending task")
+    task_add.add_argument("title")
+    task_add.add_argument("--resource", default=".")
+    task_add.add_argument("--project", default=".")
+    task_add.set_defaults(func=cmd_task_add)
+
     roles = subparsers.add_parser("roles", help="show role leases and worker heartbeats")
     roles.add_argument("project", nargs="?", default=".")
     roles.set_defaults(func=cmd_roles)
+
+    locks = subparsers.add_parser("locks", help="show resource locks")
+    locks.add_argument("project", nargs="?", default=".")
+    locks.set_defaults(func=cmd_locks)
 
     lease = subparsers.add_parser("lease", help="manage deterministic role leases")
     lease_subparsers = lease.add_subparsers(dest="lease_command", required=True)
@@ -832,9 +1648,33 @@ def build_parser() -> argparse.ArgumentParser:
     lease_release.add_argument("--project", default=".")
     lease_release.set_defaults(func=cmd_lease_release)
 
+    lock = subparsers.add_parser("lock", help="manage resource locks")
+    lock_subparsers = lock.add_subparsers(dest="lock_command", required=True)
+
+    lock_acquire = lock_subparsers.add_parser("acquire", help="acquire a resource lock")
+    lock_acquire.add_argument("resource")
+    lock_acquire.add_argument("--agent", choices=AGENTS, required=True)
+    lock_acquire.add_argument("--role", choices=ROLES)
+    lock_acquire.add_argument("--generation", type=nonnegative_int)
+    lock_acquire.add_argument("--ttl", type=positive_seconds, default=RESOURCE_LOCK_TTL_SECONDS)
+    lock_acquire.add_argument("--renew", action="store_true")
+    lock_acquire.add_argument("--project", default=".")
+    lock_acquire.set_defaults(func=cmd_lock_acquire)
+
+    lock_release = lock_subparsers.add_parser("release", help="release a resource lock")
+    lock_release.add_argument("resource")
+    lock_release.add_argument("--agent", choices=AGENTS)
+    lock_release.add_argument("--project", default=".")
+    lock_release.set_defaults(func=cmd_lock_release)
+
     start = subparsers.add_parser("start", help="start the tmux observation workspace")
     start.add_argument("project", nargs="?", default=".")
     start.add_argument("--task", default="")
+    start.add_argument(
+        "--execute-agents",
+        action="store_true",
+        help="allow workers to run codex/claude non-interactively when they hold driver",
+    )
     start.set_defaults(func=cmd_start)
 
     attach = subparsers.add_parser("attach", help="attach to the project tmux session")
@@ -852,6 +1692,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker = subparsers.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("agent", choices=AGENTS)
     worker.add_argument("--project", default=".")
+    worker.add_argument("--execute-agents", action="store_true")
     worker.set_defaults(func=cmd_worker)
 
     return parser

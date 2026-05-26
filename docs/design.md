@@ -78,6 +78,7 @@ Project state lives under `.mmux/`:
   state.db
   logs/
     supervisor.log
+  runs/
   sessions/
   inbox/
 ```
@@ -96,6 +97,21 @@ Role leases are single-row leases keyed by role. A lease holder must present the
 current generation token for stale-sensitive actions, and expired leases can be
 claimed by another worker. Worker heartbeat rows are operational status only;
 they make the tmux panes and CLI state observable but do not decide policy.
+
+Resource locks are exclusive path-prefix leases. A lock on `src` conflicts with
+`src/mmux/cli.py`, and a lock on `.` conflicts with every project file. When a
+worker acquires a resource lock under a role, the current role generation is
+stored with the lock so stale driver work can be rejected deterministically.
+
+Task execution is explicit. `mmux start` only observes by default. With
+`--execute-agents`, the worker holding `driver` claims one pending task, acquires
+that task's resource lock, and runs its local agent CLI non-interactively:
+
+- Codex: `codex exec`
+- Claude Code: `claude -p`
+
+The supervisor still does not call a model. It only grants leases and records
+facts; model work happens inside worker adapters.
 
 ## Tmux Layout
 
