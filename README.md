@@ -18,6 +18,8 @@ This repository starts as the control-plane skeleton:
 - `mmux doctor` checks local dependencies such as `tmux`, `codex`, and `claude`.
 - `mmux start` creates a four-pane tmux workspace for supervisor, Codex worker,
   Claude worker, and logs.
+- `mmux run --minutes N` starts the tmux workspace for a bounded wall-clock
+  window, writes checkpoints, stops it automatically, and prints a task summary.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
 - `mmux roles` prints role leases and worker heartbeats.
@@ -26,11 +28,13 @@ This repository starts as the control-plane skeleton:
 - `mmux lock acquire/release` exercises deterministic resource locking.
 
 By default, workers record heartbeat and lease state without editing code. Use
-`mmux start --execute-agents` to allow the worker holding `driver` to claim a
-pending task, acquire its resource lock, create an isolated git worktree, and run
-Codex or Claude Code non-interactively. Accepted driver diffs move to
-`awaiting_test`; the worker holding `tester` runs deterministic checks and only
-then applies the patch back to the main worktree.
+`mmux run --minutes N --execute-agents` for a bounded autonomous window, or
+`mmux start --execute-agents` for manual tmux control. With execution enabled,
+the worker holding `driver` claims a pending task, acquires its resource lock,
+creates an isolated git worktree, and runs Codex or Claude Code
+non-interactively. Accepted driver diffs move to `awaiting_test`; the worker
+holding `tester` runs deterministic checks and only then applies the patch back
+to the main worktree.
 
 ## Install For Local Development
 
@@ -53,6 +57,8 @@ PYTHONPATH=src python3 -m mmux.cli doctor
 ```bash
 mmux init /path/to/project --task "Improve this project continuously"
 mmux doctor
+mmux run /path/to/project --minutes 30
+mmux run /path/to/project --minutes 30 --execute-agents
 mmux start /path/to/project
 mmux start /path/to/project --execute-agents
 mmux attach /path/to/project

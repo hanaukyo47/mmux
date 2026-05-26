@@ -1106,6 +1106,12 @@ def write_log(project: Path, message: str) -> None:
         handle.write(f"{utc_now()} {message}\n")
 
 
+def record_project_event(project: Path, kind: str, payload: dict[str, object]) -> None:
+    with database(project) as db:
+        apply_schema(db)
+        record_event(db, kind, payload)
+
+
 def cleanup_runtime_state(project: Path) -> None:
     if not state_path(project).exists():
         return
@@ -1564,6 +1570,46 @@ def cmd_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
+TASK_STATUS_ORDER = (
+    "pending",
+    "running",
+    "awaiting_test",
+    "running_test",
+    "completed",
+    "failed",
+    "rejected",
+    "no_change",
+)
+
+
+def task_status_counts(project: Path) -> dict[str, int]:
+    with database(project) as db:
+        apply_schema(db)
+        rows = db.execute("select status, count(*) from tasks group by status").fetchall()
+    return {status: int(count) for status, count in rows}
+
+
+def ordered_statuses(*counts: dict[str, int]) -> list[str]:
+    seen = set(TASK_STATUS_ORDER)
+    extras = sorted({status for count in counts for status in count if status not in seen})
+    return list(TASK_STATUS_ORDER) + extras
+
+
+def format_task_counts(counts: dict[str, int]) -> str:
+    parts = [f"{status}={counts[status]}" for status in ordered_statuses(counts) if counts.get(status, 0)]
+    return ", ".join(parts) if parts else "none"
+
+
+def format_task_delta(before: dict[str, int], after: dict[str, int]) -> str:
+    parts = []
+    for status in ordered_statuses(before, after):
+        delta = after.get(status, 0) - before.get(status, 0)
+        if delta:
+            sign = "+" if delta > 0 else ""
+            parts.append(f"{status}={sign}{delta}")
+    return ", ".join(parts) if parts else "no change"
+
+
 def cmd_task_add(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     ensure_existing_schema(project)
@@ -1628,6 +1674,16 @@ def nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be an integer") from exc
     if parsed < 0:
         raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
     return parsed
 
 
@@ -1710,16 +1766,13 @@ def cmd_lock_release(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_start(args: argparse.Namespace) -> int:
-    project = resolve_project(args.project)
-    ensure_layout(project, args.task or "")
+def start_tmux_session(project: Path, *, execute_agents: bool = False) -> bool:
     name = session_name(project)
     if tmux_has_session(name):
-        print(f"tmux session already exists: {name}")
-        return 0
+        return False
 
     supervisor_cmd = module_command(project, "supervisor")
-    worker_flags = ["--execute-agents"] if args.execute_agents else []
+    worker_flags = ["--execute-agents"] if execute_agents else []
     codex_cmd = module_command(project, "worker", *worker_flags, "codex")
     claude_cmd = module_command(project, "worker", *worker_flags, "claude")
     log_cmd = f"mkdir -p .mmux/logs; touch .mmux/logs/supervisor.log; tail -f .mmux/logs/supervisor.log"
@@ -1731,6 +1784,30 @@ def cmd_start(args: argparse.Namespace) -> int:
     run(["tmux", "select-layout", "-t", name, "tiled"], check=False)
 
     write_log(project, f"started tmux session {name}")
+    return True
+
+
+def stop_tmux_session(project: Path) -> bool:
+    name = session_name(project)
+    if not shutil.which("tmux"):
+        raise SystemExit("tmux is not installed")
+    if not tmux_has_session(name):
+        cleanup_runtime_state(project)
+        return False
+    run(["tmux", "kill-session", "-t", name])
+    cleanup_runtime_state(project)
+    write_log(project, f"stopped tmux session {name}")
+    return True
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_layout(project, args.task or "")
+    name = session_name(project)
+    if not start_tmux_session(project, execute_agents=args.execute_agents):
+        print(f"tmux session already exists: {name}")
+        return 0
+
     print(f"started tmux session: {name}")
     print(f"attach with: tmux attach -t {name}")
     if args.execute_agents:
@@ -1749,17 +1826,92 @@ def cmd_attach(args: argparse.Namespace) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     name = session_name(project)
-    if not shutil.which("tmux"):
-        raise SystemExit("tmux is not installed")
-    if not tmux_has_session(name):
-        cleanup_runtime_state(project)
+    if not stop_tmux_session(project):
         print(f"tmux session not running: {name}")
         return 0
-    run(["tmux", "kill-session", "-t", name])
-    cleanup_runtime_state(project)
-    write_log(project, f"stopped tmux session {name}")
     print(f"stopped tmux session: {name}")
     return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    if not project.exists():
+        raise SystemExit(f"Project path does not exist: {project}")
+
+    ensure_layout(project, args.task or "")
+    name = session_name(project)
+    if tmux_has_session(name):
+        raise SystemExit(f"tmux session already exists: {name}. Stop it before running a timed window.")
+
+    duration_seconds = args.seconds if args.seconds is not None else max(1, int(args.minutes * 60))
+    checkpoint_seconds = min(args.checkpoint_seconds, duration_seconds)
+    before = task_status_counts(project)
+    started_at = utc_now()
+    record_project_event(
+        project,
+        "run_started",
+        {
+            "duration_seconds": duration_seconds,
+            "execute_agents": args.execute_agents,
+            "task": args.task or "",
+        },
+    )
+
+    if not start_tmux_session(project, execute_agents=args.execute_agents):
+        raise SystemExit(f"tmux session already exists: {name}")
+
+    print(f"started timed run: {name}")
+    print(f"duration: {duration_seconds}s")
+    print(f"agent execution: {'enabled' if args.execute_agents else 'disabled'}")
+    print(f"before: {format_task_counts(before)}")
+    print(f"attach with: tmux attach -t {name}")
+
+    deadline = time.monotonic() + duration_seconds
+    interrupted = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(checkpoint_seconds, remaining))
+            counts = task_status_counts(project)
+            remaining_seconds = max(0, int(deadline - time.monotonic()))
+            message = f"run checkpoint remaining={remaining_seconds}s tasks={format_task_counts(counts)}"
+            write_log(project, message)
+            print(f"{utc_now()} {message}")
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        interrupted = True
+        write_log(project, "timed run interrupted")
+    finally:
+        stop_tmux_session(project)
+
+    after = task_status_counts(project)
+    finished_at = utc_now()
+    record_project_event(
+        project,
+        "run_finished",
+        {
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "interrupted": interrupted,
+            "before": before,
+            "after": after,
+            "delta": format_task_delta(before, after),
+        },
+    )
+
+    print("run summary:")
+    print(f"  project: {project}")
+    print(f"  session: {name}")
+    print(f"  started_at: {started_at}")
+    print(f"  finished_at: {finished_at}")
+    print(f"  interrupted: {str(interrupted).lower()}")
+    print(f"  before: {format_task_counts(before)}")
+    print(f"  after: {format_task_counts(after)}")
+    print(f"  delta: {format_task_delta(before, after)}")
+    print(f"  supervisor_log: {relative_to_project(project, log_path(project))}")
+    return 130 if interrupted else 0
 
 
 def cmd_supervisor(args: argparse.Namespace) -> int:
@@ -2191,6 +2343,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow workers to run codex/claude non-interactively when they hold driver",
     )
     start.set_defaults(func=cmd_start)
+
+    run_parser = subparsers.add_parser("run", help="run a timed tmux workspace and stop automatically")
+    run_parser.add_argument("project", nargs="?", default=".")
+    run_parser.add_argument("--minutes", type=positive_float, default=30.0)
+    run_parser.add_argument("--seconds", type=positive_seconds, help=argparse.SUPPRESS)
+    run_parser.add_argument("--checkpoint-seconds", type=positive_seconds, default=60)
+    run_parser.add_argument("--task", default="")
+    run_parser.add_argument(
+        "--execute-agents",
+        action="store_true",
+        help="allow workers to run codex/claude non-interactively inside the timed window",
+    )
+    run_parser.set_defaults(func=cmd_run)
 
     attach = subparsers.add_parser("attach", help="attach to the project tmux session")
     attach.add_argument("project", nargs="?", default=".")

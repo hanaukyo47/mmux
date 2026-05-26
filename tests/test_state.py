@@ -21,6 +21,8 @@ from mmux.cli import (
     execute_driver_task,
     execute_tester_task,
     export_worktree_patch,
+    format_task_counts,
+    format_task_delta,
     format_utc,
     apply_worktree_patch,
     list_resource_locks,
@@ -33,6 +35,7 @@ from mmux.cli import (
     state_path,
     stream_agent_command,
     supervisor_role_plan,
+    task_status_counts,
     list_tasks,
     update_worker_heartbeat,
     utc_now_dt,
@@ -238,6 +241,64 @@ class StateTests(unittest.TestCase):
             assert first is not None
             self.assertEqual(first.id, task_id)
             self.assertIsNone(second)
+
+    def test_task_status_summary_helpers_are_stable(self) -> None:
+        before = {"pending": 2, "completed": 1}
+        after = {"pending": 1, "completed": 2, "failed": 1}
+
+        self.assertEqual(format_task_counts(before), "pending=2, completed=1")
+        self.assertEqual(format_task_delta(before, after), "pending=-1, completed=+1, failed=+1")
+
+    def test_cmd_run_records_timed_window_without_real_tmux(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            calls = []
+            original_start = cli.start_tmux_session
+            original_stop = cli.stop_tmux_session
+
+            def fake_start(start_project, *, execute_agents=False):
+                calls.append(("start", start_project, execute_agents))
+                return True
+
+            def fake_stop(stop_project):
+                calls.append(("stop", stop_project))
+                cleanup_runtime_state(stop_project)
+                return True
+
+            cli.start_tmux_session = fake_start
+            cli.stop_tmux_session = fake_stop
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = cli.main(
+                        [
+                            "run",
+                            str(project),
+                            "--seconds",
+                            "1",
+                            "--checkpoint-seconds",
+                            "1",
+                            "--task",
+                            "timed task",
+                        ]
+                    )
+            finally:
+                cli.start_tmux_session = original_start
+                cli.stop_tmux_session = original_stop
+
+            self.assertEqual(code, 0)
+            self.assertEqual(calls[0], ("start", project.resolve(), False))
+            self.assertEqual(calls[-1], ("stop", project.resolve()))
+            self.assertIn("run summary:", output.getvalue())
+            self.assertEqual(task_status_counts(project.resolve()), {"pending": 1})
+            with database(project.resolve()) as db:
+                events = [
+                    row[0]
+                    for row in db.execute(
+                        "select kind from events where kind in (?, ?) order by id",
+                        ("run_started", "run_finished"),
+                    ).fetchall()
+                ]
+            self.assertEqual(events, ["run_started", "run_finished"])
 
     def test_build_agent_commands_use_noninteractive_modes(self) -> None:
         project = Path("/tmp/example-project").resolve()

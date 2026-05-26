@@ -134,6 +134,22 @@ the main worktree has no tracked changes.
 The supervisor still does not call a model. It only grants leases, evaluates
 file facts, and records outcomes; model work happens inside worker adapters.
 
+## Timed Runs
+
+`mmux run PROJECT --minutes N` is the bounded top-level entry point for normal
+use. It initializes the local `.mmux/` layout when needed, refuses to reuse an
+existing tmux session, records a `run_started` event, starts the same four-pane
+workspace as `mmux start`, and then lets wall-clock time drive the window.
+
+During the window, it writes periodic checkpoints with remaining time and task
+status counts to stdout and the supervisor log. At the deadline, or on
+`KeyboardInterrupt`, it stops the tmux session, clears runtime leases, locks, and
+heartbeats, records `run_finished`, and prints before/after/delta task counts.
+
+By default, a timed run observes only. `--execute-agents` enables non-interactive
+Codex and Claude Code adapters inside the same deterministic gates described
+above.
+
 ## Tmux Layout
 
 The first workspace uses four panes:

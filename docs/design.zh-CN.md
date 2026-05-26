@@ -122,6 +122,14 @@ driver 执行结束后，确定性策略会检查 worktree diff：
 
 supervisor 仍然不调用模型。它只发放租约、检查文件事实、记录结果；模型工作只发生在 worker adapter 内部。
 
+## 限时运行
+
+`mmux run PROJECT --minutes N` 是普通使用时的顶层受控入口。它会在需要时初始化本地 `.mmux/` 目录，拒绝复用已经存在的 tmux session，记录 `run_started` 事件，启动与 `mmux start` 相同的四窗格工作区，并用墙钟时间驱动运行窗口。
+
+运行期间，它会定期把剩余时间和任务状态计数写到 stdout 与 supervisor log。到达时限或收到 `KeyboardInterrupt` 后，它会停止 tmux session，清理运行期 lease、lock、heartbeat，记录 `run_finished`，并打印 before/after/delta 任务汇总。
+
+默认情况下，限时运行只观察，不让 agent 改代码。加上 `--execute-agents` 后，Codex 和 Claude Code 才会在上面描述的确定性 gate 内非交互执行任务。
+
 ## Tmux 布局
 
 当前工作区使用四个 pane：
@@ -158,4 +166,4 @@ tmux 用于观察和人工接管。数据库仍然是事实源。
 - 可配置 tester 命令。
 - worktree 清理和归档策略。
 - commit/checkpoint/rollback 策略。
-- 顶层 `mmux run --minutes N` 长跑入口。
+- 自动提交和远端协作策略。
