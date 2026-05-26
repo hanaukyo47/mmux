@@ -41,6 +41,23 @@ curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | s
 curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | MMUX_INSTALL_DEPS=1 sh
 ```
 
+## 快速开始
+
+最低摩擦的第一次运行：
+
+```bash
+cd /path/to/project
+mmux doctor
+mmux inspect .
+mmux run . --minutes 30
+```
+
+这只是观察模式。它会初始化 `.mmux/`、生成项目画像、在任务队列为空时补一个保守默认任务、启动 tmux、写 checkpoint，并在到点后自动停止。要允许 Codex 和 Claude Code 在确定性 gate 内实际改代码：
+
+```bash
+mmux run . --minutes 30 --execute-agents
+```
+
 ## 本地开发安装
 
 ```bash

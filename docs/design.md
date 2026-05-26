@@ -204,3 +204,15 @@ an unexplored boundary:
 Recent touched files enter cooldown. Reviewers also review task selection, but
 the supervisor only accepts schema-valid candidates that pass deterministic
 checks.
+
+## Current Limits
+
+The current implementation supports controlled task execution, but it is not a
+complete unattended system yet. Remaining work:
+
+- Automatic `scout` generation of frontier tasks.
+- A real `reviewer` gate.
+- User-configurable tester commands.
+- Worktree cleanup and archival policy.
+- Commit, checkpoint, and rollback policy.
+- Automatic commit and remote collaboration policy.

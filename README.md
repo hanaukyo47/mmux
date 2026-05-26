@@ -55,6 +55,26 @@ If `tmux` is missing on macOS and Homebrew is already installed:
 curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | MMUX_INSTALL_DEPS=1 sh
 ```
 
+## Quick Start
+
+For a low-friction first run:
+
+```bash
+cd /path/to/project
+mmux doctor
+mmux inspect .
+mmux run . --minutes 30
+```
+
+This observes only. It initializes `.mmux/`, profiles the project, adds one
+conservative default task if the queue is empty, starts tmux, writes
+checkpoints, and stops at the deadline. To let Codex and Claude Code actually
+edit code inside the deterministic gates:
+
+```bash
+mmux run . --minutes 30 --execute-agents
+```
+
 ## Install For Local Development
 
 ```bash
