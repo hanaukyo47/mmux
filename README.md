@@ -130,6 +130,8 @@ mmux stop /path/to/project
   during timed runs.
 - Agent adapters have bounded runtime and no-output timeouts tied to the timed
   run deadline.
+- Adapter timeout/no-output failures requeue the task and put that agent on
+  cooldown, so another agent can take the next driver lease.
 - Stopping a run requeues unfinished `running` and `running_test` tasks.
 - Time windows drive the loop; round counts are only internal diagnostics.
 - tmux is the observation layer, not the source of truth.

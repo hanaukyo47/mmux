@@ -28,6 +28,7 @@ SUPERVISOR_TICK_SECONDS = 30
 SUPERVISOR_ASSIGNMENT_SECONDS = 5 * 60
 AGENT_TIMEOUT_SECONDS = 20 * 60
 AGENT_NO_OUTPUT_TIMEOUT_SECONDS = 2 * 60
+AGENT_ADAPTER_COOLDOWN_SECONDS = 10 * 60
 TEST_TIMEOUT_SECONDS = 10 * 60
 RUN_SHUTDOWN_GRACE_SECONDS = 15
 MIN_EXECUTION_BUDGET_SECONDS = 30
@@ -299,6 +300,79 @@ def record_event(db: sqlite3.Connection, kind: str, payload: dict[str, object]) 
         "insert into events(kind, payload, created_at) values (?, ?, ?)",
         (kind, json.dumps(payload, sort_keys=True), utc_now()),
     )
+
+
+def meta_json_db(db: sqlite3.Connection, key: str) -> dict[str, object]:
+    row = db.execute("select value from meta where key = ?", (key,)).fetchone()
+    if row is None:
+        return {}
+    try:
+        decoded = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def set_meta_json_db(db: sqlite3.Connection, key: str, value: dict[str, object]) -> None:
+    db.execute(
+        "insert or replace into meta(key, value) values (?, ?)",
+        (key, json.dumps(value, sort_keys=True)),
+    )
+
+
+def agent_cooldown_key(agent: str) -> str:
+    validate_agent(agent)
+    return f"agent_cooldown:{agent}"
+
+
+def agent_cooldown_db(db: sqlite3.Connection, agent: str) -> dict[str, object]:
+    return meta_json_db(db, agent_cooldown_key(agent))
+
+
+def agent_is_cooled_down_db(db: sqlite3.Connection, agent: str, now: Optional[dt.datetime] = None) -> bool:
+    cooldown = agent_cooldown_db(db, agent)
+    until = cooldown.get("until")
+    if not isinstance(until, str) or not until:
+        return False
+    return parse_utc(until) > (now or utc_now_dt())
+
+
+def mark_agent_cooldown(project: Path, agent: str, reason: str, ttl_seconds: int = AGENT_ADAPTER_COOLDOWN_SECONDS) -> None:
+    validate_agent(agent)
+    until = format_utc(utc_now_dt() + dt.timedelta(seconds=ttl_seconds))
+    payload = {
+        "agent": agent,
+        "reason": reason,
+        "until": until,
+    }
+    with database(project) as db:
+        apply_schema(db)
+        set_meta_json_db(db, agent_cooldown_key(agent), payload)
+        record_event(db, "agent_cooldown_started", payload)
+
+
+def list_agent_cooldowns(project: Path) -> list[tuple[str, str, str]]:
+    with database(project) as db:
+        apply_schema(db)
+        rows = db.execute(
+            "select key, value from meta where key like ? order by key",
+            ("agent_cooldown:%",),
+        ).fetchall()
+    cooldowns = []
+    now = utc_now_dt()
+    for key, value in rows:
+        agent = str(key).split(":", 1)[1]
+        try:
+            decoded = json.loads(str(value))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(decoded, dict):
+            continue
+        until = decoded.get("until")
+        reason = decoded.get("reason")
+        if isinstance(until, str) and parse_utc(until) > now:
+            cooldowns.append((agent, until, str(reason or "")))
+    return cooldowns
 
 
 def ensure_layout(project: Path, task: str = "") -> None:
@@ -1848,6 +1922,12 @@ def invoke_agent_adapter(
     return result
 
 
+def is_adapter_health_failure(result: AdapterResult) -> bool:
+    return result.returncode == 124 and (
+        "produced no output" in result.message or "timed out" in result.message
+    )
+
+
 def tmux_has_session(name: str) -> bool:
     result = run(["tmux", "has-session", "-t", name], check=False)
     return result.returncode == 0
@@ -1962,6 +2042,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "select agent, pid, status, role, generation, updated_at from worker_heartbeats order by agent"
         ).fetchall()
         events = db.execute("select kind, created_at from events order by id desc limit 5").fetchall()
+    cooldowns = list_agent_cooldowns(project)
 
     print(f"project: {project}")
     print(f"session: {session_name(project)}")
@@ -1989,6 +2070,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         for agent, pid, status, role, generation, updated_at in heartbeats:
             lease = f"{role} gen={generation}" if role else "none"
             print(f"  {agent}: pid={pid} status={status} role={lease} updated={updated_at}")
+    else:
+        print("  none")
+    print("agent cooldowns:")
+    if cooldowns:
+        for agent, until, reason in cooldowns:
+            print(f"  {agent}: until={until} reason={reason}")
     else:
         print("  none")
     print("recent events:")
@@ -2062,13 +2149,32 @@ def has_open_tasks(project: Path) -> bool:
     return any(counts.get(status, 0) > 0 for status in OPEN_TASK_STATUSES)
 
 
+def available_driver_agents(project: Path, now: Optional[dt.datetime] = None) -> tuple[str, ...]:
+    ordered_agents = agent_order_for_slot(now)
+    with database(project) as db:
+        apply_schema(db)
+        healthy = tuple(agent for agent in ordered_agents if not agent_is_cooled_down_db(db, agent, now))
+    return healthy
+
+
+def paired_tester_agent(driver: str, ordered_agents: tuple[str, ...]) -> str:
+    return next((agent for agent in ordered_agents if agent != driver), driver)
+
+
 def supervisor_role_plan_for_project(project: Path, now: Optional[dt.datetime] = None) -> tuple[tuple[str, str], ...]:
     counts = task_status_counts(project)
     agents = agent_order_for_slot(now)
+    driver_agents = available_driver_agents(project, now)
     if counts.get("awaiting_test", 0) > 0:
-        return tuple(zip(("tester", "driver"), agents))
+        driver = driver_agents[0] if driver_agents else agents[1]
+        tester = paired_tester_agent(driver, agents)
+        return (("tester", tester), ("driver", driver))
     if counts.get("pending", 0) > 0:
-        return tuple(zip(("driver", "tester"), agents))
+        if not driver_agents:
+            return (("scout", agents[0]), ("reviewer", agents[1]))
+        driver = driver_agents[0]
+        tester = paired_tester_agent(driver, agents)
+        return (("driver", driver), ("tester", tester))
     return supervisor_role_plan(now)
 
 
@@ -2603,6 +2709,23 @@ def execute_driver_task(
             )
             write_log(project, f"{agent} failed task #{task.id}: {exc}")
             return f"task #{task.id} failed: {exc}"
+
+        if is_adapter_health_failure(result):
+            message = f"{agent} adapter unavailable: {result.message}"
+            mark_agent_cooldown(project, agent, result.message)
+            update_task_payload(
+                project,
+                task.id,
+                {
+                    "worktree": relative_to_project(project, worktree),
+                    "adapter_log": result.log_file,
+                    "adapter_failure": result.message,
+                    "adapter_cooldown_agent": agent,
+                },
+            )
+            release_task_claim(project, task.id, message)
+            write_log(project, f"{agent} requeued task #{task.id}: {message}")
+            return f"task #{task.id} requeued: {message}"
 
         policy = check_diff_policy(project, worktree, lock.resource)
         payload_updates = {

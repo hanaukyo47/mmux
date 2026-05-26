@@ -189,6 +189,9 @@ adapter timeout, and a shutdown grace period. Workers refuse to start a new
 driver or tester action when the remaining budget is too small. Agent adapters
 also have a no-output timeout; if a CLI produces no stdout/stderr for the
 configured interval, mmux terminates it and records the reason in the task log.
+Timeout and no-output adapter failures are treated as agent health failures:
+mmux requeues the task, records an agent cooldown in deterministic state, and
+skips that agent for future driver leases until the cooldown expires.
 
 ## Tmux Layout
 

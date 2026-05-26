@@ -147,7 +147,7 @@ supervisor 仍然不调用模型。它只发放租约、检查文件事实、记
 
 默认情况下，限时运行只观察，不让 agent 改代码。加上 `--execute-agents` 后，Codex 和 Claude Code 才会在上面描述的确定性 gate 内非交互执行任务。
 
-限时运行会把绝对 deadline 传给 worker。worker 领取任务前，会根据 deadline、配置的 adapter 超时和停止前预留时间计算剩余执行预算；预算太小时不会再启动新的 driver 或 tester 动作。agent adapter 还有无输出超时：如果 CLI 在配置时间内没有产生 stdout/stderr，mmux 会终止它，并把原因写入 task log。
+限时运行会把绝对 deadline 传给 worker。worker 领取任务前，会根据 deadline、配置的 adapter 超时和停止前预留时间计算剩余执行预算；预算太小时不会再启动新的 driver 或 tester 动作。agent adapter 还有无输出超时：如果 CLI 在配置时间内没有产生 stdout/stderr，mmux 会终止它，并把原因写入 task log。adapter 超时和无输出会被视为 agent health failure：mmux 会重新排队任务，在确定性状态里记录 agent cooldown，并在 cooldown 过期前跳过该 agent 的 driver lease。
 
 ## Tmux 布局
 

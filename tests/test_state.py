@@ -29,6 +29,7 @@ from mmux.cli import (
     inspect_project,
     list_resource_locks,
     list_worker_heartbeats,
+    mark_agent_cooldown,
     release_role,
     release_resource_lock,
     resources_overlap,
@@ -159,9 +160,12 @@ class StateTests(unittest.TestCase):
             self.assertEqual(supervisor_role_plan_for_project(project, first), (("driver", "codex"), ("tester", "claude")))
             self.assertEqual(supervisor_role_plan_for_project(project, second), (("driver", "claude"), ("tester", "codex")))
 
+            mark_agent_cooldown(project, "claude", "silent adapter", ttl_seconds=60)
+            self.assertEqual(supervisor_role_plan_for_project(project, second), (("driver", "codex"), ("tester", "claude")))
+
             with database(project) as db:
                 db.execute("update tasks set status = ? where id = ?", ("awaiting_test", 1))
-            self.assertEqual(supervisor_role_plan_for_project(project, first), (("tester", "codex"), ("driver", "claude")))
+            self.assertEqual(supervisor_role_plan_for_project(project, first), (("tester", "claude"), ("driver", "codex")))
 
     def test_cleanup_runtime_state_releases_active_runtime_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -653,6 +657,34 @@ class StateTests(unittest.TestCase):
             self.assertEqual(tasks[-1].status, "awaiting_test")
             self.assertEqual(tasks[-1].payload["diff_policy"], "ok")
             self.assertIn("worktree", tasks[-1].payload)
+
+    def test_execute_driver_task_requeues_adapter_health_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "change src", resource="src")
+            lease = acquire_role(project, "driver", "claude", ttl_seconds=60)
+
+            original = cli.invoke_agent_adapter
+
+            def fake_adapter(_project, _execution_root, _agent, _task, _generation, _resource, **kwargs):
+                return cli.AdapterResult(False, 124, ".mmux/runs/fake-driver.log", "agent command produced no output for 30s")
+
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_driver_task(project, "claude", lease.generation)
+            finally:
+                cli.invoke_agent_adapter = original
+
+            self.assertIn("requeued", message)
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "pending")
+            self.assertEqual(tasks[-1].claimed_by, "")
+            self.assertEqual(tasks[-1].payload["adapter_cooldown_agent"], "claude")
+            cooldowns = cli.list_agent_cooldowns(project)
+            self.assertEqual(cooldowns[0][0], "claude")
 
     def test_execute_tester_task_applies_awaiting_patch_after_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
