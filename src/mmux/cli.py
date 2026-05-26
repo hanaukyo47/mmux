@@ -526,9 +526,14 @@ def acquire_role(
         if row and row[3] == "active":
             current_holder, generation, current_until, _status = row
             if renew_if_same and current_holder == holder:
+                effective_lease_until = (
+                    current_until
+                    if parse_utc(current_until) >= parse_utc(lease_until)
+                    else lease_until
+                )
                 db.execute(
                     "update role_leases set lease_until = ?, status = ? where role = ?",
-                    (lease_until, "active", role),
+                    (effective_lease_until, "active", role),
                 )
                 record_event(
                     db,
@@ -537,11 +542,11 @@ def acquire_role(
                         "role": role,
                         "holder": holder,
                         "generation": generation,
-                        "lease_until": lease_until,
+                        "lease_until": effective_lease_until,
                     },
                 )
                 db.commit()
-                return LeaseOutcome(True, role, holder, generation, lease_until, "renewed")
+                return LeaseOutcome(True, role, holder, generation, effective_lease_until, "renewed")
             db.rollback()
             return LeaseOutcome(
                 False,

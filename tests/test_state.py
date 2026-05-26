@@ -108,6 +108,19 @@ class StateTests(unittest.TestCase):
             self.assertEqual(second.holder, "claude")
             self.assertEqual(second.generation, first.generation + 1)
 
+    def test_renewing_same_role_does_not_shorten_existing_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+
+            first = acquire_role(project, "driver", "codex", ttl_seconds=300)
+            renewed = acquire_role(project, "driver", "codex", ttl_seconds=30, renew_if_same=True)
+
+            self.assertTrue(renewed.ok)
+            self.assertEqual(renewed.status, "renewed")
+            self.assertEqual(renewed.generation, first.generation)
+            self.assertGreaterEqual(cli.parse_utc(renewed.lease_until), cli.parse_utc(first.lease_until))
+
     def test_expired_role_can_be_reacquired(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
