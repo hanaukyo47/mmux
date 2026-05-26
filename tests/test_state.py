@@ -1,6 +1,8 @@
 import contextlib
 import datetime as dt
 import io
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -424,6 +426,112 @@ class StateTests(unittest.TestCase):
             self.assertEqual(calls[-1], ("stop", project.resolve()))
             self.assertIn("run summary:", output.getvalue())
             self.assertEqual(task_status_counts(project.resolve()), {"pending": 1})
+            with database(project.resolve()) as db:
+                events = [
+                    row[0]
+                    for row in db.execute(
+                        "select kind from events where kind in (?, ?) order by id",
+                        ("run_started", "run_finished"),
+                    ).fetchall()
+                ]
+            self.assertEqual(events, ["run_started", "run_finished"])
+
+    def test_cmd_run_smoke_invokes_timed_cli_with_fake_tmux(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            tmux_log = root / "tmux.log"
+            tmux_state = root / "tmux.sessions"
+            fake_tmux = bin_dir / "tmux"
+            fake_tmux.write_text(
+                """#!/bin/sh
+log=${MMUX_FAKE_TMUX_LOG:?}
+state=${MMUX_FAKE_TMUX_STATE:?}
+printf '%s\\n' "$*" >> "$log"
+cmd=$1
+case "$cmd" in
+  has-session)
+    target=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-t" ]; then
+        shift
+        target=$1
+        break
+      fi
+      shift
+    done
+    [ -f "$state" ] && grep -Fxq "$target" "$state"
+    exit $?
+    ;;
+  new-session)
+    target=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-s" ]; then
+        shift
+        target=$1
+        break
+      fi
+      shift
+    done
+    printf '%s\\n' "$target" > "$state"
+    exit 0
+    ;;
+  split-window|select-layout)
+    exit 0
+    ;;
+  kill-session)
+    rm -f "$state"
+    exit 0
+    ;;
+esac
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_tmux.chmod(0o755)
+
+            env = dict(os.environ)
+            repo_src = Path(__file__).resolve().parents[1] / "src"
+            existing_pythonpath = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = (
+                f"{repo_src}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(repo_src)
+            )
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["MMUX_FAKE_TMUX_LOG"] = str(tmux_log)
+            env["MMUX_FAKE_TMUX_STATE"] = str(tmux_state)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mmux.cli",
+                    "run",
+                    str(project),
+                    "--seconds",
+                    "1",
+                    "--checkpoint-seconds",
+                    "1",
+                    "--no-default-task",
+                ],
+                cwd=project,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("started timed run:", result.stdout)
+            self.assertIn("run checkpoint", result.stdout)
+            self.assertIn("run summary:", result.stdout)
+            self.assertFalse(tmux_state.exists())
+            tmux_calls = tmux_log.read_text(encoding="utf-8")
+            self.assertIn("new-session", tmux_calls)
+            self.assertIn("split-window", tmux_calls)
+            self.assertIn("kill-session", tmux_calls)
             with database(project.resolve()) as db:
                 events = [
                     row[0]
