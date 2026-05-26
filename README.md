@@ -36,6 +36,22 @@ non-interactively. Accepted driver diffs move to `awaiting_test`; the worker
 holding `tester` runs deterministic checks and only then applies the patch back
 to the main worktree.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | sh
+```
+
+The installer clones mmux into `~/.local/share/mmux/repo`, creates an isolated
+virtual environment in `~/.local/share/mmux/venv`, and links `mmux` into
+`~/.local/bin`. It does not use `sudo`.
+
+If `tmux` is missing on macOS and Homebrew is already installed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | MMUX_INSTALL_DEPS=1 sh
+```
+
 ## Install For Local Development
 
 ```bash
