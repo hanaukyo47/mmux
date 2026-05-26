@@ -25,7 +25,9 @@ after role leases, resource locks, and policy checks are in place.
 
 ```bash
 cd /Users/hubo-gimpo/mmux
-python3 -m pip install -e .
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
 ```
 
 Run without installation:
