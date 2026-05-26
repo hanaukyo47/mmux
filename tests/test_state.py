@@ -675,6 +675,9 @@ exit 1
         self.assertIn("workspace-write", codex)
         self.assertEqual(claude[:2], ["claude", "-p"])
         self.assertIn("--permission-mode", claude)
+        self.assertIn("--verbose", claude)
+        self.assertIn("stream-json", claude)
+        self.assertIn("--include-partial-messages", claude)
 
     def test_stream_agent_command_writes_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

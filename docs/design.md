@@ -136,7 +136,11 @@ that task's resource lock, creates an isolated git worktree, and runs its local
 agent CLI non-interactively:
 
 - Codex: `codex exec`
-- Claude Code: `claude -p`
+- Claude Code: `claude -p --verbose --output-format stream-json --include-partial-messages`
+
+Claude uses streaming JSON output so long-running reasoning or tool use keeps
+the adapter heartbeat alive. Plain text mode only prints a final response, which
+can look silent to the no-output watchdog during substantial tasks.
 
 After driver execution, deterministic policy checks inspect the worktree diff:
 

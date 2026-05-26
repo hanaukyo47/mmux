@@ -117,7 +117,9 @@ resource lock 是排他的路径前缀租约。锁住 `src` 会与 `src/mmux/cli
 任务执行是显式开启的。默认 `mmux start` 只观察，不让 agent 改代码。使用 `--execute-agents` 后，持有 `driver` 的 worker 会领取一个 pending task、获取该任务的 resource lock、创建隔离 git worktree，并非交互运行本地 agent CLI：
 
 - Codex：`codex exec`
-- Claude Code：`claude -p`
+- Claude Code：`claude -p --verbose --output-format stream-json --include-partial-messages`
+
+Claude 使用流式 JSON 输出，这样长时间推理或工具调用时 adapter 仍会持续收到心跳。纯文本模式通常只在最终响应时输出，复杂任务期间容易被 no-output watchdog 误判为静默。
 
 driver 执行结束后，确定性策略会检查 worktree diff：
 

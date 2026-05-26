@@ -1823,8 +1823,10 @@ def build_agent_command(agent: str, project: Path, prompt: str, output_file: Pat
             "-p",
             "--permission-mode",
             "acceptEdits",
+            "--verbose",
             "--output-format",
-            "text",
+            "stream-json",
+            "--include-partial-messages",
             prompt,
         ]
     raise ValueError(f"unknown agent: {agent}")
