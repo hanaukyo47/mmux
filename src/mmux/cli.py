@@ -1785,8 +1785,6 @@ def build_agent_command(agent: str, project: Path, prompt: str, output_file: Pat
             str(project),
             "--sandbox",
             "workspace-write",
-            "--ask-for-approval",
-            "never",
             "--output-last-message",
             str(output_file),
             prompt,
@@ -2908,6 +2906,46 @@ def execute_tester_task(
         release_role(project, "tester", holder=agent, generation=generation)
 
 
+def execute_worker_available_task(
+    project: Path,
+    agent: str,
+    roles: list[tuple[str, int, str]],
+    *,
+    run_deadline: str,
+    agent_timeout_seconds: int,
+    agent_no_output_seconds: int,
+    test_timeout_seconds: int,
+    shutdown_grace_seconds: int,
+) -> Optional[str]:
+    counts = task_status_counts(project)
+    tester = next((role for role in roles if role[0] == "tester"), None)
+    driver = next((role for role in roles if role[0] == "driver"), None)
+
+    if tester and counts.get("awaiting_test", 0) > 0:
+        budget = execution_budget_seconds(run_deadline, test_timeout_seconds, shutdown_grace_seconds)
+        if budget < MIN_EXECUTION_BUDGET_SECONDS:
+            return f"not enough run time for tester budget={budget}s"
+        message = execute_tester_task(project, agent, tester[1], timeout_seconds=budget)
+        if message != "no awaiting_test task":
+            return message
+
+    if driver and counts.get("pending", 0) > 0:
+        budget = execution_budget_seconds(run_deadline, agent_timeout_seconds, shutdown_grace_seconds)
+        if budget < MIN_EXECUTION_BUDGET_SECONDS:
+            return f"not enough run time for driver budget={budget}s"
+        message = execute_driver_task(
+            project,
+            agent,
+            driver[1],
+            timeout_seconds=budget,
+            no_output_timeout_seconds=min(agent_no_output_seconds, budget),
+        )
+        if message != "no pending task":
+            return message
+
+    return None
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     agent = args.agent
@@ -2952,42 +2990,20 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 sys.stdout.flush()
                 last_rendered = rendered
             if args.execute_agents:
-                tester = next((role for role in roles if role[0] == "tester"), None)
-                driver = next((role for role in roles if role[0] == "driver"), None)
-                if tester:
-                    budget = execution_budget_seconds(
-                        args.run_deadline,
-                        args.test_timeout_seconds,
-                        args.shutdown_grace_seconds,
-                    )
-                    if budget < MIN_EXECUTION_BUDGET_SECONDS:
-                        message = f"not enough run time for tester budget={budget}s"
-                    else:
-                        message = execute_tester_task(project, agent, tester[1], timeout_seconds=budget)
-                    if message != "no awaiting_test task":
-                        print(message)
-                        sys.stdout.flush()
-                        last_rendered = ""
-                elif driver:
-                    budget = execution_budget_seconds(
-                        args.run_deadline,
-                        args.agent_timeout_seconds,
-                        args.shutdown_grace_seconds,
-                    )
-                    if budget < MIN_EXECUTION_BUDGET_SECONDS:
-                        message = f"not enough run time for driver budget={budget}s"
-                    else:
-                        message = execute_driver_task(
-                            project,
-                            agent,
-                            driver[1],
-                            timeout_seconds=budget,
-                            no_output_timeout_seconds=min(args.agent_no_output_seconds, budget),
-                        )
-                    if message != "no pending task":
-                        print(message)
-                        sys.stdout.flush()
-                        last_rendered = ""
+                message = execute_worker_available_task(
+                    project,
+                    agent,
+                    roles,
+                    run_deadline=args.run_deadline,
+                    agent_timeout_seconds=args.agent_timeout_seconds,
+                    agent_no_output_seconds=args.agent_no_output_seconds,
+                    test_timeout_seconds=args.test_timeout_seconds,
+                    shutdown_grace_seconds=args.shutdown_grace_seconds,
+                )
+                if message:
+                    print(message)
+                    sys.stdout.flush()
+                    last_rendered = ""
             time.sleep(WORKER_REFRESH_SECONDS)
     except KeyboardInterrupt:
         write_log(project, f"{agent} worker interrupted")

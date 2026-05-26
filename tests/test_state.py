@@ -21,6 +21,7 @@ from mmux.cli import (
     ensure_layout,
     execute_driver_task,
     execute_tester_task,
+    execute_worker_available_task,
     export_worktree_patch,
     format_task_counts,
     format_task_delta,
@@ -497,8 +498,8 @@ class StateTests(unittest.TestCase):
         claude = build_agent_command("claude", project, "do work", output)
 
         self.assertEqual(codex[:2], ["codex", "exec"])
-        self.assertIn("--ask-for-approval", codex)
-        self.assertIn("never", codex)
+        self.assertIn("--sandbox", codex)
+        self.assertIn("workspace-write", codex)
         self.assertEqual(claude[:2], ["claude", "-p"])
         self.assertIn("--permission-mode", claude)
 
@@ -685,6 +686,47 @@ class StateTests(unittest.TestCase):
             self.assertEqual(tasks[-1].payload["adapter_cooldown_agent"], "claude")
             cooldowns = cli.list_agent_cooldowns(project)
             self.assertEqual(cooldowns[0][0], "claude")
+
+    def test_worker_falls_through_to_driver_when_tester_has_no_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+            enqueue_task(project, "driver task", resource=".")
+            roles = [
+                ("driver", 11, "2099-01-01T00:00:00+00:00"),
+                ("tester", 10, "2099-01-01T00:00:00+00:00"),
+            ]
+
+            original_driver = cli.execute_driver_task
+            original_tester = cli.execute_tester_task
+            calls = []
+
+            def fake_tester(*args, **kwargs):
+                raise AssertionError("tester should be skipped when no task awaits testing")
+
+            def fake_driver(_project, _agent, generation, **kwargs):
+                calls.append(("driver", generation, kwargs["timeout_seconds"]))
+                return "task #1 awaiting_test log=.mmux/runs/fake.log"
+
+            cli.execute_tester_task = fake_tester
+            cli.execute_driver_task = fake_driver
+            try:
+                message = execute_worker_available_task(
+                    project,
+                    "codex",
+                    roles,
+                    run_deadline="",
+                    agent_timeout_seconds=60,
+                    agent_no_output_seconds=30,
+                    test_timeout_seconds=60,
+                    shutdown_grace_seconds=15,
+                )
+            finally:
+                cli.execute_driver_task = original_driver
+                cli.execute_tester_task = original_tester
+
+            self.assertIn("awaiting_test", message)
+            self.assertEqual(calls, [("driver", 11, 60)])
 
     def test_execute_tester_task_applies_awaiting_patch_after_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
