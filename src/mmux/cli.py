@@ -1437,7 +1437,7 @@ def changed_json_files(worktree: Path, changed_files: Iterable[str]) -> list[str
 
 def has_unittest_tree(worktree: Path) -> bool:
     tests_dir = worktree / "tests"
-    return tests_dir.is_dir() and any(path.name.startswith("test") and path.suffix == ".py" for path in tests_dir.rglob("*.py"))
+    return tests_dir.is_dir() and any(path.name.startswith("test") for path in tests_dir.rglob("*.py"))
 
 
 SKIPPED_PROFILE_DIRS = {
