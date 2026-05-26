@@ -861,9 +861,17 @@ def release_resource_lock(
     resource: str,
     *,
     holder: Optional[str] = None,
+    role: Optional[str] = None,
+    role_generation: Optional[int] = None,
 ) -> LockOutcome:
     if holder is not None:
         validate_agent(holder)
+    if (role is None) != (role_generation is None):
+        raise ValueError("role and role_generation must be provided together")
+    if role is not None:
+        validate_role(role)
+    if role_generation is not None and role_generation <= 0:
+        raise ValueError("role_generation must be positive")
     normalized = normalize_resource(project, resource)
 
     db = connect(project)
@@ -872,14 +880,18 @@ def release_resource_lock(
         apply_schema(db)
         expire_resource_locks_db(db, utc_now_dt())
         row = db.execute(
-            "select holder, mode, lease_until, status from resource_locks where resource = ?",
+            """
+            select holder, mode, lease_until, status, role, role_generation
+            from resource_locks
+            where resource = ?
+            """,
             (normalized,),
         ).fetchone()
         if not row:
             db.rollback()
             return LockOutcome(False, normalized, holder or "", "", "", "missing", f"{normalized} is not locked")
 
-        current_holder, mode, lease_until, status = row
+        current_holder, mode, lease_until, status, current_role, current_generation = row
         if status != "active":
             db.rollback()
             return LockOutcome(
@@ -901,6 +913,17 @@ def release_resource_lock(
                 lease_until,
                 "conflict",
                 f"{normalized} is held by {current_holder}",
+            )
+        if role is not None and (current_role != role or current_generation != role_generation):
+            db.rollback()
+            return LockOutcome(
+                False,
+                normalized,
+                current_holder,
+                mode,
+                lease_until,
+                "stale_role",
+                f"{normalized} lock belongs to {current_role or 'no role'} generation {current_generation}",
             )
 
         db.execute("update resource_locks set status = ? where resource = ?", ("released", normalized))
@@ -2676,7 +2699,13 @@ def execute_driver_task(
         worktree = create_task_worktree(project, task, agent)
     except Exception as exc:
         release_task_claim(project, task.id, f"worktree creation failed: {exc}")
-        release_resource_lock(project, lock.resource, holder=agent)
+        release_resource_lock(
+            project,
+            lock.resource,
+            holder=agent,
+            role="driver",
+            role_generation=generation,
+        )
         release_role(project, "driver", holder=agent, generation=generation)
         return f"task #{task.id} requeued: worktree creation failed: {exc}"
 
@@ -2782,7 +2811,13 @@ def execute_driver_task(
         write_log(project, f"{agent} finished task #{task.id} ok={result.ok} log={result.log_file}")
         return f"task #{task.id} {'completed' if result.ok else 'failed'} log={result.log_file}"
     finally:
-        release_resource_lock(project, lock.resource, holder=agent)
+        release_resource_lock(
+            project,
+            lock.resource,
+            holder=agent,
+            role="driver",
+            role_generation=generation,
+        )
         release_role(project, "driver", holder=agent, generation=generation)
 
 
@@ -2907,7 +2942,13 @@ def execute_tester_task(
         write_log(project, f"{agent} tester completed task #{task.id} log={test_result.log_file}")
         return f"task #{task.id} completed log={test_result.log_file}"
     finally:
-        release_resource_lock(project, lock.resource, holder=agent)
+        release_resource_lock(
+            project,
+            lock.resource,
+            holder=agent,
+            role="tester",
+            role_generation=generation,
+        )
         release_role(project, "tester", holder=agent, generation=generation)
 
 

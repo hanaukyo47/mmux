@@ -299,6 +299,58 @@ class StateTests(unittest.TestCase):
             self.assertTrue(second.ok)
             self.assertEqual(locks[-1][1], "claude")
 
+    def test_release_resource_lock_rejects_stale_role_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+            first_role = acquire_role(project, "driver", "codex", ttl_seconds=60)
+            first_lock = acquire_resource_lock(
+                project,
+                ".",
+                "codex",
+                ttl_seconds=60,
+                role="driver",
+                role_generation=first_role.generation,
+            )
+            self.assertTrue(first_lock.ok)
+
+            expired_at = format_utc(utc_now_dt() - dt.timedelta(seconds=1))
+            with database(project) as db:
+                db.execute(
+                    "update role_leases set lease_until = ? where role = ?",
+                    (expired_at, "driver"),
+                )
+                db.execute(
+                    "update resource_locks set lease_until = ? where resource = ?",
+                    (expired_at, "."),
+                )
+
+            second_role = acquire_role(project, "driver", "codex", ttl_seconds=60)
+            second_lock = acquire_resource_lock(
+                project,
+                ".",
+                "codex",
+                ttl_seconds=60,
+                role="driver",
+                role_generation=second_role.generation,
+            )
+            stale_release = release_resource_lock(
+                project,
+                ".",
+                holder="codex",
+                role="driver",
+                role_generation=first_role.generation,
+            )
+            active_lock = list_resource_locks(project)[-1]
+
+            self.assertEqual(second_role.generation, first_role.generation + 1)
+            self.assertTrue(second_lock.ok)
+            self.assertFalse(stale_release.ok)
+            self.assertEqual(stale_release.status, "stale_role")
+            self.assertEqual(active_lock[4], "driver")
+            self.assertEqual(active_lock[5], second_role.generation)
+            self.assertEqual(active_lock[6], "active")
+
     def test_claim_next_task_is_exclusive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
