@@ -37,6 +37,7 @@ from mmux.cli import (
     state_path,
     stream_agent_command,
     supervisor_role_plan,
+    supervisor_role_plan_for_project,
     task_status_counts,
     list_tasks,
     update_worker_heartbeat,
@@ -145,6 +146,23 @@ class StateTests(unittest.TestCase):
         self.assertEqual(supervisor_role_plan(first), (("scout", "codex"), ("reviewer", "claude")))
         self.assertEqual(supervisor_role_plan(second), (("driver", "claude"), ("tester", "codex")))
 
+    def test_supervisor_project_plan_prioritizes_executable_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+            first = dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
+            second = dt.datetime.fromtimestamp(5 * 60, tz=dt.timezone.utc)
+
+            self.assertEqual(supervisor_role_plan_for_project(project, first), supervisor_role_plan(first))
+
+            enqueue_task(project, "pending task", resource=".")
+            self.assertEqual(supervisor_role_plan_for_project(project, first), (("driver", "codex"), ("tester", "claude")))
+            self.assertEqual(supervisor_role_plan_for_project(project, second), (("driver", "claude"), ("tester", "codex")))
+
+            with database(project) as db:
+                db.execute("update tasks set status = ? where id = ?", ("awaiting_test", 1))
+            self.assertEqual(supervisor_role_plan_for_project(project, first), (("tester", "codex"), ("driver", "claude")))
+
     def test_cleanup_runtime_state_releases_active_runtime_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -165,6 +183,38 @@ class StateTests(unittest.TestCase):
             self.assertEqual(role_status, "released")
             self.assertEqual(lock_status, "released")
             self.assertEqual(worker, ("stopped", None, None))
+
+    def test_cleanup_runtime_state_requeues_inflight_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+            running_id = enqueue_task(project, "driver task", resource=".")
+            test_id = enqueue_task(project, "tester task", resource=".")
+            with database(project) as db:
+                db.execute(
+                    """
+                    update tasks
+                    set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?
+                    where id = ?
+                    """,
+                    ("running", "codex", "driver", 1, running_id),
+                )
+                db.execute(
+                    """
+                    update tasks
+                    set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?
+                    where id = ?
+                    """,
+                    ("running_test", "claude", "tester", 2, test_id),
+                )
+
+            cleanup_runtime_state(project)
+            tasks = {task.id: task for task in list_tasks(project)}
+
+            self.assertEqual(tasks[running_id].status, "pending")
+            self.assertEqual(tasks[running_id].claimed_by, "")
+            self.assertEqual(tasks[test_id].status, "awaiting_test")
+            self.assertEqual(tasks[test_id].claimed_by, "")
 
     def test_resource_overlap_detects_directory_prefixes(self) -> None:
         self.assertTrue(resources_overlap(".", "src/mmux/cli.py"))

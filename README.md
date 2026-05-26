@@ -125,6 +125,9 @@ mmux stop /path/to/project
 - Agent execution happens in task git worktrees under `.mmux/worktrees/`.
 - Diff policy rejects protected paths and files outside the task resource.
 - Tester gate infers zero-config local checks before applying accepted patches.
+- Pending or awaiting-test work gets deterministic `driver/tester` priority
+  during timed runs.
+- Stopping a run requeues unfinished `running` and `running_test` tasks.
 - Time windows drive the loop; round counts are only internal diagnostics.
 - tmux is the observation layer, not the source of truth.
 

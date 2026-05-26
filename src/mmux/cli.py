@@ -141,8 +141,13 @@ def supervisor_assignment_slot(now: Optional[dt.datetime] = None) -> int:
 def supervisor_role_plan(now: Optional[dt.datetime] = None) -> tuple[tuple[str, str], ...]:
     slot = supervisor_assignment_slot(now)
     roles = ASSIGNMENT_ROLE_PAIRS[slot % len(ASSIGNMENT_ROLE_PAIRS)]
-    agents = AGENTS if slot % 2 == 0 else tuple(reversed(AGENTS))
+    agents = agent_order_for_slot(now)
     return tuple(zip(roles, agents))
+
+
+def agent_order_for_slot(now: Optional[dt.datetime] = None) -> tuple[str, ...]:
+    slot = supervisor_assignment_slot(now)
+    return AGENTS if slot % 2 == 0 else tuple(reversed(AGENTS))
 
 
 def seconds_until_next_assignment(now: Optional[dt.datetime] = None) -> int:
@@ -1133,6 +1138,27 @@ def cleanup_runtime_state(project: Path) -> None:
         return
     with database(project) as db:
         apply_schema(db)
+        now = utc_now()
+        driver_rows = db.execute("select id from tasks where status = ?", ("running",)).fetchall()
+        tester_rows = db.execute("select id from tasks where status = ?", ("running_test",)).fetchall()
+        db.execute(
+            """
+            update tasks
+            set status = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
+                claimed_at = '', updated_at = ?, last_error = ?
+            where status = ?
+            """,
+            ("pending", now, "runtime stopped before driver completed", "running"),
+        )
+        db.execute(
+            """
+            update tasks
+            set status = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
+                claimed_at = '', updated_at = ?, last_error = ?
+            where status = ?
+            """,
+            ("awaiting_test", now, "runtime stopped before tester completed", "running_test"),
+        )
         db.execute("update role_leases set status = ? where status = ?", ("released", "active"))
         db.execute("update resource_locks set status = ? where status = ?", ("released", "active"))
         db.execute(
@@ -1140,8 +1166,28 @@ def cleanup_runtime_state(project: Path) -> None:
             update worker_heartbeats
             set status = ?, role = null, generation = null, updated_at = ?
             """,
-            ("stopped", utc_now()),
+            ("stopped", now),
         )
+        for row in driver_rows:
+            record_event(
+                db,
+                "task_requeued",
+                {
+                    "id": int(row[0]),
+                    "status": "pending",
+                    "reason": "runtime stopped before driver completed",
+                },
+            )
+        for row in tester_rows:
+            record_event(
+                db,
+                "task_requeued",
+                {
+                    "id": int(row[0]),
+                    "status": "awaiting_test",
+                    "reason": "runtime stopped before tester completed",
+                },
+            )
         record_event(db, "runtime_stopped", {})
 
 
@@ -1958,6 +2004,16 @@ def has_open_tasks(project: Path) -> bool:
     return any(counts.get(status, 0) > 0 for status in OPEN_TASK_STATUSES)
 
 
+def supervisor_role_plan_for_project(project: Path, now: Optional[dt.datetime] = None) -> tuple[tuple[str, str], ...]:
+    counts = task_status_counts(project)
+    agents = agent_order_for_slot(now)
+    if counts.get("awaiting_test", 0) > 0:
+        return tuple(zip(("tester", "driver"), agents))
+    if counts.get("pending", 0) > 0:
+        return tuple(zip(("driver", "tester"), agents))
+    return supervisor_role_plan(now)
+
+
 def default_task_title(profile: ProjectProfile) -> str:
     ecosystem = ", ".join(profile.ecosystems) if profile.ecosystems else "general"
     return (
@@ -2315,7 +2371,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     try:
         while True:
             now = utc_now_dt()
-            plan = supervisor_role_plan(now)
+            plan = supervisor_role_plan_for_project(project, now)
             ttl = min(ROLE_LEASE_TTL_SECONDS, seconds_until_next_assignment(now))
             ensured: list[str] = []
             conflicts: list[str] = []

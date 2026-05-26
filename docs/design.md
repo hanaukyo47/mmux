@@ -119,6 +119,12 @@ current generation token for stale-sensitive actions, and expired leases can be
 claimed by another worker. Worker heartbeat rows are operational status only;
 they make the tmux panes and CLI state observable but do not decide policy.
 
+The baseline role plan still rotates across role pairs to avoid fixed agent
+ownership. When executable work is present, the project plan overrides that
+rotation deterministically: `awaiting_test` tasks prioritize `tester/driver`,
+and `pending` tasks prioritize `driver/tester`. Agent assignment still alternates
+by wall-clock slot, so Codex and Claude Code do not permanently own either role.
+
 Resource locks are exclusive path-prefix leases. A lock on `src` conflicts with
 `src/mmux/cli.py`, and a lock on `.` conflicts with every project file. When a
 worker acquires a resource lock under a role, the current role generation is
@@ -169,7 +175,9 @@ then lets wall-clock time drive the window.
 During the window, it writes periodic checkpoints with remaining time and task
 status counts to stdout and the supervisor log. At the deadline, or on
 `KeyboardInterrupt`, it stops the tmux session, clears runtime leases, locks, and
-heartbeats, records `run_finished`, and prints before/after/delta task counts.
+heartbeats, requeues unfinished `running` tasks to `pending`, requeues unfinished
+`running_test` tasks to `awaiting_test`, records `run_finished`, and prints
+before/after/delta task counts.
 
 By default, a timed run observes only. `--execute-agents` enables non-interactive
 Codex and Claude Code adapters inside the same deterministic gates described

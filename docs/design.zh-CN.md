@@ -108,6 +108,8 @@ SQLite 表：
 
 role lease 是以 role 为 key 的单行租约。持有者执行 stale-sensitive 动作时必须带上当前 generation token；过期 lease 可以被其他 worker 重新获取。worker heartbeat 只表示运行状态，用于 CLI 和 tmux pane 可观察性，不参与策略判断。
 
+基础 role plan 仍然按 role pair 轮转，避免 agent 固定占用某个角色。当存在可执行工作时，项目级 plan 会确定性覆盖轮转：有 `awaiting_test` 任务时优先 `tester/driver`，有 `pending` 任务时优先 `driver/tester`。agent 分配仍然按墙钟 slot 交替，所以 Codex 和 Claude Code 不会永久拥有某个角色。
+
 resource lock 是排他的路径前缀租约。锁住 `src` 会与 `src/mmux/cli.py` 冲突；锁住 `.` 会与整个项目冲突。worker 在某个 role 下获取 resource lock 时，当前 role generation 会写入 lock，防止过期 driver 工作继续提交。
 
 ## 任务执行
@@ -141,7 +143,7 @@ supervisor 仍然不调用模型。它只发放租约、检查文件事实、记
 
 `mmux run PROJECT --minutes N` 是普通使用时的顶层受控入口。它会在需要时初始化本地 `.mmux/` 目录，拒绝复用已经存在的 tmux session，先生成项目画像；如果任务队列里没有 pending 或进行中的工作，会自动补一个保守默认任务。`--no-default-task` 可以关闭这个队列引导，用于纯观察运行。随后命令记录 `run_started` 事件，启动与 `mmux start` 相同的四窗格工作区，并用墙钟时间驱动运行窗口。
 
-运行期间，它会定期把剩余时间和任务状态计数写到 stdout 与 supervisor log。到达时限或收到 `KeyboardInterrupt` 后，它会停止 tmux session，清理运行期 lease、lock、heartbeat，记录 `run_finished`，并打印 before/after/delta 任务汇总。
+运行期间，它会定期把剩余时间和任务状态计数写到 stdout 与 supervisor log。到达时限或收到 `KeyboardInterrupt` 后，它会停止 tmux session，清理运行期 lease、lock、heartbeat，把未完成的 `running` 任务恢复为 `pending`，把未完成的 `running_test` 任务恢复为 `awaiting_test`，记录 `run_finished`，并打印 before/after/delta 任务汇总。
 
 默认情况下，限时运行只观察，不让 agent 改代码。加上 `--execute-agents` 后，Codex 和 Claude Code 才会在上面描述的确定性 gate 内非交互执行任务。
 
