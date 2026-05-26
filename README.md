@@ -100,6 +100,7 @@ mmux inspect /path/to/project
 mmux run /path/to/project --minutes 30
 mmux run /path/to/project --minutes 30 --execute-agents
 mmux run /path/to/project --minutes 30 --no-default-task
+mmux run /path/to/project --minutes 30 --agent-no-output-seconds 120
 mmux start /path/to/project
 mmux start /path/to/project --execute-agents
 mmux attach /path/to/project
@@ -127,6 +128,8 @@ mmux stop /path/to/project
 - Tester gate infers zero-config local checks before applying accepted patches.
 - Pending or awaiting-test work gets deterministic `driver/tester` priority
   during timed runs.
+- Agent adapters have bounded runtime and no-output timeouts tied to the timed
+  run deadline.
 - Stopping a run requeues unfinished `running` and `running_test` tasks.
 - Time windows drive the loop; round counts are only internal diagnostics.
 - tmux is the observation layer, not the source of truth.

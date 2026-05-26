@@ -371,8 +371,8 @@ class StateTests(unittest.TestCase):
             original_start = cli.start_tmux_session
             original_stop = cli.stop_tmux_session
 
-            def fake_start(start_project, *, execute_agents=False):
-                calls.append(("start", start_project, execute_agents))
+            def fake_start(start_project, *, execute_agents=False, **kwargs):
+                calls.append(("start", start_project, execute_agents, kwargs))
                 return True
 
             def fake_stop(stop_project):
@@ -401,7 +401,8 @@ class StateTests(unittest.TestCase):
                 cli.stop_tmux_session = original_stop
 
             self.assertEqual(code, 0)
-            self.assertEqual(calls[0], ("start", project.resolve(), False))
+            self.assertEqual(calls[0][0:3], ("start", project.resolve(), False))
+            self.assertIn("run_deadline", calls[0][3])
             self.assertEqual(calls[-1], ("stop", project.resolve()))
             self.assertIn("run summary:", output.getvalue())
             self.assertEqual(task_status_counts(project.resolve()), {"pending": 1})
@@ -421,7 +422,7 @@ class StateTests(unittest.TestCase):
             original_start = cli.start_tmux_session
             original_stop = cli.stop_tmux_session
 
-            def fake_start(_project, *, execute_agents=False):
+            def fake_start(_project, *, execute_agents=False, **kwargs):
                 return True
 
             def fake_stop(stop_project):
@@ -454,7 +455,7 @@ class StateTests(unittest.TestCase):
             original_start = cli.start_tmux_session
             original_stop = cli.stop_tmux_session
 
-            def fake_start(_project, *, execute_agents=False):
+            def fake_start(_project, *, execute_agents=False, **kwargs):
                 return True
 
             def fake_stop(stop_project):
@@ -514,6 +515,26 @@ class StateTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(result.returncode, 0)
             self.assertIn("adapter ok", log_file.read_text(encoding="utf-8"))
+
+    def test_stream_agent_command_times_out_when_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+            log_file = project / ".mmux" / "runs" / "silent.log"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = stream_agent_command(
+                    project,
+                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    log_file,
+                    timeout_seconds=10,
+                    no_output_timeout_seconds=1,
+                )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.returncode, 124)
+            self.assertIn("produced no output", result.message)
+            self.assertIn("produced no output", log_file.read_text(encoding="utf-8"))
 
     def test_create_task_worktree_checks_out_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -614,7 +635,7 @@ class StateTests(unittest.TestCase):
 
             original = cli.invoke_agent_adapter
 
-            def fake_adapter(_project, execution_root, _agent, task, _generation, _resource):
+            def fake_adapter(_project, execution_root, _agent, task, _generation, _resource, **kwargs):
                 self.assertEqual(task.title, "change src")
                 (execution_root / "src" / "app.py").write_text("value = 4\n", encoding="utf-8")
                 return cli.AdapterResult(True, 0, ".mmux/runs/fake.log", "ok")
@@ -643,7 +664,7 @@ class StateTests(unittest.TestCase):
 
             original = cli.invoke_agent_adapter
 
-            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource):
+            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource, **kwargs):
                 (execution_root / "src" / "app.py").write_text("value = 4\n", encoding="utf-8")
                 return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
 
@@ -675,7 +696,7 @@ class StateTests(unittest.TestCase):
 
             original = cli.invoke_agent_adapter
 
-            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource):
+            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource, **kwargs):
                 (execution_root / "src" / "app.py").write_text("if True print('bad')\n", encoding="utf-8")
                 return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
 

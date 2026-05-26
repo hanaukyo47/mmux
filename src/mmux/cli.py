@@ -11,6 +11,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import shutil
 import select
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -26,7 +27,10 @@ WORKER_REFRESH_SECONDS = 5
 SUPERVISOR_TICK_SECONDS = 30
 SUPERVISOR_ASSIGNMENT_SECONDS = 5 * 60
 AGENT_TIMEOUT_SECONDS = 20 * 60
+AGENT_NO_OUTPUT_TIMEOUT_SECONDS = 2 * 60
 TEST_TIMEOUT_SECONDS = 10 * 60
+RUN_SHUTDOWN_GRACE_SECONDS = 15
+MIN_EXECUTION_BUDGET_SECONDS = 30
 ASSIGNMENT_ROLE_PAIRS = (
     ("scout", "reviewer"),
     ("driver", "tester"),
@@ -1590,7 +1594,7 @@ def command_text(command: Iterable[str]) -> str:
 
 
 def profile_to_dict(profile: ProjectProfile) -> dict[str, object]:
-    def checks_to_dict(checks: Iterable[ProjectCheck]) -> list[dict[str, str]]:
+    def checks_to_dict(checks: Iterable[ProjectCheck]) -> list[dict[str, object]]:
         return [
             {
                 "name": check.name,
@@ -1646,7 +1650,14 @@ def run_logged_test_command(
     return True, f"{name} passed"
 
 
-def run_tester_gate(project: Path, worktree: Path, task: TaskRecord, changed_files: Iterable[str]) -> TestGateResult:
+def run_tester_gate(
+    project: Path,
+    worktree: Path,
+    task: TaskRecord,
+    changed_files: Iterable[str],
+    *,
+    timeout_seconds: int = TEST_TIMEOUT_SECONDS,
+) -> TestGateResult:
     log_file = run_log_path(project, "tester", task.id)
     checks = build_tester_checks(worktree, changed_files)
 
@@ -1654,8 +1665,15 @@ def run_tester_gate(project: Path, worktree: Path, task: TaskRecord, changed_fil
         handle.write(f"{utc_now()} tester gate for task #{task.id}\n")
         handle.write(f"worktree: {worktree}\n")
         handle.write(f"changed_files: {', '.join(changed_files)}\n")
+        handle.write(f"timeout_seconds: {timeout_seconds}\n")
         for check in checks:
-            ok, message = run_logged_test_command(handle, worktree, check.name, list(check.command))
+            ok, message = run_logged_test_command(
+                handle,
+                worktree,
+                check.name,
+                list(check.command),
+                timeout_seconds=timeout_seconds,
+            )
             if not ok:
                 handle.write(f"\n{utc_now()} tester failed: {message}\n")
                 return TestGateResult(False, relative_to_project(project, log_file), message)
@@ -1712,17 +1730,44 @@ def build_agent_command(agent: str, project: Path, prompt: str, output_file: Pat
     raise ValueError(f"unknown agent: {agent}")
 
 
+def stop_process_tree(process: subprocess.Popen[str]) -> None:
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.kill()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            return
+        process.wait()
+
+
 def stream_agent_command(
     project: Path,
     cmd: list[str],
     log_file: Path,
     *,
     timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
 ) -> AdapterResult:
     started = time.monotonic()
+    last_output = started
     command_text = " ".join(sh_quote(part) for part in cmd)
     with log_file.open("w", encoding="utf-8") as handle:
         handle.write(f"{utc_now()} command: {command_text}\n\n")
+        handle.write(f"timeout_seconds: {timeout_seconds}\n")
+        handle.write(f"no_output_timeout_seconds: {no_output_timeout_seconds}\n\n")
         handle.flush()
         print(f"running: {command_text}")
         sys.stdout.flush()
@@ -1733,17 +1778,23 @@ def stream_agent_command(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
         assert process.stdout is not None
-        timed_out = False
+        timeout_reason = ""
         while True:
-            if time.monotonic() - started > timeout_seconds:
-                timed_out = True
-                process.kill()
+            now = time.monotonic()
+            if not timeout_reason and now - started > timeout_seconds:
+                timeout_reason = f"agent command timed out after {timeout_seconds}s"
+                stop_process_tree(process)
+            if not timeout_reason and now - last_output > no_output_timeout_seconds:
+                timeout_reason = f"agent command produced no output for {no_output_timeout_seconds}s"
+                stop_process_tree(process)
             ready, _write, _error = select.select([process.stdout], [], [], 1)
             if ready:
                 chunk = process.stdout.readline()
                 if chunk:
+                    last_output = time.monotonic()
                     print(chunk, end="")
                     handle.write(chunk)
                     handle.flush()
@@ -1755,15 +1806,13 @@ def stream_agent_command(
                     print(rest, end="")
                     handle.write(rest)
                 break
-            if timed_out:
-                process.wait()
+            if timeout_reason:
                 break
         process.stdout.close()
         returncode = process.returncode if process.returncode is not None else 124
-        if timed_out:
-            message = f"agent command timed out after {timeout_seconds}s"
-            handle.write(f"\n{utc_now()} {message}\n")
-            return AdapterResult(False, 124, relative_to_project(project, log_file), message)
+        if timeout_reason:
+            handle.write(f"\n{utc_now()} {timeout_reason}\n")
+            return AdapterResult(False, 124, relative_to_project(project, log_file), timeout_reason)
         message = f"agent command exited {returncode}"
         handle.write(f"\n{utc_now()} {message}\n")
         return AdapterResult(returncode == 0, returncode, relative_to_project(project, log_file), message)
@@ -1776,12 +1825,21 @@ def invoke_agent_adapter(
     task: TaskRecord,
     role_generation: int,
     resource: str,
+    *,
+    timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
 ) -> AdapterResult:
     prompt = build_agent_prompt(agent, task, role_generation, resource)
     log_file = run_log_path(project, agent, task.id)
     output_file = log_file.with_suffix(".last-message.txt")
     cmd = build_agent_command(agent, execution_root, prompt, output_file)
-    result = stream_agent_command(execution_root, cmd, log_file)
+    result = stream_agent_command(
+        execution_root,
+        cmd,
+        log_file,
+        timeout_seconds=timeout_seconds,
+        no_output_timeout_seconds=no_output_timeout_seconds,
+    )
     if output_file.exists():
         with log_file.open("a", encoding="utf-8") as handle:
             handle.write("\n--- last message ---\n")
@@ -2200,13 +2258,36 @@ def cmd_lock_release(args: argparse.Namespace) -> int:
     return 0
 
 
-def start_tmux_session(project: Path, *, execute_agents: bool = False) -> bool:
+def start_tmux_session(
+    project: Path,
+    *,
+    execute_agents: bool = False,
+    run_deadline: str = "",
+    agent_timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+    agent_no_output_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+    test_timeout_seconds: int = TEST_TIMEOUT_SECONDS,
+    shutdown_grace_seconds: int = RUN_SHUTDOWN_GRACE_SECONDS,
+) -> bool:
     name = session_name(project)
     if tmux_has_session(name):
         return False
 
     supervisor_cmd = module_command(project, "supervisor")
     worker_flags = ["--execute-agents"] if execute_agents else []
+    worker_flags.extend(
+        [
+            "--agent-timeout-seconds",
+            str(agent_timeout_seconds),
+            "--agent-no-output-seconds",
+            str(agent_no_output_seconds),
+            "--test-timeout-seconds",
+            str(test_timeout_seconds),
+            "--shutdown-grace-seconds",
+            str(shutdown_grace_seconds),
+        ]
+    )
+    if run_deadline:
+        worker_flags.extend(["--run-deadline", run_deadline])
     codex_cmd = module_command(project, "worker", *worker_flags, "codex")
     claude_cmd = module_command(project, "worker", *worker_flags, "claude")
     log_cmd = f"mkdir -p .mmux/logs; touch .mmux/logs/supervisor.log; tail -f .mmux/logs/supervisor.log"
@@ -2279,6 +2360,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     duration_seconds = args.seconds if args.seconds is not None else max(1, int(args.minutes * 60))
     checkpoint_seconds = min(args.checkpoint_seconds, duration_seconds)
+    run_deadline = format_utc(utc_now_dt() + dt.timedelta(seconds=duration_seconds))
     profile = inspect_project(project)
     default_task_id = None
     if not args.no_default_task:
@@ -2294,15 +2376,32 @@ def cmd_run(args: argparse.Namespace) -> int:
             "execute_agents": args.execute_agents,
             "task": args.task or "",
             "default_task_id": default_task_id,
+            "run_deadline": run_deadline,
+            "agent_timeout_seconds": args.agent_timeout_seconds,
+            "agent_no_output_seconds": args.agent_no_output_seconds,
+            "test_timeout_seconds": args.test_timeout_seconds,
+            "shutdown_grace_seconds": args.shutdown_grace_seconds,
         },
     )
 
-    if not start_tmux_session(project, execute_agents=args.execute_agents):
+    if not start_tmux_session(
+        project,
+        execute_agents=args.execute_agents,
+        run_deadline=run_deadline,
+        agent_timeout_seconds=args.agent_timeout_seconds,
+        agent_no_output_seconds=args.agent_no_output_seconds,
+        test_timeout_seconds=args.test_timeout_seconds,
+        shutdown_grace_seconds=args.shutdown_grace_seconds,
+    ):
         raise SystemExit(f"tmux session already exists: {name}")
 
     print(f"started timed run: {name}")
     print(f"duration: {duration_seconds}s")
+    print(f"deadline: {run_deadline}")
     print(f"agent execution: {'enabled' if args.execute_agents else 'disabled'}")
+    print(f"agent timeout max: {args.agent_timeout_seconds}s")
+    print(f"agent no-output timeout: {args.agent_no_output_seconds}s")
+    print(f"test timeout max: {args.test_timeout_seconds}s")
     print(f"profile: ecosystems={format_names(profile.ecosystems)} languages={format_names(profile.languages)}")
     print(f"active checks: {format_check_names(profile.active_checks)}")
     if default_task_id is not None:
@@ -2412,11 +2511,39 @@ def task_worktree_path(project: Path, task: TaskRecord) -> Optional[Path]:
     return path if path.is_absolute() else project / path
 
 
-def execute_driver_task(project: Path, agent: str, generation: int) -> str:
+def seconds_until_deadline(deadline: str) -> Optional[int]:
+    if not deadline:
+        return None
+    remaining = int((parse_utc(deadline) - utc_now_dt()).total_seconds())
+    return max(0, remaining)
+
+
+def execution_budget_seconds(deadline: str, configured_timeout: int, shutdown_grace_seconds: int) -> int:
+    remaining = seconds_until_deadline(deadline)
+    if remaining is None:
+        return configured_timeout
+    return max(0, min(configured_timeout, remaining - shutdown_grace_seconds))
+
+
+def format_budget(deadline: str, timeout_seconds: int, shutdown_grace_seconds: int) -> str:
+    remaining = seconds_until_deadline(deadline)
+    if remaining is None:
+        return f"{timeout_seconds}s"
+    return f"{execution_budget_seconds(deadline, timeout_seconds, shutdown_grace_seconds)}s remaining_budget={remaining}s"
+
+
+def execute_driver_task(
+    project: Path,
+    agent: str,
+    generation: int,
+    *,
+    timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> str:
     task = claim_next_task(project, agent, "driver", generation)
     if task is None:
         return "no pending task"
-    role = acquire_role(project, "driver", agent, AGENT_TIMEOUT_SECONDS + 60, renew_if_same=True)
+    role = acquire_role(project, "driver", agent, timeout_seconds + 60, renew_if_same=True)
     if not role.ok or role.generation != generation:
         release_task_claim(project, task.id, "driver role lease is stale")
         return f"task #{task.id} requeued: driver role lease is stale"
@@ -2426,7 +2553,7 @@ def execute_driver_task(project: Path, agent: str, generation: int) -> str:
         project,
         resource,
         agent,
-        max(RESOURCE_LOCK_TTL_SECONDS, AGENT_TIMEOUT_SECONDS + 60),
+        max(RESOURCE_LOCK_TTL_SECONDS, timeout_seconds + 60),
         role="driver",
         role_generation=generation,
         renew_if_same=True,
@@ -2451,9 +2578,20 @@ def execute_driver_task(project: Path, agent: str, generation: int) -> str:
         print(f"executing task #{task.id}: {task.title}")
         print(f"resource lock: {lock.resource}")
         print(f"worktree: {worktree}")
+        print(f"agent timeout: {timeout_seconds}s")
+        print(f"no-output timeout: {no_output_timeout_seconds}s")
         sys.stdout.flush()
         try:
-            result = invoke_agent_adapter(project, worktree, agent, task, generation, lock.resource)
+            result = invoke_agent_adapter(
+                project,
+                worktree,
+                agent,
+                task,
+                generation,
+                lock.resource,
+                timeout_seconds=timeout_seconds,
+                no_output_timeout_seconds=min(no_output_timeout_seconds, timeout_seconds),
+            )
         except Exception as exc:
             message = f"agent adapter failed: {exc}"
             finish_task(
@@ -2522,11 +2660,17 @@ def execute_driver_task(project: Path, agent: str, generation: int) -> str:
         release_role(project, "driver", holder=agent, generation=generation)
 
 
-def execute_tester_task(project: Path, agent: str, generation: int) -> str:
+def execute_tester_task(
+    project: Path,
+    agent: str,
+    generation: int,
+    *,
+    timeout_seconds: int = TEST_TIMEOUT_SECONDS,
+) -> str:
     task = claim_next_test_task(project, agent, generation)
     if task is None:
         return "no awaiting_test task"
-    role = acquire_role(project, "tester", agent, TEST_TIMEOUT_SECONDS + 60, renew_if_same=True)
+    role = acquire_role(project, "tester", agent, timeout_seconds + 60, renew_if_same=True)
     if not role.ok or role.generation != generation:
         release_task_claim_to(
             project,
@@ -2542,7 +2686,7 @@ def execute_tester_task(project: Path, agent: str, generation: int) -> str:
         project,
         resource,
         agent,
-        max(RESOURCE_LOCK_TTL_SECONDS, TEST_TIMEOUT_SECONDS + 60),
+        max(RESOURCE_LOCK_TTL_SECONDS, timeout_seconds + 60),
         role="tester",
         role_generation=generation,
         renew_if_same=True,
@@ -2564,6 +2708,7 @@ def execute_tester_task(project: Path, agent: str, generation: int) -> str:
         print(f"testing task #{task.id}: {task.title}")
         print(f"resource lock: {lock.resource}")
         print(f"worktree: {worktree}")
+        print(f"test timeout: {timeout_seconds}s")
         sys.stdout.flush()
 
         policy = check_diff_policy(project, worktree, lock.resource)
@@ -2593,7 +2738,7 @@ def execute_tester_task(project: Path, agent: str, generation: int) -> str:
             write_log(project, f"{agent} tester rejected task #{task.id}: {policy.reason}")
             return f"task #{task.id} rejected: {policy.reason}"
 
-        test_result = run_tester_gate(project, worktree, task, policy.changed_files)
+        test_result = run_tester_gate(project, worktree, task, policy.changed_files, timeout_seconds=timeout_seconds)
         payload_updates["tester_log"] = test_result.log_file
         if not test_result.ok:
             finish_task(
@@ -2669,6 +2814,10 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     f"project: {project}",
                     f"status: {status}",
                     f"agent execution: {'enabled' if args.execute_agents else 'disabled'}",
+                    f"run deadline: {args.run_deadline or 'none'}",
+                    f"driver budget: {format_budget(args.run_deadline, args.agent_timeout_seconds, args.shutdown_grace_seconds)}",
+                    f"tester budget: {format_budget(args.run_deadline, args.test_timeout_seconds, args.shutdown_grace_seconds)}",
+                    f"no-output timeout: {args.agent_no_output_seconds}s",
                     "role leases:",
                     *role_lines,
                     "",
@@ -2683,13 +2832,35 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 tester = next((role for role in roles if role[0] == "tester"), None)
                 driver = next((role for role in roles if role[0] == "driver"), None)
                 if tester:
-                    message = execute_tester_task(project, agent, tester[1])
+                    budget = execution_budget_seconds(
+                        args.run_deadline,
+                        args.test_timeout_seconds,
+                        args.shutdown_grace_seconds,
+                    )
+                    if budget < MIN_EXECUTION_BUDGET_SECONDS:
+                        message = f"not enough run time for tester budget={budget}s"
+                    else:
+                        message = execute_tester_task(project, agent, tester[1], timeout_seconds=budget)
                     if message != "no awaiting_test task":
                         print(message)
                         sys.stdout.flush()
                         last_rendered = ""
                 elif driver:
-                    message = execute_driver_task(project, agent, driver[1])
+                    budget = execution_budget_seconds(
+                        args.run_deadline,
+                        args.agent_timeout_seconds,
+                        args.shutdown_grace_seconds,
+                    )
+                    if budget < MIN_EXECUTION_BUDGET_SECONDS:
+                        message = f"not enough run time for driver budget={budget}s"
+                    else:
+                        message = execute_driver_task(
+                            project,
+                            agent,
+                            driver[1],
+                            timeout_seconds=budget,
+                            no_output_timeout_seconds=min(args.agent_no_output_seconds, budget),
+                        )
                     if message != "no pending task":
                         print(message)
                         sys.stdout.flush()
@@ -2800,6 +2971,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--minutes", type=positive_float, default=30.0)
     run_parser.add_argument("--seconds", type=positive_seconds, help=argparse.SUPPRESS)
     run_parser.add_argument("--checkpoint-seconds", type=positive_seconds, default=60)
+    run_parser.add_argument("--agent-timeout-seconds", type=positive_seconds, default=AGENT_TIMEOUT_SECONDS)
+    run_parser.add_argument("--agent-no-output-seconds", type=positive_seconds, default=AGENT_NO_OUTPUT_TIMEOUT_SECONDS)
+    run_parser.add_argument("--test-timeout-seconds", type=positive_seconds, default=TEST_TIMEOUT_SECONDS)
+    run_parser.add_argument("--shutdown-grace-seconds", type=positive_seconds, default=RUN_SHUTDOWN_GRACE_SECONDS)
     run_parser.add_argument("--task", default="")
     run_parser.add_argument(
         "--no-default-task",
@@ -2829,6 +3004,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("agent", choices=AGENTS)
     worker.add_argument("--project", default=".")
     worker.add_argument("--execute-agents", action="store_true")
+    worker.add_argument("--run-deadline", default="")
+    worker.add_argument("--agent-timeout-seconds", type=positive_seconds, default=AGENT_TIMEOUT_SECONDS)
+    worker.add_argument("--agent-no-output-seconds", type=positive_seconds, default=AGENT_NO_OUTPUT_TIMEOUT_SECONDS)
+    worker.add_argument("--test-timeout-seconds", type=positive_seconds, default=TEST_TIMEOUT_SECONDS)
+    worker.add_argument("--shutdown-grace-seconds", type=positive_seconds, default=RUN_SHUTDOWN_GRACE_SECONDS)
     worker.set_defaults(func=cmd_worker)
 
     return parser

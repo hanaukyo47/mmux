@@ -183,6 +183,13 @@ By default, a timed run observes only. `--execute-agents` enables non-interactiv
 Codex and Claude Code adapters inside the same deterministic gates described
 above.
 
+Timed runs pass their absolute deadline to workers. Before claiming work, a
+worker computes a remaining execution budget from that deadline, the configured
+adapter timeout, and a shutdown grace period. Workers refuse to start a new
+driver or tester action when the remaining budget is too small. Agent adapters
+also have a no-output timeout; if a CLI produces no stdout/stderr for the
+configured interval, mmux terminates it and records the reason in the task log.
+
 ## Tmux Layout
 
 The first workspace uses four panes:
