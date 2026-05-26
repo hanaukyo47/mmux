@@ -87,9 +87,15 @@ SQLite tables:
 - `meta`
 - `tasks`
 - `role_leases`
+- `worker_heartbeats`
 - `resource_locks`
 - `events`
 - `frontier_items`
+
+Role leases are single-row leases keyed by role. A lease holder must present the
+current generation token for stale-sensitive actions, and expired leases can be
+claimed by another worker. Worker heartbeat rows are operational status only;
+they make the tmux panes and CLI state observable but do not decide policy.
 
 ## Tmux Layout
 

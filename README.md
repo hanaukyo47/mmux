@@ -17,9 +17,12 @@ This repository starts as the control-plane skeleton:
 - `mmux start` creates a four-pane tmux workspace for supervisor, Codex worker,
   Claude worker, and logs.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
+- `mmux roles` prints role leases and worker heartbeats.
+- `mmux lease acquire/release` exercises deterministic role leasing.
 
-The first implementation intentionally does not let agents edit code. That comes
-after role leases, resource locks, and policy checks are in place.
+The current worker adapter records heartbeat and role-lease state, but it still
+does not let agents edit code. Real model adapters come after resource locks and
+policy checks are in place.
 
 ## Install For Local Development
 
@@ -45,6 +48,9 @@ mmux doctor
 mmux start /path/to/project
 mmux attach /path/to/project
 mmux status /path/to/project
+mmux roles /path/to/project
+mmux lease acquire scout --agent codex --project /path/to/project
+mmux lease release scout --agent codex --project /path/to/project
 mmux stop /path/to/project
 ```
 
