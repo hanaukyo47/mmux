@@ -26,6 +26,7 @@ WORKER_REFRESH_SECONDS = 5
 SUPERVISOR_TICK_SECONDS = 30
 SUPERVISOR_ASSIGNMENT_SECONDS = 5 * 60
 AGENT_TIMEOUT_SECONDS = 20 * 60
+TEST_TIMEOUT_SECONDS = 10 * 60
 ASSIGNMENT_ROLE_PAIRS = (
     ("scout", "reviewer"),
     ("driver", "tester"),
@@ -83,6 +84,13 @@ class DiffPolicyResult:
     status: str
     changed_files: tuple[str, ...]
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class TestGateResult:
+    ok: bool
+    log_file: str
+    message: str
 
 
 def utc_now_dt() -> dt.datetime:
@@ -904,7 +912,15 @@ def list_tasks(project: Path) -> list[TaskRecord]:
         return [task_from_row(row) for row in rows]
 
 
-def claim_next_task(project: Path, agent: str, role: str, generation: int) -> Optional[TaskRecord]:
+def claim_task_with_status(
+    project: Path,
+    agent: str,
+    role: str,
+    generation: int,
+    *,
+    source_status: str,
+    running_status: str,
+) -> Optional[TaskRecord]:
     validate_agent(agent)
     validate_role(role)
     db = connect(project)
@@ -923,7 +939,7 @@ def claim_next_task(project: Path, agent: str, role: str, generation: int) -> Op
             order by id
             limit 1
             """,
-            ("pending",),
+            (source_status,),
         ).fetchone()
         if not row:
             db.rollback()
@@ -937,15 +953,22 @@ def claim_next_task(project: Path, agent: str, role: str, generation: int) -> Op
                 claimed_at = ?, updated_at = ?, last_error = ''
             where id = ? and status = ?
             """,
-            ("running", agent, role, generation, now, now, task.id, "pending"),
+            (running_status, agent, role, generation, now, now, task.id, source_status),
         )
         record_event(
             db,
             "task_claimed",
-            {"id": task.id, "agent": agent, "role": role, "generation": generation},
+            {
+                "id": task.id,
+                "agent": agent,
+                "role": role,
+                "generation": generation,
+                "from": source_status,
+                "to": running_status,
+            },
         )
         db.commit()
-        return TaskRecord(task.id, task.title, "running", task.payload, agent, role, generation)
+        return TaskRecord(task.id, task.title, running_status, task.payload, agent, role, generation)
     except Exception:
         db.rollback()
         raise
@@ -953,7 +976,33 @@ def claim_next_task(project: Path, agent: str, role: str, generation: int) -> Op
         db.close()
 
 
+def claim_next_task(project: Path, agent: str, role: str, generation: int) -> Optional[TaskRecord]:
+    return claim_task_with_status(
+        project,
+        agent,
+        role,
+        generation,
+        source_status="pending",
+        running_status="running",
+    )
+
+
+def claim_next_test_task(project: Path, agent: str, generation: int) -> Optional[TaskRecord]:
+    return claim_task_with_status(
+        project,
+        agent,
+        "tester",
+        generation,
+        source_status="awaiting_test",
+        running_status="running_test",
+    )
+
+
 def release_task_claim(project: Path, task_id: int, reason: str) -> None:
+    release_task_claim_to(project, task_id, "pending", reason, running_status="running")
+
+
+def release_task_claim_to(project: Path, task_id: int, target_status: str, reason: str, *, running_status: str) -> None:
     with database(project) as db:
         apply_schema(db)
         now = utc_now()
@@ -964,9 +1013,42 @@ def release_task_claim(project: Path, task_id: int, reason: str) -> None:
                 claimed_at = '', updated_at = ?, last_error = ?
             where id = ? and status = ?
             """,
-            ("pending", now, reason, task_id, "running"),
+            (target_status, now, reason, task_id, running_status),
         )
-        record_event(db, "task_requeued", {"id": task_id, "reason": reason})
+        record_event(db, "task_requeued", {"id": task_id, "status": target_status, "reason": reason})
+
+
+def move_task_to_status(
+    project: Path,
+    task_id: int,
+    status: str,
+    *,
+    message: str = "",
+    log_file: str = "",
+    payload_updates: Optional[dict[str, object]] = None,
+) -> None:
+    with database(project) as db:
+        apply_schema(db)
+        row = db.execute("select payload from tasks where id = ?", (task_id,)).fetchone()
+        payload = decode_payload(row[0]) if row else {}
+        if payload_updates:
+            payload.update(payload_updates)
+        if log_file:
+            payload["last_run_log"] = log_file
+        if message:
+            payload["last_message"] = message[:2000]
+        now = utc_now()
+        last_error = message if status in {"failed", "rejected"} else ""
+        db.execute(
+            """
+            update tasks
+            set status = ?, payload = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
+                claimed_at = '', updated_at = ?, last_error = ?
+            where id = ?
+            """,
+            (status, encode_payload(payload), now, last_error, task_id),
+        )
+        record_event(db, "task_status_changed", {"id": task_id, "status": status, "log_file": log_file})
 
 
 def update_task_payload(project: Path, task_id: int, updates: dict[str, object]) -> None:
@@ -1004,13 +1086,15 @@ def finish_task(
         if message:
             payload["last_message"] = message[:2000]
         now = utc_now()
+        last_error = message if status in {"failed", "rejected"} else ""
         db.execute(
             """
             update tasks
-            set status = ?, payload = ?, updated_at = ?, finished_at = ?, last_error = ?
+            set status = ?, payload = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
+                claimed_at = '', updated_at = ?, finished_at = ?, last_error = ?
             where id = ?
             """,
-            (status, encode_payload(payload), now, now, "" if status == "completed" else message, task_id),
+            (status, encode_payload(payload), now, now, last_error, task_id),
         )
         record_event(db, "task_finished", {"id": task_id, "status": status, "log_file": log_file})
 
@@ -1020,6 +1104,23 @@ def write_log(project: Path, message: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"{utc_now()} {message}\n")
+
+
+def cleanup_runtime_state(project: Path) -> None:
+    if not state_path(project).exists():
+        return
+    with database(project) as db:
+        apply_schema(db)
+        db.execute("update role_leases set status = ? where status = ?", ("released", "active"))
+        db.execute("update resource_locks set status = ? where status = ?", ("released", "active"))
+        db.execute(
+            """
+            update worker_heartbeats
+            set status = ?, role = null, generation = null, updated_at = ?
+            """,
+            ("stopped", utc_now()),
+        )
+        record_event(db, "runtime_stopped", {})
 
 
 def require_project_state(project: Path) -> None:
@@ -1134,6 +1235,79 @@ def apply_worktree_patch(project: Path, patch: str) -> None:
     if not main_worktree_is_clean(project):
         raise RuntimeError("main worktree has tracked changes; refusing to apply task patch")
     run_with_input(["git", "apply", "--binary", "-"], cwd=project, input_text=patch)
+
+
+def changed_python_files(worktree: Path, changed_files: Iterable[str]) -> list[str]:
+    return sorted(
+        path
+        for path in changed_files
+        if path.endswith(".py") and (worktree / path).exists()
+    )
+
+
+def has_unittest_tree(worktree: Path) -> bool:
+    tests_dir = worktree / "tests"
+    return tests_dir.is_dir() and any(path.name.startswith("test") and path.suffix == ".py" for path in tests_dir.rglob("*.py"))
+
+
+def run_logged_test_command(
+    handle,
+    worktree: Path,
+    name: str,
+    cmd: list[str],
+    *,
+    timeout_seconds: int = TEST_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    command_text = " ".join(sh_quote(part) for part in cmd)
+    handle.write(f"\n--- {name}: {command_text} ---\n")
+    handle.flush()
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(worktree),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        handle.write(output)
+        message = f"{name} timed out after {timeout_seconds}s"
+        handle.write(f"\n{message}\n")
+        return False, message
+
+    handle.write(result.stdout or "")
+    if result.returncode != 0:
+        return False, f"{name} exited {result.returncode}"
+    return True, f"{name} passed"
+
+
+def run_tester_gate(project: Path, worktree: Path, task: TaskRecord, changed_files: Iterable[str]) -> TestGateResult:
+    log_file = run_log_path(project, "tester", task.id)
+    checks: list[tuple[str, list[str]]] = [
+        ("diff-check", ["git", "diff", "--check", "HEAD", "--"]),
+    ]
+    py_files = changed_python_files(worktree, changed_files)
+    if py_files:
+        checks.append(("py-compile", [sys.executable, "-m", "py_compile", *py_files]))
+    if has_unittest_tree(worktree):
+        checks.append(("unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests"]))
+
+    with log_file.open("w", encoding="utf-8") as handle:
+        handle.write(f"{utc_now()} tester gate for task #{task.id}\n")
+        handle.write(f"worktree: {worktree}\n")
+        handle.write(f"changed_files: {', '.join(changed_files)}\n")
+        for name, cmd in checks:
+            ok, message = run_logged_test_command(handle, worktree, name, cmd)
+            if not ok:
+                handle.write(f"\n{utc_now()} tester failed: {message}\n")
+                return TestGateResult(False, relative_to_project(project, log_file), message)
+        handle.write(f"\n{utc_now()} tester passed\n")
+    return TestGateResult(True, relative_to_project(project, log_file), "tester passed")
 
 
 def build_agent_prompt(agent: str, task: TaskRecord, role_generation: int, resource: str) -> str:
@@ -1578,9 +1752,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if not shutil.which("tmux"):
         raise SystemExit("tmux is not installed")
     if not tmux_has_session(name):
+        cleanup_runtime_state(project)
         print(f"tmux session not running: {name}")
         return 0
     run(["tmux", "kill-session", "-t", name])
+    cleanup_runtime_state(project)
     write_log(project, f"stopped tmux session {name}")
     print(f"stopped tmux session: {name}")
     return 0
@@ -1628,6 +1804,14 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
 def task_resource(task: TaskRecord) -> str:
     resource = task.payload.get("resource", ".")
     return str(resource) if isinstance(resource, str) else "."
+
+
+def task_worktree_path(project: Path, task: TaskRecord) -> Optional[Path]:
+    value = task.payload.get("worktree")
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else project / path
 
 
 def execute_driver_task(project: Path, agent: str, generation: int) -> str:
@@ -1713,28 +1897,22 @@ def execute_driver_task(project: Path, agent: str, generation: int) -> str:
             write_log(project, f"{agent} rejected task #{task.id}: {policy.reason}")
             return f"task #{task.id} rejected: {policy.reason}"
         if result.ok:
-            try:
-                patch = export_worktree_patch(worktree)
-                apply_worktree_patch(project, patch)
-                payload_updates["patch_applied"] = True
-            except Exception as exc:
-                message = f"patch apply failed: {exc}"
-                payload_updates["patch_applied"] = False
-                finish_task(
-                    project,
-                    task.id,
-                    "failed",
-                    message=message,
-                    log_file=result.log_file,
-                    payload_updates=payload_updates,
-                )
-                write_log(project, f"{agent} failed to apply task #{task.id}: {exc}")
-                return f"task #{task.id} failed: {message}"
+            payload_updates["driver_log"] = result.log_file
+            move_task_to_status(
+                project,
+                task.id,
+                "awaiting_test",
+                message=result.message,
+                log_file=result.log_file,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} moved task #{task.id} to awaiting_test log={result.log_file}")
+            return f"task #{task.id} awaiting_test log={result.log_file}"
 
         finish_task(
             project,
             task.id,
-            "completed" if result.ok else "failed",
+            "failed",
             message=result.message,
             log_file=result.log_file,
             payload_updates=payload_updates,
@@ -1744,6 +1922,124 @@ def execute_driver_task(project: Path, agent: str, generation: int) -> str:
     finally:
         release_resource_lock(project, lock.resource, holder=agent)
         release_role(project, "driver", holder=agent, generation=generation)
+
+
+def execute_tester_task(project: Path, agent: str, generation: int) -> str:
+    task = claim_next_test_task(project, agent, generation)
+    if task is None:
+        return "no awaiting_test task"
+    role = acquire_role(project, "tester", agent, TEST_TIMEOUT_SECONDS + 60, renew_if_same=True)
+    if not role.ok or role.generation != generation:
+        release_task_claim_to(
+            project,
+            task.id,
+            "awaiting_test",
+            "tester role lease is stale",
+            running_status="running_test",
+        )
+        return f"task #{task.id} requeued: tester role lease is stale"
+
+    resource = task_resource(task)
+    lock = acquire_resource_lock(
+        project,
+        resource,
+        agent,
+        max(RESOURCE_LOCK_TTL_SECONDS, TEST_TIMEOUT_SECONDS + 60),
+        role="tester",
+        role_generation=generation,
+        renew_if_same=True,
+    )
+    if not lock.ok:
+        release_task_claim_to(project, task.id, "awaiting_test", lock.reason, running_status="running_test")
+        release_role(project, "tester", holder=agent, generation=generation)
+        return f"task #{task.id} requeued: {lock.reason}"
+
+    try:
+        worktree = task_worktree_path(project, task)
+        if worktree is None or not worktree.exists():
+            message = "task worktree is missing"
+            finish_task(project, task.id, "failed", message=message)
+            write_log(project, f"{agent} failed tester task #{task.id}: {message}")
+            return f"task #{task.id} failed: {message}"
+
+        update_worker_heartbeat(project, agent, "testing", role="tester", generation=generation)
+        print(f"testing task #{task.id}: {task.title}")
+        print(f"resource lock: {lock.resource}")
+        print(f"worktree: {worktree}")
+        sys.stdout.flush()
+
+        policy = check_diff_policy(project, worktree, lock.resource)
+        payload_updates = {
+            "worktree": relative_to_project(project, worktree),
+            "diff_policy": policy.status,
+            "changed_files": list(policy.changed_files),
+        }
+        if policy.status == "no_change":
+            finish_task(
+                project,
+                task.id,
+                "no_change",
+                message=policy.reason,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} tester found no changes for task #{task.id}")
+            return f"task #{task.id} no_change"
+        if not policy.ok:
+            finish_task(
+                project,
+                task.id,
+                "rejected",
+                message=policy.reason,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} tester rejected task #{task.id}: {policy.reason}")
+            return f"task #{task.id} rejected: {policy.reason}"
+
+        test_result = run_tester_gate(project, worktree, task, policy.changed_files)
+        payload_updates["tester_log"] = test_result.log_file
+        if not test_result.ok:
+            finish_task(
+                project,
+                task.id,
+                "failed",
+                message=test_result.message,
+                log_file=test_result.log_file,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} tester failed task #{task.id}: {test_result.message}")
+            return f"task #{task.id} failed: {test_result.message}"
+
+        try:
+            patch = export_worktree_patch(worktree)
+            apply_worktree_patch(project, patch)
+            payload_updates["patch_applied"] = True
+        except Exception as exc:
+            message = f"patch apply failed: {exc}"
+            payload_updates["patch_applied"] = False
+            finish_task(
+                project,
+                task.id,
+                "failed",
+                message=message,
+                log_file=test_result.log_file,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} tester failed to apply task #{task.id}: {exc}")
+            return f"task #{task.id} failed: {message}"
+
+        finish_task(
+            project,
+            task.id,
+            "completed",
+            message=test_result.message,
+            log_file=test_result.log_file,
+            payload_updates=payload_updates,
+        )
+        write_log(project, f"{agent} tester completed task #{task.id} log={test_result.log_file}")
+        return f"task #{task.id} completed log={test_result.log_file}"
+    finally:
+        release_resource_lock(project, lock.resource, holder=agent)
+        release_role(project, "tester", holder=agent, generation=generation)
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
@@ -1778,7 +2074,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     "role leases:",
                     *role_lines,
                     "",
-                    "adapter: driver role executes pending tasks when enabled",
+                    "adapter: driver writes task worktrees; tester gates and applies patches",
                 ]
             )
             if rendered != last_rendered:
@@ -1786,8 +2082,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 sys.stdout.flush()
                 last_rendered = rendered
             if args.execute_agents:
+                tester = next((role for role in roles if role[0] == "tester"), None)
                 driver = next((role for role in roles if role[0] == "driver"), None)
-                if driver:
+                if tester:
+                    message = execute_tester_task(project, agent, tester[1])
+                    if message != "no awaiting_test task":
+                        print(message)
+                        sys.stdout.flush()
+                        last_rendered = ""
+                elif driver:
                     message = execute_driver_task(project, agent, driver[1])
                     if message != "no pending task":
                         print(message)

@@ -26,8 +26,9 @@ This repository starts as the control-plane skeleton:
 By default, workers record heartbeat and lease state without editing code. Use
 `mmux start --execute-agents` to allow the worker holding `driver` to claim a
 pending task, acquire its resource lock, create an isolated git worktree, and run
-Codex or Claude Code non-interactively. Accepted diffs are applied back to the
-main worktree only after deterministic policy checks pass.
+Codex or Claude Code non-interactively. Accepted driver diffs move to
+`awaiting_test`; the worker holding `tester` runs deterministic checks and only
+then applies the patch back to the main worktree.
 
 ## Install For Local Development
 
@@ -74,6 +75,7 @@ mmux stop /path/to/project
 - Resource locks prevent concurrent writes to the same files or modules.
 - Agent execution happens in task git worktrees under `.mmux/worktrees/`.
 - Diff policy rejects protected paths and files outside the task resource.
+- Tester gate runs deterministic checks before applying accepted patches.
 - Time windows drive the loop; round counts are only internal diagnostics.
 - tmux is the observation layer, not the source of truth.
 

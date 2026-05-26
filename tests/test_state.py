@@ -13,11 +13,13 @@ from mmux.cli import (
     build_agent_command,
     check_diff_policy,
     claim_next_task,
+    cleanup_runtime_state,
     create_task_worktree,
     database,
     enqueue_task,
     ensure_layout,
     execute_driver_task,
+    execute_tester_task,
     export_worktree_patch,
     format_utc,
     apply_worktree_patch,
@@ -137,6 +139,27 @@ class StateTests(unittest.TestCase):
 
         self.assertEqual(supervisor_role_plan(first), (("scout", "codex"), ("reviewer", "claude")))
         self.assertEqual(supervisor_role_plan(second), (("driver", "claude"), ("tester", "codex")))
+
+    def test_cleanup_runtime_state_releases_active_runtime_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+            acquire_role(project, "driver", "codex", ttl_seconds=60)
+            acquire_resource_lock(project, ".", "codex", ttl_seconds=60)
+            update_worker_heartbeat(project, "codex", "leased", role="driver", generation=1)
+
+            cleanup_runtime_state(project)
+
+            with database(project) as db:
+                role_status = db.execute("select status from role_leases where role = ?", ("driver",)).fetchone()[0]
+                lock_status = db.execute("select status from resource_locks where resource = ?", (".",)).fetchone()[0]
+                worker = db.execute(
+                    "select status, role, generation from worker_heartbeats where agent = ?",
+                    ("codex",),
+                ).fetchone()
+            self.assertEqual(role_status, "released")
+            self.assertEqual(lock_status, "released")
+            self.assertEqual(worker, ("stopped", None, None))
 
     def test_resource_overlap_detects_directory_prefixes(self) -> None:
         self.assertTrue(resources_overlap(".", "src/mmux/cli.py"))
@@ -336,7 +359,7 @@ class StateTests(unittest.TestCase):
 
             self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 3\n")
 
-    def test_execute_driver_task_uses_worktree_and_applies_policy_accepted_patch(self) -> None:
+    def test_execute_driver_task_moves_accepted_patch_to_awaiting_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             init_git_project(project)
@@ -358,12 +381,75 @@ class StateTests(unittest.TestCase):
             finally:
                 cli.invoke_agent_adapter = original
 
+            self.assertIn("awaiting_test", message)
+            self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "awaiting_test")
+            self.assertEqual(tasks[-1].payload["diff_policy"], "ok")
+            self.assertIn("worktree", tasks[-1].payload)
+
+    def test_execute_tester_task_applies_awaiting_patch_after_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "change src", resource="src")
+            driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            original = cli.invoke_agent_adapter
+
+            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource):
+                (execution_root / "src" / "app.py").write_text("value = 4\n", encoding="utf-8")
+                return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
+
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    execute_driver_task(project, "codex", driver.generation)
+            finally:
+                cli.invoke_agent_adapter = original
+
+            tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
+            with contextlib.redirect_stdout(io.StringIO()):
+                message = execute_tester_task(project, "claude", tester.generation)
+
             self.assertIn("completed", message)
             self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 4\n")
             tasks = list_tasks(project)
             self.assertEqual(tasks[-1].status, "completed")
-            self.assertEqual(tasks[-1].payload["diff_policy"], "ok")
             self.assertEqual(tasks[-1].payload["patch_applied"], True)
+            self.assertIn("tester_log", tasks[-1].payload)
+
+    def test_execute_tester_task_fails_invalid_python_without_applying_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "break src", resource="src")
+            driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            original = cli.invoke_agent_adapter
+
+            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource):
+                (execution_root / "src" / "app.py").write_text("if True print('bad')\n", encoding="utf-8")
+                return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
+
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    execute_driver_task(project, "codex", driver.generation)
+            finally:
+                cli.invoke_agent_adapter = original
+
+            tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
+            with contextlib.redirect_stdout(io.StringIO()):
+                message = execute_tester_task(project, "claude", tester.generation)
+
+            self.assertIn("failed", message)
+            self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "failed")
+            self.assertEqual(tasks[-1].payload["patch_applied"] if "patch_applied" in tasks[-1].payload else False, False)
 
 
 if __name__ == "__main__":

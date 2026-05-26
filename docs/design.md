@@ -112,13 +112,22 @@ agent CLI non-interactively:
 - Codex: `codex exec`
 - Claude Code: `claude -p`
 
-After execution, deterministic policy checks inspect the worktree diff:
+After driver execution, deterministic policy checks inspect the worktree diff:
 
 - No diff becomes `no_change`.
 - Protected paths such as `.git`, `.mmux`, and `.env*` are rejected.
 - Every changed path must be inside the task resource lock.
-- Accepted patches are applied back to the main worktree only if the main
-  worktree has no tracked changes.
+- Accepted driver diffs move to `awaiting_test`.
+
+The worker holding `tester` then runs deterministic checks in the same task
+worktree:
+
+- `git diff --check HEAD --`
+- `python -m py_compile` for changed Python files
+- `python -m unittest discover -s tests` when a `tests/` tree exists
+
+Only tester-passed patches are applied back to the main worktree, and only if
+the main worktree has no tracked changes.
 
 The supervisor still does not call a model. It only grants leases, evaluates
 file facts, and records outcomes; model work happens inside worker adapters.
