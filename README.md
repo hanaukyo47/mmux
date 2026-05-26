@@ -2,6 +2,8 @@
 
 Deterministic multi-agent pair programming over tmux.
 
+[简体中文说明](README.zh-CN.md)
+
 mmux is a local supervisor for long-running coding-agent collaboration. It uses
 tmux for visibility and human takeover, but keeps orchestration deterministic:
 timers, role leases, resource locks, git facts, and test results decide what can
@@ -33,7 +35,7 @@ then applies the patch back to the main worktree.
 ## Install For Local Development
 
 ```bash
-cd /Users/hubo-gimpo/mmux
+cd /path/to/mmux
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
@@ -42,7 +44,7 @@ python -m pip install -e .
 Run without installation:
 
 ```bash
-cd /Users/hubo-gimpo/mmux
+cd /path/to/mmux
 PYTHONPATH=src python3 -m mmux.cli doctor
 ```
 
