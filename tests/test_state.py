@@ -6,27 +6,55 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import mmux.cli as cli
 from mmux.cli import (
     acquire_role,
     acquire_resource_lock,
     build_agent_command,
+    check_diff_policy,
     claim_next_task,
+    create_task_worktree,
     database,
     enqueue_task,
     ensure_layout,
+    execute_driver_task,
+    export_worktree_patch,
     format_utc,
+    apply_worktree_patch,
     list_resource_locks,
     list_worker_heartbeats,
     release_role,
     release_resource_lock,
     resources_overlap,
+    run,
     session_name,
     state_path,
     stream_agent_command,
     supervisor_role_plan,
+    list_tasks,
     update_worker_heartbeat,
     utc_now_dt,
 )
+
+
+def init_git_project(project: Path) -> None:
+    run(["git", "init"], cwd=project)
+    run(["git", "config", "user.email", "test@example.com"], cwd=project)
+    run(["git", "config", "user.name", "Test User"], cwd=project)
+    (project / ".gitignore").write_text(".mmux/\n", encoding="utf-8")
+    (project / "src").mkdir()
+    (project / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (project / "README.md").write_text("# test\n", encoding="utf-8")
+    run(["git", "add", ".gitignore", "src/app.py", "README.md"], cwd=project)
+    run(["git", "commit", "-m", "init"], cwd=project)
+
+
+def claim_driver_task(project: Path, *, resource: str = "."):
+    enqueue_task(project, "driver task", resource=resource)
+    lease = acquire_role(project, "driver", "codex", ttl_seconds=60)
+    task = claim_next_task(project, "codex", "driver", lease.generation)
+    assert task is not None
+    return task
 
 
 class StateTests(unittest.TestCase):
@@ -218,6 +246,124 @@ class StateTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(result.returncode, 0)
             self.assertIn("adapter ok", log_file.read_text(encoding="utf-8"))
+
+    def test_create_task_worktree_checks_out_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task = claim_driver_task(project)
+
+            worktree = create_task_worktree(project, task, "codex")
+
+            self.assertTrue((worktree / "src" / "app.py").exists())
+            self.assertEqual((worktree / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
+
+    def test_diff_policy_accepts_changes_inside_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "change src", resource="src")
+            lease = acquire_role(project, "driver", "codex", ttl_seconds=60)
+            task = claim_next_task(project, "codex", "driver", lease.generation)
+            assert task is not None
+            self.assertEqual(task.id, task_id)
+            worktree = create_task_worktree(project, task, "codex")
+            (worktree / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
+
+            policy = check_diff_policy(project, worktree, "src")
+
+            self.assertTrue(policy.ok)
+            self.assertEqual(policy.status, "ok")
+            self.assertEqual(policy.changed_files, ("src/app.py",))
+
+    def test_diff_policy_rejects_changes_outside_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task = claim_driver_task(project, resource="src")
+            worktree = create_task_worktree(project, task, "codex")
+            (worktree / "README.md").write_text("# changed\n", encoding="utf-8")
+
+            policy = check_diff_policy(project, worktree, "src")
+
+            self.assertFalse(policy.ok)
+            self.assertEqual(policy.status, "resource_violation")
+
+    def test_diff_policy_rejects_protected_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task = claim_driver_task(project)
+            worktree = create_task_worktree(project, task, "codex")
+            (worktree / ".env").write_text("SECRET=1\n", encoding="utf-8")
+
+            policy = check_diff_policy(project, worktree, ".")
+
+            self.assertFalse(policy.ok)
+            self.assertEqual(policy.status, "protected_violation")
+
+    def test_diff_policy_marks_no_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task = claim_driver_task(project)
+            worktree = create_task_worktree(project, task, "codex")
+
+            policy = check_diff_policy(project, worktree, ".")
+
+            self.assertTrue(policy.ok)
+            self.assertEqual(policy.status, "no_change")
+            self.assertEqual(policy.changed_files, ())
+
+    def test_apply_worktree_patch_updates_main_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task = claim_driver_task(project, resource="src")
+            worktree = create_task_worktree(project, task, "codex")
+            (worktree / "src" / "app.py").write_text("value = 3\n", encoding="utf-8")
+            policy = check_diff_policy(project, worktree, "src")
+            self.assertTrue(policy.ok)
+
+            patch = export_worktree_patch(worktree)
+            apply_worktree_patch(project, patch)
+
+            self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 3\n")
+
+    def test_execute_driver_task_uses_worktree_and_applies_policy_accepted_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "change src", resource="src")
+            lease = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            original = cli.invoke_agent_adapter
+
+            def fake_adapter(_project, execution_root, _agent, task, _generation, _resource):
+                self.assertEqual(task.title, "change src")
+                (execution_root / "src" / "app.py").write_text("value = 4\n", encoding="utf-8")
+                return cli.AdapterResult(True, 0, ".mmux/runs/fake.log", "ok")
+
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_driver_task(project, "codex", lease.generation)
+            finally:
+                cli.invoke_agent_adapter = original
+
+            self.assertIn("completed", message)
+            self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 4\n")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "completed")
+            self.assertEqual(tasks[-1].payload["diff_policy"], "ok")
+            self.assertEqual(tasks[-1].payload["patch_applied"], True)
 
 
 if __name__ == "__main__":

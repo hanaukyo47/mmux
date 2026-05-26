@@ -77,6 +77,14 @@ class AdapterResult:
     message: str
 
 
+@dataclass(frozen=True)
+class DiffPolicyResult:
+    ok: bool
+    status: str
+    changed_files: tuple[str, ...]
+    reason: str = ""
+
+
 def utc_now_dt() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
@@ -265,6 +273,7 @@ def ensure_layout(project: Path, task: str = "") -> None:
     (root / "logs").mkdir(parents=True, exist_ok=True)
     (root / "sessions").mkdir(parents=True, exist_ok=True)
     (root / "runs").mkdir(parents=True, exist_ok=True)
+    (root / "worktrees").mkdir(parents=True, exist_ok=True)
     (root / "inbox").mkdir(parents=True, exist_ok=True)
 
     config = {
@@ -361,6 +370,21 @@ def resource_is_prefix(prefix: str, resource: str) -> bool:
 
 def resources_overlap(left: str, right: str) -> bool:
     return resource_is_prefix(left, right) or resource_is_prefix(right, left)
+
+
+def resource_contains(resource: str, path: str) -> bool:
+    return resource_is_prefix(resource, path)
+
+
+def is_protected_path(path: str) -> bool:
+    return (
+        path == ".git"
+        or path.startswith(".git/")
+        or path == ".mmux"
+        or path.startswith(".mmux/")
+        or path == ".env"
+        or path.startswith(".env.")
+    )
 
 
 def expire_role_leases_db(db: sqlite3.Connection, now: dt.datetime) -> None:
@@ -945,13 +969,36 @@ def release_task_claim(project: Path, task_id: int, reason: str) -> None:
         record_event(db, "task_requeued", {"id": task_id, "reason": reason})
 
 
-def finish_task(project: Path, task_id: int, status: str, *, message: str = "", log_file: str = "") -> None:
-    if status not in {"completed", "failed"}:
+def update_task_payload(project: Path, task_id: int, updates: dict[str, object]) -> None:
+    with database(project) as db:
+        apply_schema(db)
+        row = db.execute("select payload from tasks where id = ?", (task_id,)).fetchone()
+        payload = decode_payload(row[0]) if row else {}
+        payload.update(updates)
+        db.execute(
+            "update tasks set payload = ?, updated_at = ? where id = ?",
+            (encode_payload(payload), utc_now(), task_id),
+        )
+        record_event(db, "task_payload_updated", {"id": task_id, "keys": sorted(updates)})
+
+
+def finish_task(
+    project: Path,
+    task_id: int,
+    status: str,
+    *,
+    message: str = "",
+    log_file: str = "",
+    payload_updates: Optional[dict[str, object]] = None,
+) -> None:
+    if status not in {"completed", "failed", "no_change", "rejected"}:
         raise ValueError(f"unknown task terminal status: {status}")
     with database(project) as db:
         apply_schema(db)
         row = db.execute("select payload from tasks where id = ?", (task_id,)).fetchone()
         payload = decode_payload(row[0]) if row else {}
+        if payload_updates:
+            payload.update(payload_updates)
         if log_file:
             payload["last_run_log"] = log_file
         if message:
@@ -991,6 +1038,18 @@ def run(cmd: Iterable[str], *, cwd: Optional[Path] = None, check: bool = True) -
     )
 
 
+def run_with_input(cmd: Iterable[str], *, cwd: Path, input_text: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(cmd),
+        cwd=str(cwd),
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
 def run_log_path(project: Path, agent: str, task_id: int) -> Path:
     stamp = utc_now().replace(":", "").replace("+", "Z")
     path = mmux_dir(project) / "runs" / f"{stamp}-{agent}-task-{task_id}.log"
@@ -1005,6 +1064,78 @@ def relative_to_project(project: Path, path: Path) -> str:
         return str(path)
 
 
+def worktree_root(project: Path) -> Path:
+    root = mmux_dir(project) / "worktrees"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def create_task_worktree(project: Path, task: TaskRecord, agent: str) -> Path:
+    validate_agent(agent)
+    run(["git", "rev-parse", "--show-toplevel"], cwd=project)
+    run(["git", "rev-parse", "--verify", "HEAD"], cwd=project)
+    stamp = utc_now().replace(":", "").replace("+", "Z")
+    path = worktree_root(project) / f"task-{task.id}-{agent}-{os.getpid()}-{stamp}"
+    run(["git", "worktree", "add", "--detach", str(path), "HEAD"], cwd=project)
+    return path
+
+
+def split_nul_paths(output: str) -> list[str]:
+    return [part for part in output.split("\0") if part]
+
+
+def collect_changed_files(worktree: Path) -> list[str]:
+    tracked = split_nul_paths(run(["git", "diff", "--name-only", "-z", "HEAD", "--"], cwd=worktree).stdout)
+    untracked = split_nul_paths(
+        run(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=worktree).stdout
+    )
+    return sorted(set(tracked + untracked))
+
+
+def check_diff_policy(project: Path, worktree: Path, resource: str) -> DiffPolicyResult:
+    normalized_resource = normalize_resource(project, resource)
+    changed_files = tuple(collect_changed_files(worktree))
+    if not changed_files:
+        return DiffPolicyResult(True, "no_change", changed_files, "no file changes")
+
+    protected = [path for path in changed_files if is_protected_path(path)]
+    if protected:
+        return DiffPolicyResult(
+            False,
+            "protected_violation",
+            changed_files,
+            "protected paths changed: " + ", ".join(protected),
+        )
+
+    outside = [path for path in changed_files if not resource_contains(normalized_resource, path)]
+    if outside:
+        return DiffPolicyResult(
+            False,
+            "resource_violation",
+            changed_files,
+            f"changes outside locked resource {normalized_resource}: " + ", ".join(outside),
+        )
+
+    return DiffPolicyResult(True, "ok", changed_files)
+
+
+def export_worktree_patch(worktree: Path) -> str:
+    run(["git", "add", "-A"], cwd=worktree)
+    return run(["git", "diff", "--cached", "--binary", "HEAD"], cwd=worktree).stdout
+
+
+def main_worktree_is_clean(project: Path) -> bool:
+    return run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=project).stdout.strip() == ""
+
+
+def apply_worktree_patch(project: Path, patch: str) -> None:
+    if not patch.strip():
+        return
+    if not main_worktree_is_clean(project):
+        raise RuntimeError("main worktree has tracked changes; refusing to apply task patch")
+    run_with_input(["git", "apply", "--binary", "-"], cwd=project, input_text=patch)
+
+
 def build_agent_prompt(agent: str, task: TaskRecord, role_generation: int, resource: str) -> str:
     return "\n".join(
         [
@@ -1014,10 +1145,12 @@ def build_agent_prompt(agent: str, task: TaskRecord, role_generation: int, resou
             f"- role: driver",
             f"- role generation: {role_generation}",
             f"- resource lock: {resource}",
+            "- execution root: isolated git worktree",
             "",
             f"Task #{task.id}: {task.title}",
             "",
             "Work only inside this repository. Keep the change scoped to the task and the locked resource.",
+            "A deterministic diff policy gate will reject changes outside the locked resource.",
             "Do not start a long-running service. Run focused tests or checks when practical.",
             "When done, leave a concise final summary including changed files and verification.",
         ]
@@ -1109,12 +1242,19 @@ def stream_agent_command(
         return AdapterResult(returncode == 0, returncode, relative_to_project(project, log_file), message)
 
 
-def invoke_agent_adapter(project: Path, agent: str, task: TaskRecord, role_generation: int, resource: str) -> AdapterResult:
+def invoke_agent_adapter(
+    project: Path,
+    execution_root: Path,
+    agent: str,
+    task: TaskRecord,
+    role_generation: int,
+    resource: str,
+) -> AdapterResult:
     prompt = build_agent_prompt(agent, task, role_generation, resource)
     log_file = run_log_path(project, agent, task.id)
     output_file = log_file.with_suffix(".last-message.txt")
-    cmd = build_agent_command(agent, project, prompt, output_file)
-    result = stream_agent_command(project, cmd, log_file)
+    cmd = build_agent_command(agent, execution_root, prompt, output_file)
+    result = stream_agent_command(execution_root, cmd, log_file)
     if output_file.exists():
         with log_file.open("a", encoding="utf-8") as handle:
             handle.write("\n--- last message ---\n")
@@ -1494,44 +1634,116 @@ def execute_driver_task(project: Path, agent: str, generation: int) -> str:
     task = claim_next_task(project, agent, "driver", generation)
     if task is None:
         return "no pending task"
+    role = acquire_role(project, "driver", agent, AGENT_TIMEOUT_SECONDS + 60, renew_if_same=True)
+    if not role.ok or role.generation != generation:
+        release_task_claim(project, task.id, "driver role lease is stale")
+        return f"task #{task.id} requeued: driver role lease is stale"
+
     resource = task_resource(task)
     lock = acquire_resource_lock(
         project,
         resource,
         agent,
-        RESOURCE_LOCK_TTL_SECONDS,
+        max(RESOURCE_LOCK_TTL_SECONDS, AGENT_TIMEOUT_SECONDS + 60),
         role="driver",
         role_generation=generation,
         renew_if_same=True,
     )
     if not lock.ok:
         release_task_claim(project, task.id, lock.reason)
+        release_role(project, "driver", holder=agent, generation=generation)
         return f"task #{task.id} requeued: {lock.reason}"
 
-    write_log(project, f"{agent} executing task #{task.id} resource={lock.resource}")
-    update_worker_heartbeat(project, agent, "running", role="driver", generation=generation)
-    print(f"executing task #{task.id}: {task.title}")
-    print(f"resource lock: {lock.resource}")
-    sys.stdout.flush()
     try:
+        worktree = create_task_worktree(project, task, agent)
+    except Exception as exc:
+        release_task_claim(project, task.id, f"worktree creation failed: {exc}")
+        release_resource_lock(project, lock.resource, holder=agent)
+        release_role(project, "driver", holder=agent, generation=generation)
+        return f"task #{task.id} requeued: worktree creation failed: {exc}"
+
+    try:
+        update_task_payload(project, task.id, {"worktree": relative_to_project(project, worktree)})
+        write_log(project, f"{agent} executing task #{task.id} resource={lock.resource}")
+        update_worker_heartbeat(project, agent, "running", role="driver", generation=generation)
+        print(f"executing task #{task.id}: {task.title}")
+        print(f"resource lock: {lock.resource}")
+        print(f"worktree: {worktree}")
+        sys.stdout.flush()
         try:
-            result = invoke_agent_adapter(project, agent, task, generation, lock.resource)
+            result = invoke_agent_adapter(project, worktree, agent, task, generation, lock.resource)
         except Exception as exc:
             message = f"agent adapter failed: {exc}"
-            finish_task(project, task.id, "failed", message=message)
+            finish_task(
+                project,
+                task.id,
+                "failed",
+                message=message,
+                payload_updates={"worktree": relative_to_project(project, worktree)},
+            )
             write_log(project, f"{agent} failed task #{task.id}: {exc}")
             return f"task #{task.id} failed: {exc}"
+
+        policy = check_diff_policy(project, worktree, lock.resource)
+        payload_updates = {
+            "worktree": relative_to_project(project, worktree),
+            "diff_policy": policy.status,
+            "changed_files": list(policy.changed_files),
+        }
+        if result.ok and policy.status == "no_change":
+            finish_task(
+                project,
+                task.id,
+                "no_change",
+                message=policy.reason,
+                log_file=result.log_file,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} produced no changes for task #{task.id}")
+            return f"task #{task.id} no_change log={result.log_file}"
+        if result.ok and not policy.ok:
+            finish_task(
+                project,
+                task.id,
+                "rejected",
+                message=policy.reason,
+                log_file=result.log_file,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} rejected task #{task.id}: {policy.reason}")
+            return f"task #{task.id} rejected: {policy.reason}"
+        if result.ok:
+            try:
+                patch = export_worktree_patch(worktree)
+                apply_worktree_patch(project, patch)
+                payload_updates["patch_applied"] = True
+            except Exception as exc:
+                message = f"patch apply failed: {exc}"
+                payload_updates["patch_applied"] = False
+                finish_task(
+                    project,
+                    task.id,
+                    "failed",
+                    message=message,
+                    log_file=result.log_file,
+                    payload_updates=payload_updates,
+                )
+                write_log(project, f"{agent} failed to apply task #{task.id}: {exc}")
+                return f"task #{task.id} failed: {message}"
+
         finish_task(
             project,
             task.id,
             "completed" if result.ok else "failed",
             message=result.message,
             log_file=result.log_file,
+            payload_updates=payload_updates,
         )
         write_log(project, f"{agent} finished task #{task.id} ok={result.ok} log={result.log_file}")
         return f"task #{task.id} {'completed' if result.ok else 'failed'} log={result.log_file}"
     finally:
         release_resource_lock(project, lock.resource, holder=agent)
+        release_role(project, "driver", holder=agent, generation=generation)
 
 
 def cmd_worker(args: argparse.Namespace) -> int:

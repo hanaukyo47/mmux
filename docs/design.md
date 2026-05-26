@@ -79,6 +79,7 @@ Project state lives under `.mmux/`:
   logs/
     supervisor.log
   runs/
+  worktrees/
   sessions/
   inbox/
 ```
@@ -105,13 +106,22 @@ stored with the lock so stale driver work can be rejected deterministically.
 
 Task execution is explicit. `mmux start` only observes by default. With
 `--execute-agents`, the worker holding `driver` claims one pending task, acquires
-that task's resource lock, and runs its local agent CLI non-interactively:
+that task's resource lock, creates an isolated git worktree, and runs its local
+agent CLI non-interactively:
 
 - Codex: `codex exec`
 - Claude Code: `claude -p`
 
-The supervisor still does not call a model. It only grants leases and records
-facts; model work happens inside worker adapters.
+After execution, deterministic policy checks inspect the worktree diff:
+
+- No diff becomes `no_change`.
+- Protected paths such as `.git`, `.mmux`, and `.env*` are rejected.
+- Every changed path must be inside the task resource lock.
+- Accepted patches are applied back to the main worktree only if the main
+  worktree has no tracked changes.
+
+The supervisor still does not call a model. It only grants leases, evaluates
+file facts, and records outcomes; model work happens inside worker adapters.
 
 ## Tmux Layout
 
