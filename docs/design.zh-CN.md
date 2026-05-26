@@ -61,12 +61,24 @@ supervisor 不负责：
 - Git status/diff。
 - test/lint exit code。
 - schema-valid JSON proposal。
+- 本地项目 marker 和文件名。
 
 不允许作为 supervisor 输入的内容：
 
 - LLM 判断。
 - 自由格式终端总结。
 - 绕过 git/test 证据的 agent 自述。
+
+## 项目画像
+
+每次限时运行前，mmux 会先对本地仓库做一次不调用模型的项目画像。画像只基于确定性 marker，例如 `pyproject.toml`、`package.json`、`Cargo.toml`、`go.mod`、`pom.xml`、Gradle 文件、`.sln` / `.csproj`、`composer.json`、`Gemfile`、`Package.swift`、`Makefile` 和文件扩展名。
+
+画像会区分：
+
+- 默认启用检查：足够保守、可以零配置运行的本地检查。
+- 建议检查：很可能有用，但可能需要依赖、工具链或离线缓存，不默认作为 patch gate。
+
+这样 `mmux run` 在执行前会先做足够的本地调研，避免盲跑，同时 supervisor 仍然保持确定性，不依赖大模型裁判。
 
 ## 状态
 
@@ -116,7 +128,10 @@ driver 执行结束后，确定性策略会检查 worktree diff：
 
 - `git diff --check HEAD --`
 - 对 changed Python files 运行 `python -m py_compile`
+- 对 changed shell scripts 运行 `sh -n`
+- 对 changed JSON files 运行 `python -m json.tool`
 - 如果存在 `tests/`，运行 `python -m unittest discover -s tests`
+- 当项目画像确认无需安装依赖即可运行时，执行本地 package test，例如已有 `node_modules` 的 Node `test` script
 
 只有 tester 通过的 patch 才会应用回主工作区，并且主工作区必须没有 tracked changes。
 

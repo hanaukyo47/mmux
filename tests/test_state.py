@@ -10,6 +10,7 @@ import mmux.cli as cli
 from mmux.cli import (
     acquire_role,
     acquire_resource_lock,
+    build_tester_checks,
     build_agent_command,
     check_diff_policy,
     claim_next_task,
@@ -25,6 +26,7 @@ from mmux.cli import (
     format_task_delta,
     format_utc,
     apply_worktree_patch,
+    inspect_project,
     list_resource_locks,
     list_worker_heartbeats,
     release_role,
@@ -248,6 +250,69 @@ class StateTests(unittest.TestCase):
 
         self.assertEqual(format_task_counts(before), "pending=2, completed=1")
         self.assertEqual(format_task_delta(before, after), "pending=-1, completed=+1, failed=+1")
+
+    def test_inspect_project_detects_common_ecosystems(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+            (project / "package.json").write_text('{"scripts": {"test": "vitest"}}\n', encoding="utf-8")
+            (project / "Cargo.toml").write_text("[package]\nname = \"sample\"\n", encoding="utf-8")
+            (project / "go.mod").write_text("module example.com/sample\n", encoding="utf-8")
+            (project / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+            (project / "script.sh").write_text("echo ok\n", encoding="utf-8")
+            (project / "data.json").write_text("{}\n", encoding="utf-8")
+            (project / "tests").mkdir()
+            (project / "tests" / "test_sample.py").write_text("def test_placeholder():\n    pass\n", encoding="utf-8")
+
+            profile = inspect_project(project)
+            active_names = {check.name for check in profile.active_checks}
+            suggested_names = {check.name for check in profile.suggested_checks}
+
+            self.assertIn("python", profile.ecosystems)
+            self.assertIn("node", profile.ecosystems)
+            self.assertIn("rust", profile.ecosystems)
+            self.assertIn("go", profile.ecosystems)
+            self.assertIn("gradle", profile.ecosystems)
+            self.assertIn("shell", profile.languages)
+            self.assertIn("json", profile.languages)
+            self.assertIn("py-compile", active_names)
+            self.assertIn("unittest", active_names)
+            self.assertIn("shell-check", active_names)
+            self.assertIn("json-syntax", active_names)
+            self.assertIn("diff-check", active_names)
+            self.assertIn("cargo-test", suggested_names)
+            self.assertIn("go-test", suggested_names)
+            self.assertIn("gradle-test", suggested_names)
+
+    def test_build_tester_checks_adds_changed_file_syntax_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "app.py").write_text("value = 1\n", encoding="utf-8")
+            (project / "script.sh").write_text("echo ok\n", encoding="utf-8")
+            (project / "package.json").write_text("{}\n", encoding="utf-8")
+            (project / "tests").mkdir()
+            (project / "tests" / "test_app.py").write_text("import unittest\n", encoding="utf-8")
+
+            checks = build_tester_checks(project, ["app.py", "script.sh", "package.json"])
+            names = [check.name for check in checks]
+
+            self.assertEqual(names[0], "diff-check")
+            self.assertIn("py-compile", names)
+            self.assertIn("shell-check:script.sh", names)
+            self.assertIn("json-syntax:package.json", names)
+            self.assertIn("unittest", names)
+
+    def test_cmd_inspect_prints_json_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                code = cli.main(["inspect", str(project), "--json"])
+
+            self.assertEqual(code, 0)
+            decoded = cli.json.loads(output.getvalue())
+            self.assertIn("python", decoded["ecosystems"])
 
     def test_cmd_run_records_timed_window_without_real_tmux(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

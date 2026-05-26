@@ -16,6 +16,8 @@ This repository starts as the control-plane skeleton:
 
 - `mmux init` creates a project-local `.mmux/` state directory.
 - `mmux doctor` checks local dependencies such as `tmux`, `codex`, and `claude`.
+- `mmux inspect` detects project ecosystems, languages, markers, active checks,
+  and suggested checks without using an LLM.
 - `mmux start` creates a four-pane tmux workspace for supervisor, Codex worker,
   Claude worker, and logs.
 - `mmux run --minutes N` starts the tmux workspace for a bounded wall-clock
@@ -73,6 +75,7 @@ PYTHONPATH=src python3 -m mmux.cli doctor
 ```bash
 mmux init /path/to/project --task "Improve this project continuously"
 mmux doctor
+mmux inspect /path/to/project
 mmux run /path/to/project --minutes 30
 mmux run /path/to/project --minutes 30 --execute-agents
 mmux start /path/to/project
@@ -99,7 +102,7 @@ mmux stop /path/to/project
 - Resource locks prevent concurrent writes to the same files or modules.
 - Agent execution happens in task git worktrees under `.mmux/worktrees/`.
 - Diff policy rejects protected paths and files outside the task resource.
-- Tester gate runs deterministic checks before applying accepted patches.
+- Tester gate infers zero-config local checks before applying accepted patches.
 - Time windows drive the loop; round counts are only internal diagnostics.
 - tmux is the observation layer, not the source of truth.
 

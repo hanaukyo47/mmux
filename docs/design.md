@@ -63,12 +63,30 @@ Allowed inputs:
 - Git status/diff.
 - Test/lint exit codes.
 - Schema-valid JSON proposals.
+- Local project markers and file names.
 
 Disallowed supervisor inputs:
 
 - LLM judgement calls.
 - Free-form terminal summaries as policy facts.
 - Agent claims that bypass git/test evidence.
+
+## Project Inspection
+
+Before a timed run, mmux profiles the local repository without calling a model.
+The profile is based on deterministic markers such as `pyproject.toml`,
+`package.json`, `Cargo.toml`, `go.mod`, `pom.xml`, Gradle files, `.sln`/
+`.csproj`, `composer.json`, `Gemfile`, `Package.swift`, `Makefile`, and file
+extensions.
+
+The profile separates:
+
+- Active checks: conservative local checks that mmux can run by default.
+- Suggested checks: likely project commands that may need dependencies,
+  toolchains, or an offline cache before they should gate patches.
+
+This lets `mmux run` do enough local reconnaissance to avoid blind execution
+while keeping the supervisor deterministic and non-model-based.
 
 ## State
 
@@ -126,7 +144,11 @@ worktree:
 
 - `git diff --check HEAD --`
 - `python -m py_compile` for changed Python files
+- `sh -n` for changed shell scripts
+- `python -m json.tool` for changed JSON files
 - `python -m unittest discover -s tests` when a `tests/` tree exists
+- local package tests when the profile says they are available without
+  dependency installation, such as a Node `test` script with `node_modules`
 
 Only tester-passed patches are applied back to the main worktree, and only if
 the main worktree has no tracked changes.

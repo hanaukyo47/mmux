@@ -93,6 +93,22 @@ class TestGateResult:
     message: str
 
 
+@dataclass(frozen=True)
+class ProjectCheck:
+    name: str
+    command: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProjectProfile:
+    ecosystems: tuple[str, ...]
+    languages: tuple[str, ...]
+    markers: tuple[str, ...]
+    active_checks: tuple[ProjectCheck, ...]
+    suggested_checks: tuple[ProjectCheck, ...]
+
+
 def utc_now_dt() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
@@ -1251,9 +1267,301 @@ def changed_python_files(worktree: Path, changed_files: Iterable[str]) -> list[s
     )
 
 
+def changed_shell_files(worktree: Path, changed_files: Iterable[str]) -> list[str]:
+    return sorted(
+        path
+        for path in changed_files
+        if path.endswith(".sh") and (worktree / path).exists()
+    )
+
+
+def changed_json_files(worktree: Path, changed_files: Iterable[str]) -> list[str]:
+    return sorted(
+        path
+        for path in changed_files
+        if path.endswith(".json") and (worktree / path).exists()
+    )
+
+
 def has_unittest_tree(worktree: Path) -> bool:
     tests_dir = worktree / "tests"
     return tests_dir.is_dir() and any(path.name.startswith("test") and path.suffix == ".py" for path in tests_dir.rglob("*.py"))
+
+
+SKIPPED_PROFILE_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".mmux",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    "vendor",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+}
+
+
+def list_project_files(project: Path, *, limit: int = 5000) -> list[str]:
+    result = run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=project, check=False)
+    if result.returncode == 0 and result.stdout:
+        files = split_nul_paths(result.stdout)
+        return sorted(path for path in files if not any(part in SKIPPED_PROFILE_DIRS for part in PurePosixPath(path).parts))[:limit]
+
+    files: list[str] = []
+    for path in project.rglob("*"):
+        try:
+            relative = path.relative_to(project)
+        except ValueError:
+            continue
+        parts = relative.parts
+        if any(part in SKIPPED_PROFILE_DIRS for part in parts):
+            continue
+        if path.is_file():
+            files.append(relative.as_posix())
+            if len(files) >= limit:
+                break
+    return sorted(files)
+
+
+def package_json_scripts(project: Path) -> dict[str, str]:
+    path = project / "package.json"
+    if not path.exists():
+        return {}
+    try:
+        decoded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    scripts = decoded.get("scripts")
+    if not isinstance(scripts, dict):
+        return {}
+    return {str(key): str(value) for key, value in scripts.items() if isinstance(key, str)}
+
+
+def has_real_npm_test_script(project: Path) -> bool:
+    script = package_json_scripts(project).get("test", "").strip()
+    if not script:
+        return False
+    lowered = script.lower()
+    return "no test specified" not in lowered and "exit 1" not in lowered
+
+
+def node_test_command(project: Path) -> tuple[str, ...]:
+    if (project / "pnpm-lock.yaml").exists() and shutil.which("pnpm"):
+        return ("pnpm", "test")
+    if (project / "yarn.lock").exists() and shutil.which("yarn"):
+        return ("yarn", "test")
+    if ((project / "bun.lockb").exists() or (project / "bun.lock").exists()) and shutil.which("bun"):
+        return ("bun", "test")
+    if shutil.which("npm"):
+        return ("npm", "test")
+    return ()
+
+
+def makefile_has_target(project: Path, target: str) -> bool:
+    for name in ("Makefile", "makefile", "GNUmakefile"):
+        path = project / name
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if stripped.startswith(f"{target}:"):
+                return True
+    return False
+
+
+def composer_has_test_script(project: Path) -> bool:
+    path = project / "composer.json"
+    if not path.exists():
+        return False
+    try:
+        decoded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    scripts = decoded.get("scripts")
+    return isinstance(scripts, dict) and "test" in scripts
+
+
+def add_check(checks: list[ProjectCheck], name: str, command: Iterable[str], reason: str) -> None:
+    command_tuple = tuple(command)
+    if not command_tuple:
+        return
+    key = (name, command_tuple)
+    if any((check.name, check.command) == key for check in checks):
+        return
+    checks.append(ProjectCheck(name, command_tuple, reason))
+
+
+def inspect_project(project: Path) -> ProjectProfile:
+    files = list_project_files(project)
+    file_set = set(files)
+    suffixes = {Path(path).suffix for path in files}
+    markers: list[str] = []
+    ecosystems: set[str] = set()
+    languages: set[str] = set()
+    active_checks: list[ProjectCheck] = []
+    suggested_checks: list[ProjectCheck] = []
+
+    def mark(path: str) -> bool:
+        if path in file_set or (project / path).exists():
+            markers.append(path)
+            return True
+        return False
+
+    def mark_any(paths: Iterable[str]) -> bool:
+        found = False
+        for path in paths:
+            if mark(path):
+                found = True
+        return found
+
+    has_python = mark_any(("pyproject.toml", "setup.py", "requirements.txt", "Pipfile", "poetry.lock", "uv.lock")) or ".py" in suffixes
+    if has_python:
+        ecosystems.add("python")
+        languages.add("python")
+        add_check(active_checks, "py-compile", (sys.executable, "-m", "py_compile", "<changed .py files>"), "syntax-check changed Python files")
+        if has_unittest_tree(project):
+            add_check(active_checks, "unittest", (sys.executable, "-m", "unittest", "discover", "-s", "tests"), "tests/ contains unittest-style tests")
+        if mark_any(("pytest.ini", "tox.ini")) or "conftest.py" in file_set:
+            add_check(suggested_checks, "pytest", ("pytest",), "pytest markers found; enable when project dependencies are installed")
+
+    if mark("package.json") or suffixes & {".js", ".jsx", ".ts", ".tsx"}:
+        ecosystems.add("node")
+        languages.update({"javascript"} if suffixes & {".js", ".jsx"} else set())
+        languages.update({"typescript"} if suffixes & {".ts", ".tsx"} else set())
+        test_cmd = node_test_command(project)
+        if has_real_npm_test_script(project):
+            if test_cmd and (project / "node_modules").exists():
+                add_check(active_checks, "node-test", test_cmd, "package.json test script with local node_modules")
+            elif test_cmd:
+                add_check(suggested_checks, "node-test", test_cmd, "package.json test script found; install dependencies before enabling")
+
+    if mark("Cargo.toml"):
+        ecosystems.add("rust")
+        languages.add("rust")
+        add_check(suggested_checks, "cargo-test", ("cargo", "test", "--locked", "--offline"), "Cargo project found; offline test avoids network access")
+
+    if mark("go.mod") or ".go" in suffixes:
+        ecosystems.add("go")
+        languages.add("go")
+        add_check(suggested_checks, "go-test", ("env", "GOPROXY=off", "go", "test", "./..."), "Go project found; GOPROXY=off avoids network access")
+
+    if mark("pom.xml"):
+        ecosystems.add("java")
+        languages.add("java")
+        add_check(suggested_checks, "maven-test", ("mvn", "-o", "test"), "Maven project found; offline mode avoids network access")
+
+    if mark_any(("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")):
+        ecosystems.add("gradle")
+        languages.add("java")
+        if (project / "gradlew").exists():
+            add_check(suggested_checks, "gradle-test", ("./gradlew", "test", "--offline"), "Gradle wrapper found; offline mode avoids network access")
+        else:
+            add_check(suggested_checks, "gradle-test", ("gradle", "test", "--offline"), "Gradle project found; offline mode avoids network access")
+
+    if any(path.endswith(".csproj") or path.endswith(".sln") for path in files):
+        ecosystems.add("dotnet")
+        languages.add("csharp")
+        add_check(suggested_checks, "dotnet-test", ("dotnet", "test", "--no-restore"), ".NET project found; --no-restore avoids dependency changes")
+
+    if mark("composer.json"):
+        ecosystems.add("php")
+        languages.add("php")
+        if composer_has_test_script(project):
+            add_check(suggested_checks, "composer-test", ("composer", "test"), "composer.json test script found")
+
+    if mark("Gemfile") or ".rb" in suffixes:
+        ecosystems.add("ruby")
+        languages.add("ruby")
+        if mark("Rakefile"):
+            add_check(suggested_checks, "rake-test", ("bundle", "exec", "rake", "test"), "Ruby Rakefile found")
+
+    if mark("Package.swift") or ".swift" in suffixes:
+        ecosystems.add("swift")
+        languages.add("swift")
+        add_check(suggested_checks, "swift-test", ("swift", "test"), "Swift package found")
+
+    if ".sh" in suffixes:
+        languages.add("shell")
+        add_check(active_checks, "shell-check", ("sh", "-n", "<changed .sh files>"), "syntax-check changed shell scripts")
+
+    if ".json" in suffixes:
+        languages.add("json")
+        add_check(active_checks, "json-syntax", (sys.executable, "-m", "json.tool", "<changed .json files>"), "syntax-check changed JSON files")
+
+    if makefile_has_target(project, "test"):
+        ecosystems.add("make")
+        add_check(suggested_checks, "make-test", ("make", "test"), "Makefile test target found")
+
+    add_check(active_checks, "diff-check", ("git", "diff", "--check", "HEAD", "--"), "reject whitespace errors in the task diff")
+
+    return ProjectProfile(
+        ecosystems=tuple(sorted(ecosystems)),
+        languages=tuple(sorted(languages)),
+        markers=tuple(sorted(set(markers))),
+        active_checks=tuple(active_checks),
+        suggested_checks=tuple(suggested_checks),
+    )
+
+
+def build_tester_checks(worktree: Path, changed_files: Iterable[str]) -> list[ProjectCheck]:
+    checks: list[ProjectCheck] = [
+        ProjectCheck("diff-check", ("git", "diff", "--check", "HEAD", "--"), "reject whitespace errors in the task diff")
+    ]
+
+    py_files = changed_python_files(worktree, changed_files)
+    if py_files:
+        add_check(checks, "py-compile", (sys.executable, "-m", "py_compile", *py_files), "syntax-check changed Python files")
+
+    for shell_file in changed_shell_files(worktree, changed_files):
+        add_check(checks, f"shell-check:{shell_file}", ("sh", "-n", shell_file), "syntax-check changed shell script")
+
+    for json_file in changed_json_files(worktree, changed_files):
+        add_check(checks, f"json-syntax:{json_file}", (sys.executable, "-m", "json.tool", json_file), "syntax-check changed JSON file")
+
+    if has_unittest_tree(worktree):
+        add_check(checks, "unittest", (sys.executable, "-m", "unittest", "discover", "-s", "tests"), "tests/ contains unittest-style tests")
+
+    node_cmd = node_test_command(worktree)
+    if has_real_npm_test_script(worktree) and node_cmd and (worktree / "node_modules").exists():
+        add_check(checks, "node-test", node_cmd, "package.json test script with local node_modules")
+
+    return checks
+
+
+def command_text(command: Iterable[str]) -> str:
+    return " ".join(sh_quote(part) for part in command)
+
+
+def profile_to_dict(profile: ProjectProfile) -> dict[str, object]:
+    def checks_to_dict(checks: Iterable[ProjectCheck]) -> list[dict[str, str]]:
+        return [
+            {
+                "name": check.name,
+                "command": list(check.command),
+                "command_text": command_text(check.command),
+                "reason": check.reason,
+            }
+            for check in checks
+        ]
+
+    return {
+        "ecosystems": list(profile.ecosystems),
+        "languages": list(profile.languages),
+        "markers": list(profile.markers),
+        "active_checks": checks_to_dict(profile.active_checks),
+        "suggested_checks": checks_to_dict(profile.suggested_checks),
+    }
 
 
 def run_logged_test_command(
@@ -1294,21 +1602,14 @@ def run_logged_test_command(
 
 def run_tester_gate(project: Path, worktree: Path, task: TaskRecord, changed_files: Iterable[str]) -> TestGateResult:
     log_file = run_log_path(project, "tester", task.id)
-    checks: list[tuple[str, list[str]]] = [
-        ("diff-check", ["git", "diff", "--check", "HEAD", "--"]),
-    ]
-    py_files = changed_python_files(worktree, changed_files)
-    if py_files:
-        checks.append(("py-compile", [sys.executable, "-m", "py_compile", *py_files]))
-    if has_unittest_tree(worktree):
-        checks.append(("unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests"]))
+    checks = build_tester_checks(worktree, changed_files)
 
     with log_file.open("w", encoding="utf-8") as handle:
         handle.write(f"{utc_now()} tester gate for task #{task.id}\n")
         handle.write(f"worktree: {worktree}\n")
         handle.write(f"changed_files: {', '.join(changed_files)}\n")
-        for name, cmd in checks:
-            ok, message = run_logged_test_command(handle, worktree, name, cmd)
+        for check in checks:
+            ok, message = run_logged_test_command(handle, worktree, check.name, list(check.command))
             if not ok:
                 handle.write(f"\n{utc_now()} tester failed: {message}\n")
                 return TestGateResult(False, relative_to_project(project, log_file), message)
@@ -1492,6 +1793,47 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if level == "required" and not found:
             failed_required = True
     return 1 if failed_required else 0
+
+
+def format_names(values: Iterable[str]) -> str:
+    items = list(values)
+    return ", ".join(items) if items else "none"
+
+
+def format_check_names(checks: Iterable[ProjectCheck]) -> str:
+    return ", ".join(check.name for check in checks) or "none"
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    if not project.exists():
+        raise SystemExit(f"Project path does not exist: {project}")
+    profile = inspect_project(project)
+    if args.json:
+        print(json.dumps(profile_to_dict(profile), indent=2))
+        return 0
+
+    print(f"project: {project}")
+    print(f"ecosystems: {format_names(profile.ecosystems)}")
+    print(f"languages: {format_names(profile.languages)}")
+    print("markers:")
+    if profile.markers:
+        for marker in profile.markers:
+            print(f"  {marker}")
+    else:
+        print("  none")
+    print("active checks:")
+    for check in profile.active_checks:
+        print(f"  {check.name}: {command_text(check.command)}")
+        print(f"    reason: {check.reason}")
+    print("suggested checks:")
+    if profile.suggested_checks:
+        for check in profile.suggested_checks:
+            print(f"  {check.name}: {command_text(check.command)}")
+            print(f"    reason: {check.reason}")
+    else:
+        print("  none")
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1846,7 +2188,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     duration_seconds = args.seconds if args.seconds is not None else max(1, int(args.minutes * 60))
     checkpoint_seconds = min(args.checkpoint_seconds, duration_seconds)
     before = task_status_counts(project)
+    profile = inspect_project(project)
     started_at = utc_now()
+    record_project_event(project, "project_inspected", profile_to_dict(profile))
     record_project_event(
         project,
         "run_started",
@@ -1863,6 +2207,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"started timed run: {name}")
     print(f"duration: {duration_seconds}s")
     print(f"agent execution: {'enabled' if args.execute_agents else 'disabled'}")
+    print(f"profile: ecosystems={format_names(profile.ecosystems)} languages={format_names(profile.languages)}")
+    print(f"active checks: {format_check_names(profile.active_checks)}")
     print(f"before: {format_task_counts(before)}")
     print(f"attach with: tmux attach -t {name}")
 
@@ -2267,6 +2613,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="check local tool dependencies")
     doctor.set_defaults(func=cmd_doctor)
+
+    inspect = subparsers.add_parser("inspect", help="inspect project type and inferred checks")
+    inspect.add_argument("project", nargs="?", default=".")
+    inspect.add_argument("--json", action="store_true", help="print machine-readable project profile")
+    inspect.set_defaults(func=cmd_inspect)
 
     status = subparsers.add_parser("status", help="show deterministic project state")
     status.add_argument("project", nargs="?", default=".")
