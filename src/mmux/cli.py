@@ -1922,6 +1922,7 @@ TASK_STATUS_ORDER = (
     "rejected",
     "no_change",
 )
+OPEN_TASK_STATUSES = ("pending", "running", "awaiting_test", "running_test")
 
 
 def task_status_counts(project: Path) -> dict[str, int]:
@@ -1950,6 +1951,41 @@ def format_task_delta(before: dict[str, int], after: dict[str, int]) -> str:
             sign = "+" if delta > 0 else ""
             parts.append(f"{status}={sign}{delta}")
     return ", ".join(parts) if parts else "no change"
+
+
+def has_open_tasks(project: Path) -> bool:
+    counts = task_status_counts(project)
+    return any(counts.get(status, 0) > 0 for status in OPEN_TASK_STATUSES)
+
+
+def default_task_title(profile: ProjectProfile) -> str:
+    ecosystem = ", ".join(profile.ecosystems) if profile.ecosystems else "general"
+    return (
+        f"Find one small, testable improvement in this {ecosystem} project; "
+        "keep the diff minimal and verify it with local checks."
+    )
+
+
+def ensure_default_task(project: Path, profile: ProjectProfile) -> Optional[int]:
+    if has_open_tasks(project):
+        return None
+    title = default_task_title(profile)
+    task_id = enqueue_task(project, title, resource=".")
+    update_task_payload(
+        project,
+        task_id,
+        {
+            "origin": "auto_default",
+            "ecosystems": list(profile.ecosystems),
+            "active_checks": [check.name for check in profile.active_checks],
+        },
+    )
+    record_project_event(
+        project,
+        "default_task_added",
+        {"id": task_id, "title": title, "resource": "."},
+    )
+    return task_id
 
 
 def cmd_task_add(args: argparse.Namespace) -> int:
@@ -2187,8 +2223,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     duration_seconds = args.seconds if args.seconds is not None else max(1, int(args.minutes * 60))
     checkpoint_seconds = min(args.checkpoint_seconds, duration_seconds)
-    before = task_status_counts(project)
     profile = inspect_project(project)
+    default_task_id = None
+    if not args.no_default_task:
+        default_task_id = ensure_default_task(project, profile)
+    before = task_status_counts(project)
     started_at = utc_now()
     record_project_event(project, "project_inspected", profile_to_dict(profile))
     record_project_event(
@@ -2198,6 +2237,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "duration_seconds": duration_seconds,
             "execute_agents": args.execute_agents,
             "task": args.task or "",
+            "default_task_id": default_task_id,
         },
     )
 
@@ -2209,6 +2249,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"agent execution: {'enabled' if args.execute_agents else 'disabled'}")
     print(f"profile: ecosystems={format_names(profile.ecosystems)} languages={format_names(profile.languages)}")
     print(f"active checks: {format_check_names(profile.active_checks)}")
+    if default_task_id is not None:
+        print(f"default task: added #{default_task_id}")
+    elif args.no_default_task:
+        print("default task: disabled")
     print(f"before: {format_task_counts(before)}")
     print(f"attach with: tmux attach -t {name}")
 
@@ -2701,6 +2745,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--seconds", type=positive_seconds, help=argparse.SUPPRESS)
     run_parser.add_argument("--checkpoint-seconds", type=positive_seconds, default=60)
     run_parser.add_argument("--task", default="")
+    run_parser.add_argument(
+        "--no-default-task",
+        action="store_true",
+        help="do not add a conservative default task when the queue is empty",
+    )
     run_parser.add_argument(
         "--execute-agents",
         action="store_true",

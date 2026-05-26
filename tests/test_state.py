@@ -365,6 +365,75 @@ class StateTests(unittest.TestCase):
                 ]
             self.assertEqual(events, ["run_started", "run_finished"])
 
+    def test_cmd_run_adds_default_task_when_queue_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            original_start = cli.start_tmux_session
+            original_stop = cli.stop_tmux_session
+
+            def fake_start(_project, *, execute_agents=False):
+                return True
+
+            def fake_stop(stop_project):
+                cleanup_runtime_state(stop_project)
+                return True
+
+            cli.start_tmux_session = fake_start
+            cli.stop_tmux_session = fake_stop
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = cli.main(["run", str(project), "--seconds", "1", "--checkpoint-seconds", "1"])
+            finally:
+                cli.start_tmux_session = original_start
+                cli.stop_tmux_session = original_stop
+
+            self.assertEqual(code, 0)
+            self.assertIn("default task: added #1", output.getvalue())
+            tasks = list_tasks(project.resolve())
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].status, "pending")
+            self.assertEqual(tasks[0].payload["origin"], "auto_default")
+            self.assertIn("Find one small, testable improvement", tasks[0].title)
+            with database(project.resolve()) as db:
+                event = db.execute("select kind from events where kind = ?", ("default_task_added",)).fetchone()
+            self.assertEqual(event[0], "default_task_added")
+
+    def test_cmd_run_can_disable_default_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            original_start = cli.start_tmux_session
+            original_stop = cli.stop_tmux_session
+
+            def fake_start(_project, *, execute_agents=False):
+                return True
+
+            def fake_stop(stop_project):
+                cleanup_runtime_state(stop_project)
+                return True
+
+            cli.start_tmux_session = fake_start
+            cli.stop_tmux_session = fake_stop
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = cli.main(
+                        [
+                            "run",
+                            str(project),
+                            "--seconds",
+                            "1",
+                            "--checkpoint-seconds",
+                            "1",
+                            "--no-default-task",
+                        ]
+                    )
+            finally:
+                cli.start_tmux_session = original_start
+                cli.stop_tmux_session = original_stop
+
+            self.assertEqual(code, 0)
+            self.assertIn("default task: disabled", output.getvalue())
+            self.assertEqual(list_tasks(project.resolve()), [])
+
     def test_build_agent_commands_use_noninteractive_modes(self) -> None:
         project = Path("/tmp/example-project").resolve()
         output = project / ".mmux" / "runs" / "out.txt"

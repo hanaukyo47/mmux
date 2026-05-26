@@ -160,8 +160,11 @@ file facts, and records outcomes; model work happens inside worker adapters.
 
 `mmux run PROJECT --minutes N` is the bounded top-level entry point for normal
 use. It initializes the local `.mmux/` layout when needed, refuses to reuse an
-existing tmux session, records a `run_started` event, starts the same four-pane
-workspace as `mmux start`, and then lets wall-clock time drive the window.
+existing tmux session, profiles the project, and adds one conservative default
+task when the queue has no pending or in-progress work. `--no-default-task`
+disables that queue bootstrap for observation-only runs. The command records a
+`run_started` event, starts the same four-pane workspace as `mmux start`, and
+then lets wall-clock time drive the window.
 
 During the window, it writes periodic checkpoints with remaining time and task
 status counts to stdout and the supervisor log. At the deadline, or on
