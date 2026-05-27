@@ -4,7 +4,7 @@
 
 [English README](README.md)
 
-![mmux deterministic agent loop](docs/assets/mmux-loop.svg)
+![mmux alpha demo recording](docs/assets/mmux-demo.gif)
 
 mmux 不是让大模型互相投票的 agent 群聊，而是把裁判从模型手里拿出来。Codex 和 Claude Code 可以在可观察、可接管的 tmux pane 里写代码、review、讨论；状态流转由确定性 supervisor 根据计时器、role lease、resource lock、git facts 和测试结果决定。
 

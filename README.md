@@ -4,7 +4,7 @@ Deterministic multi-agent pair programming over tmux.
 
 [简体中文说明](README.zh-CN.md)
 
-![mmux deterministic agent loop](docs/assets/mmux-loop.svg)
+![mmux alpha demo recording](docs/assets/mmux-demo.gif)
 
 Unlike model-chat agent frameworks where LLMs negotiate outcomes, mmux keeps the
 referee outside the model loop. Codex and Claude Code can write, review, and

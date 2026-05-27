@@ -42,26 +42,28 @@ def main() -> int:
         cli.invoke_reviewer_adapter = fake_reviewer
         try:
             print("mmux alpha deterministic loop demo")
-            print(f"project: {project}")
+            print("project: <temporary demo repository>")
             print(f"task: #{task_id} Change a small Python value")
             print()
 
             driver = cli.acquire_role(project, "driver", "codex", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
-                driver_message = cli.execute_driver_task(project, "codex", driver.generation)
-            print(f"driver   codex  -> {driver_message}")
+                cli.execute_driver_task(project, "codex", driver.generation)
+            task = cli.get_task(project, task_id)
+            print(f"driver   codex  -> {task.status if task else 'missing'}  (isolated diff)")
 
             reviewer = cli.acquire_role(project, "reviewer", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
-                review_message = cli.execute_reviewer_task(project, "claude", reviewer.generation)
-            print(f"reviewer claude -> {review_message}")
+                cli.execute_reviewer_task(project, "claude", reviewer.generation)
+            task = cli.get_task(project, task_id)
+            print(f"reviewer claude -> {task.status if task else 'missing'}  (approve)")
 
             tester = cli.acquire_role(project, "tester", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
-                test_message = cli.execute_tester_task(project, "claude", tester.generation)
-            print(f"tester   claude -> {test_message}")
-
+                cli.execute_tester_task(project, "claude", tester.generation)
             task = cli.get_task(project, task_id)
+            print(f"tester   claude -> {task.status if task else 'missing'}  (patch applied)")
+
             final_value = (project / "src" / "app.py").read_text(encoding="utf-8").strip()
             print()
             print(f"final task status: {task.status if task else 'missing'}")

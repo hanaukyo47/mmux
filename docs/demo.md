@@ -20,9 +20,9 @@ Expected shape:
 mmux alpha deterministic loop demo
 task: #1 Change a small Python value
 
-driver   codex  -> task #1 awaiting_review ...
-reviewer claude -> task #1 awaiting_test review=approve ...
-tester   claude -> task #1 completed ...
+driver   codex  -> awaiting_review  (isolated diff)
+reviewer claude -> awaiting_test  (approve)
+tester   claude -> completed  (patch applied)
 
 final task status: completed
 main worktree src/app.py: value = 7
@@ -30,6 +30,22 @@ main worktree src/app.py: value = 7
 
 Use this for docs, smoke checks, and rehearsing the voiceover. Do not present it
 as a real model run.
+
+## Recorded GIF
+
+The README demo GIF is generated with [VHS](https://github.com/charmbracelet/vhs):
+
+```bash
+brew install vhs ffmpeg
+cd /path/to/mmux
+vhs docs/demo.tape
+```
+
+Output:
+
+```text
+docs/assets/mmux-demo.gif
+```
 
 ## Real Agent Demo
 
@@ -85,7 +101,7 @@ Record the tmux session, not only the final terminal output.
 
 ## README Visual
 
-The README currently uses `docs/assets/mmux-loop.svg` as the first-screen visual.
+The README currently uses `docs/assets/mmux-demo.gif` as the first-screen visual.
 Replace it with a real `.webp` or `.gif` after recording:
 
 ```markdown
