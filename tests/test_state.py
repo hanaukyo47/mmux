@@ -23,6 +23,7 @@ from mmux.cli import (
     database,
     enqueue_task,
     ensure_layout,
+    ensure_default_task,
     execute_driver_task,
     execute_tester_task,
     execute_worker_available_task,
@@ -33,6 +34,7 @@ from mmux.cli import (
     format_utc,
     get_task,
     apply_worktree_patch,
+    discover_frontier_candidates,
     inspect_project,
     list_resource_locks,
     list_worker_heartbeats,
@@ -418,6 +420,58 @@ class StateTests(unittest.TestCase):
             self.assertIn("cargo-test", suggested_names)
             self.assertIn("go-test", suggested_names)
             self.assertIn("gradle-test", suggested_names)
+
+    def test_discover_frontier_candidates_prefers_todo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "src" / "app.py").write_text("value = 1\n# TODO: cover edge case\n", encoding="utf-8")
+            run(["git", "add", "src/app.py"], cwd=project)
+            run(["git", "commit", "-m", "todo"], cwd=project)
+            profile = inspect_project(project)
+
+            candidates = discover_frontier_candidates(project, profile)
+
+            self.assertTrue(candidates)
+            self.assertEqual(candidates[0].resource, "src/app.py")
+            self.assertIn("TODO", candidates[0].title)
+
+    def test_ensure_default_task_uses_frontier_before_generic_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "src" / "app.py").write_text("value = 1\n# FIXME: handle empty input\n", encoding="utf-8")
+            run(["git", "add", "src/app.py"], cwd=project)
+            run(["git", "commit", "-m", "frontier"], cwd=project)
+            ensure_layout(project)
+            profile = inspect_project(project)
+
+            task_id = ensure_default_task(project, profile)
+
+            self.assertIsNotNone(task_id)
+            task = get_task(project, int(task_id or 0))
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.payload.get("origin"), "frontier")
+            self.assertIn("FIXME", task.title)
+            with database(project) as db:
+                row = db.execute("select status from frontier_items where status = ?", ("enqueued",)).fetchone()
+            self.assertIsNotNone(row)
+
+    def test_cmd_frontier_lists_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "src" / "app.py").write_text("value = 1\n# TODO: cover edge case\n", encoding="utf-8")
+            run(["git", "add", "src/app.py"], cwd=project)
+            run(["git", "commit", "-m", "todo"], cwd=project)
+
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                code = cli.main(["frontier", str(project)])
+
+            self.assertEqual(code, 0)
+            self.assertIn("frontier candidates:", output.getvalue())
+            self.assertIn("Resolve TODO", output.getvalue())
 
     def test_build_tester_checks_adds_changed_file_syntax_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

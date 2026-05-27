@@ -88,6 +88,21 @@ The profile separates:
 This lets `mmux run` do enough local reconnaissance to avoid blind execution
 while keeping the supervisor deterministic and non-model-based.
 
+## Frontier Discovery
+
+mmux can generate next-task candidates without asking a model. `mmux frontier`
+and timed-run queue replenishment inspect repository facts such as:
+
+- TODO/FIXME/XXX markers in tracked text files.
+- Source files without obvious nearby tests.
+- Suggested checks detected by project inspection.
+
+Candidates are stored in `frontier_items` with evidence and score. When the open
+queue is empty, mmux prefers the highest-scoring new frontier candidate before
+falling back to a generic conservative default task. This keeps long runs moving
+toward visible project boundaries while leaving final judgement to git facts and
+tester gates.
+
 ## State
 
 Project state lives under `.mmux/`:
@@ -293,7 +308,6 @@ checks.
 The current implementation supports controlled task execution, but it is not a
 complete unattended system yet. Remaining work:
 
-- Automatic `scout` generation of frontier tasks.
 - A real `reviewer` gate.
 - User-configurable tester commands.
 - Worktree cleanup and archival policy.

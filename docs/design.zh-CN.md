@@ -80,6 +80,16 @@ supervisor 不负责：
 
 这样 `mmux run` 在执行前会先做足够的本地调研，避免盲跑，同时 supervisor 仍然保持确定性，不依赖大模型裁判。
 
+## Frontier 发现
+
+mmux 可以不调用模型生成下一步候选任务。`mmux frontier` 和限时运行的队列补给会检查这些确定性事实：
+
+- tracked 文本文件里的 TODO/FIXME/XXX。
+- 缺少明显对应测试的源码文件。
+- 项目画像发现的 suggested checks。
+
+candidate 会写入 `frontier_items`，附带 evidence 和 score。当 open queue 为空时，mmux 会优先选择分数最高且未入队的 frontier candidate；没有候选时才退回通用保守默认任务。这样长时间运行会更倾向于探索真实项目边界，而不是反复生成同一句模糊任务。
+
 ## 状态
 
 项目状态保存在目标工程的 `.mmux/` 下：
@@ -214,7 +224,6 @@ tmux 用于观察和人工接管。数据库仍然是事实源。
 
 当前实现已经支持受控任务执行，但还不是完整无人值守系统。仍需补齐：
 
-- `scout` 自动生成 frontier task。
 - `reviewer` 的真实 review gate。
 - 可配置 tester 命令。
 - worktree 清理和归档策略。

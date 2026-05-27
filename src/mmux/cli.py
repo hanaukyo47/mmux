@@ -137,6 +137,14 @@ class ProjectProfile:
     suggested_checks: tuple[ProjectCheck, ...]
 
 
+@dataclass(frozen=True)
+class FrontierCandidate:
+    title: str
+    resource: str
+    evidence: dict[str, object]
+    score: int
+
+
 def utc_now_dt() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
@@ -1630,6 +1638,21 @@ def has_unittest_tree(worktree: Path) -> bool:
     return tests_dir.is_dir() and any(path.name.startswith("test") for path in tests_dir.rglob("*.py"))
 
 
+def looks_like_test_path(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    name = PurePosixPath(path).name.lower()
+    return (
+        "test" in parts
+        or "tests" in parts
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith(".test.js")
+        or name.endswith(".test.ts")
+        or name.endswith(".spec.js")
+        or name.endswith(".spec.ts")
+    )
+
+
 SKIPPED_PROFILE_DIRS = {
     ".git",
     ".hg",
@@ -1646,6 +1669,25 @@ SKIPPED_PROFILE_DIRS = {
     ".next",
     ".cache",
 }
+
+
+SOURCE_SUFFIXES = {
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".rb",
+    ".php",
+    ".cs",
+}
+TEXT_FRONTIER_SUFFIXES = SOURCE_SUFFIXES | {".md", ".rst", ".txt", ".toml", ".yaml", ".yml", ".json", ".sh"}
+TODO_MARKERS = ("todo", "fixme", "xxx")
 
 
 def list_project_files(project: Path, *, limit: int = 5000) -> list[str]:
@@ -1904,6 +1946,191 @@ def profile_to_dict(profile: ProjectProfile) -> dict[str, object]:
         "active_checks": checks_to_dict(profile.active_checks),
         "suggested_checks": checks_to_dict(profile.suggested_checks),
     }
+
+
+def compact_text(value: str, limit: int = 90) -> str:
+    normalized = " ".join(value.strip().split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
+
+
+def candidate_evidence_text(candidate: FrontierCandidate) -> str:
+    payload = dict(candidate.evidence)
+    payload["resource"] = candidate.resource
+    return json.dumps(payload, sort_keys=True)
+
+
+def candidate_exists_db(db: sqlite3.Connection, candidate: FrontierCandidate) -> bool:
+    row = db.execute(
+        "select 1 from frontier_items where title = ? and evidence = ? limit 1",
+        (candidate.title, candidate_evidence_text(candidate)),
+    ).fetchone()
+    return row is not None
+
+
+def store_frontier_candidates(project: Path, candidates: Iterable[FrontierCandidate]) -> None:
+    with database(project) as db:
+        apply_schema(db)
+        for candidate in candidates:
+            if candidate_exists_db(db, candidate):
+                continue
+            db.execute(
+                """
+                insert into frontier_items(title, status, evidence, score, created_at)
+                values (?, ?, ?, ?, ?)
+                """,
+                (candidate.title, "candidate", candidate_evidence_text(candidate), candidate.score, utc_now()),
+            )
+            record_event(
+                db,
+                "frontier_candidate_added",
+                {
+                    "title": candidate.title,
+                    "resource": candidate.resource,
+                    "score": candidate.score,
+                    "evidence": candidate.evidence,
+                },
+            )
+
+
+def task_title_exists(project: Path, title: str) -> bool:
+    with database(project) as db:
+        apply_schema(db)
+        row = db.execute("select 1 from tasks where title = ? limit 1", (title,)).fetchone()
+    return row is not None
+
+
+def mark_frontier_enqueued(project: Path, candidate: FrontierCandidate, task_id: int) -> None:
+    evidence = candidate_evidence_text(candidate)
+    with database(project) as db:
+        apply_schema(db)
+        db.execute(
+            "update frontier_items set status = ? where title = ? and evidence = ?",
+            ("enqueued", candidate.title, evidence),
+        )
+        record_event(
+            db,
+            "frontier_task_added",
+            {
+                "id": task_id,
+                "title": candidate.title,
+                "resource": candidate.resource,
+                "score": candidate.score,
+                "evidence": candidate.evidence,
+            },
+        )
+
+
+def read_frontier_text(path: Path, limit: int = 200_000) -> str:
+    try:
+        if path.stat().st_size > limit:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def discover_todo_frontiers(project: Path, files: Iterable[str]) -> list[FrontierCandidate]:
+    candidates: list[FrontierCandidate] = []
+    for path_text in files:
+        path = PurePosixPath(path_text)
+        if path.suffix.lower() not in TEXT_FRONTIER_SUFFIXES:
+            continue
+        content = read_frontier_text(project / path_text)
+        if not content:
+            continue
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            lowered = line.lower()
+            marker = next((item for item in TODO_MARKERS if item in lowered), "")
+            if not marker:
+                continue
+            snippet = compact_text(line)
+            candidates.append(
+                FrontierCandidate(
+                    title=f"Resolve {marker.upper()} in {path_text}:{line_number}",
+                    resource=path_text,
+                    evidence={"kind": "todo", "path": path_text, "line": line_number, "snippet": snippet},
+                    score=100,
+                )
+            )
+            break
+    return candidates
+
+
+def discover_test_gap_frontiers(project: Path, files: Iterable[str]) -> list[FrontierCandidate]:
+    file_list = list(files)
+    test_files = [path for path in file_list if looks_like_test_path(path)]
+    tests_dir_exists = (project / "tests").is_dir()
+    candidates: list[FrontierCandidate] = []
+    for path_text in file_list:
+        path = PurePosixPath(path_text)
+        suffix = path.suffix.lower()
+        if suffix not in SOURCE_SUFFIXES or looks_like_test_path(path_text):
+            continue
+        stem = path.stem.lower()
+        has_named_test = any(stem and stem in PurePosixPath(test_path).stem.lower() for test_path in test_files)
+        if has_named_test:
+            continue
+        resource = "tests" if tests_dir_exists else "."
+        candidates.append(
+            FrontierCandidate(
+                title=f"Add focused coverage for {path_text}",
+                resource=resource,
+                evidence={"kind": "test_gap", "path": path_text, "tests_dir": tests_dir_exists},
+                score=70 if tests_dir_exists else 55,
+            )
+        )
+    return candidates
+
+
+def discover_frontier_candidates(project: Path, profile: ProjectProfile, *, limit: int = 20) -> list[FrontierCandidate]:
+    files = list_project_files(project)
+    candidates = discover_todo_frontiers(project, files)
+    candidates.extend(discover_test_gap_frontiers(project, files))
+    if profile.suggested_checks:
+        check = profile.suggested_checks[0]
+        candidates.append(
+            FrontierCandidate(
+                title=f"Document how to enable suggested check: {check.name}",
+                resource=".",
+                evidence={"kind": "suggested_check", "check": check.name, "reason": check.reason},
+                score=40,
+            )
+        )
+
+    deduped: dict[tuple[str, str], FrontierCandidate] = {}
+    for candidate in candidates:
+        try:
+            resource = normalize_resource(project, candidate.resource)
+        except ValueError:
+            continue
+        normalized = FrontierCandidate(candidate.title, resource, candidate.evidence, candidate.score)
+        deduped.setdefault((normalized.title, candidate_evidence_text(normalized)), normalized)
+    return sorted(deduped.values(), key=lambda item: (-item.score, item.title))[:limit]
+
+
+def ensure_frontier_task(project: Path, profile: ProjectProfile) -> Optional[int]:
+    candidates = discover_frontier_candidates(project, profile)
+    if not candidates:
+        return None
+    store_frontier_candidates(project, candidates)
+    for candidate in candidates:
+        if task_title_exists(project, candidate.title):
+            continue
+        task_id = enqueue_task(project, candidate.title, resource=candidate.resource)
+        update_task_payload(
+            project,
+            task_id,
+            {
+                "origin": "frontier",
+                "frontier_score": candidate.score,
+                "frontier_evidence": candidate.evidence,
+            },
+        )
+        mark_frontier_enqueued(project, candidate, task_id)
+        return task_id
+    return None
 
 
 def run_logged_test_command(
@@ -2700,6 +2927,41 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_frontier(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    if not project.exists():
+        raise SystemExit(f"Project path does not exist: {project}")
+    profile = inspect_project(project)
+    candidates = discover_frontier_candidates(project, profile, limit=args.limit)
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "title": candidate.title,
+                        "resource": candidate.resource,
+                        "score": candidate.score,
+                        "evidence": candidate.evidence,
+                    }
+                    for candidate in candidates
+                ],
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"project: {project}")
+    print("frontier candidates:")
+    if not candidates:
+        print("  none")
+        return 0
+    for candidate in candidates:
+        evidence_kind = candidate.evidence.get("kind", "")
+        print(f"  score={candidate.score} resource={candidate.resource} kind={evidence_kind}")
+        print(f"    {candidate.title}")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     ensure_existing_schema(project)
@@ -2872,6 +3134,9 @@ def default_task_title(profile: ProjectProfile) -> str:
 def ensure_default_task(project: Path, profile: ProjectProfile) -> Optional[int]:
     if has_open_tasks(project):
         return None
+    frontier_task_id = ensure_frontier_task(project, profile)
+    if frontier_task_id is not None:
+        return frontier_task_id
     title = default_task_title(profile)
     task_id = enqueue_task(project, title, resource=".")
     update_task_payload(
@@ -3848,6 +4113,12 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("project", nargs="?", default=".")
     inspect.add_argument("--json", action="store_true", help="print machine-readable project profile")
     inspect.set_defaults(func=cmd_inspect)
+
+    frontier = subparsers.add_parser("frontier", help="show deterministic frontier candidates")
+    frontier.add_argument("project", nargs="?", default=".")
+    frontier.add_argument("--limit", type=positive_seconds, default=20)
+    frontier.add_argument("--json", action="store_true", help="print machine-readable frontier candidates")
+    frontier.set_defaults(func=cmd_frontier)
 
     status = subparsers.add_parser("status", help="show deterministic project state")
     status.add_argument("project", nargs="?", default=".")

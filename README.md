@@ -18,6 +18,8 @@ This repository starts as the control-plane skeleton:
 - `mmux doctor` checks local dependencies such as `tmux`, `codex`, and `claude`.
 - `mmux inspect` detects project ecosystems, languages, markers, active checks,
   and suggested checks without using an LLM.
+- `mmux frontier` shows deterministic next-task candidates from repository
+  facts such as TODOs, test gaps, and suggested checks.
 - `mmux start` creates a four-pane tmux workspace for supervisor, Codex worker,
   Claude worker, and logs.
 - `mmux run --minutes N` starts the tmux workspace for a bounded wall-clock
@@ -127,6 +129,7 @@ PYTHONPATH=src python3 -m mmux.cli doctor
 mmux init /path/to/project --task "Improve this project continuously"
 mmux doctor
 mmux inspect /path/to/project
+mmux frontier /path/to/project
 mmux run /path/to/project --minutes 30
 mmux run /path/to/project --minutes 30 --execute-agents
 mmux run /path/to/project --minutes 30 --resident-agents
@@ -175,6 +178,8 @@ mmux stop /path/to/project
   cooldown, so another agent can take the next driver lease.
 - Stopping a run requeues unfinished `running` and `running_test` tasks.
 - Time windows drive the loop; round counts are only internal diagnostics.
+- Queue replenishment prefers deterministic frontier candidates before generic
+  default tasks.
 - tmux is the observation layer, not the source of truth.
 
 See [docs/design.md](docs/design.md) for the initial architecture.
