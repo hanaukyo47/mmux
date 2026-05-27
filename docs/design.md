@@ -214,8 +214,10 @@ and sends the peer resident agent a deterministic `MMUX_TASK` takeover request
 through tmux. It does not fail the task or apply any partial diff from the
 blocked agent. A second resident `MMUX_BLOCKED` for the same task escalates the
 task to `blocked`, which removes it from the open queue and lets timed runs
-continue with other work. When `--resident-agents --execute-agents` are used
-together, mmux opens an extra `automation` tmux window for the existing
+continue with other work. After a human resolves the ambiguity, `mmux task
+requeue #N` can move the task back to `pending`. When `--resident-agents
+--execute-agents` are used together, mmux opens an extra `automation` tmux
+window for the existing
 non-interactive workers, preserving the deterministic driver/tester gate while
 the resident panes keep their long-lived context.
 
@@ -292,7 +294,6 @@ The current implementation supports controlled task execution, but it is not a
 complete unattended system yet. Remaining work:
 
 - Automatic `scout` generation of frontier tasks.
-- Human recovery and requeue commands for `blocked` tasks.
 - A real `reviewer` gate.
 - User-configurable tester commands.
 - Worktree cleanup and archival policy.

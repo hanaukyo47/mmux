@@ -24,6 +24,7 @@ AGENTS = ("codex", "claude")
 RESIDENT_MESSAGE_KINDS = ("task", "review", "note")
 RESIDENT_PANE_INDEXES = {"codex": "1", "claude": "3"}
 RESIDENT_BLOCKED_ESCALATION_EVENTS = 2
+REQUEUEABLE_TASK_STATUSES = ("blocked", "failed", "rejected", "no_change")
 ROLE_LEASE_TTL_SECONDS = 2 * 60
 RESOURCE_LOCK_TTL_SECONDS = 10 * 60
 WORKER_REFRESH_SECONDS = 5
@@ -76,6 +77,15 @@ class TaskRecord:
     claimed_by: str = ""
     claimed_role: str = ""
     claimed_generation: int = 0
+
+
+@dataclass(frozen=True)
+class TaskRequeueOutcome:
+    ok: bool
+    task_id: int
+    from_status: str
+    to_status: str
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -1120,6 +1130,65 @@ def get_task(project: Path, task_id: int) -> Optional[TaskRecord]:
     return task_from_row(row) if row else None
 
 
+def requeue_task(project: Path, task_id: int, reason: str = "manual requeue") -> TaskRequeueOutcome:
+    db = connect(project)
+    try:
+        db.execute("begin immediate")
+        apply_schema(db)
+        row = db.execute(
+            """
+            select id, title, status, payload, claimed_by, claimed_role, claimed_generation
+            from tasks
+            where id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            db.rollback()
+            return TaskRequeueOutcome(False, task_id, "", "", "task not found")
+        task = task_from_row(row)
+        if task.status == "pending":
+            db.rollback()
+            return TaskRequeueOutcome(True, task_id, "pending", "pending", "already pending")
+        if task.status not in REQUEUEABLE_TASK_STATUSES:
+            db.rollback()
+            return TaskRequeueOutcome(
+                False,
+                task_id,
+                task.status,
+                "",
+                f"cannot requeue task in status {task.status}",
+            )
+
+        payload = dict(task.payload)
+        now = utc_now()
+        payload["requeued_from"] = task.status
+        payload["requeued_reason"] = reason
+        payload["requeued_at"] = now
+        payload["requeue_count"] = int(payload.get("requeue_count", 0) or 0) + 1
+        db.execute(
+            """
+            update tasks
+            set status = ?, payload = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
+                claimed_at = '', finished_at = '', updated_at = ?, last_error = ''
+            where id = ?
+            """,
+            ("pending", encode_payload(payload), now, task_id),
+        )
+        record_event(
+            db,
+            "task_requeued",
+            {"id": task_id, "from": task.status, "status": "pending", "reason": reason},
+        )
+        db.commit()
+        return TaskRequeueOutcome(True, task_id, task.status, "pending")
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def claim_task_with_status(
     project: Path,
     agent: str,
@@ -1246,7 +1315,7 @@ def move_task_to_status(
         if message:
             payload["last_message"] = message[:2000]
         now = utc_now()
-        last_error = message if status in {"failed", "rejected"} else ""
+        last_error = message if status in {"failed", "rejected", "blocked"} else ""
         db.execute(
             """
             update tasks
@@ -2845,6 +2914,20 @@ def cmd_task_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_task_requeue(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_existing_schema(project)
+    outcome = requeue_task(project, args.task_id, reason=args.reason)
+    if not outcome.ok:
+        print(f"requeue denied: #{outcome.task_id} {outcome.reason}")
+        return 2
+    if outcome.from_status == "pending":
+        print(f"task already pending: #{outcome.task_id}")
+        return 0
+    print(f"task requeued: #{outcome.task_id} {outcome.from_status} -> {outcome.to_status}")
+    return 0
+
+
 def cmd_roles(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     ensure_existing_schema(project)
@@ -2901,6 +2984,17 @@ def nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be an integer") from exc
     if parsed < 0:
         raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
+
+
+def positive_task_id(value: str) -> int:
+    normalized = value.strip().lstrip("#")
+    try:
+        parsed = int(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a task id") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive task id")
     return parsed
 
 
@@ -3771,6 +3865,12 @@ def build_parser() -> argparse.ArgumentParser:
     task_add.add_argument("--resource", default=".")
     task_add.add_argument("--project", default=".")
     task_add.set_defaults(func=cmd_task_add)
+
+    task_requeue = task_subparsers.add_parser("requeue", help="move a blocked or failed task back to pending")
+    task_requeue.add_argument("task_id", type=positive_task_id)
+    task_requeue.add_argument("--reason", default="manual requeue")
+    task_requeue.add_argument("--project", default=".")
+    task_requeue.set_defaults(func=cmd_task_requeue)
 
     roles = subparsers.add_parser("roles", help="show role leases and worker heartbeats")
     roles.add_argument("project", nargs="?", default=".")

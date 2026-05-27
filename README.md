@@ -39,6 +39,7 @@ This repository starts as the control-plane skeleton:
   `blocked`, freeing the timed run to continue with other work.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
+- `mmux task requeue #N` moves a blocked or failed task back to `pending`.
 - `mmux roles` prints role leases and worker heartbeats.
 - `mmux locks` prints resource locks.
 - `mmux lease acquire/release` exercises deterministic role leasing.
@@ -140,6 +141,7 @@ mmux attach /path/to/project
 mmux status /path/to/project
 mmux tasks /path/to/project
 mmux task add "Add focused tests" --resource tests --project /path/to/project
+mmux task requeue #12 --project /path/to/project --reason "human decision made"
 mmux roles /path/to/project
 mmux locks /path/to/project
 mmux lease acquire scout --agent codex --project /path/to/project
@@ -162,6 +164,7 @@ mmux stop /path/to/project
 - Resident `MMUX_DONE` can hand work to tester; it is not treated as acceptance.
 - Resident `MMUX_BLOCKED` requests peer takeover without failing the task.
 - Repeated resident blocks stop ping-pong by moving the task to `blocked`.
+- Blocked tasks can be manually requeued after human recovery.
 - Diff policy rejects protected paths and files outside the task resource.
 - Tester gate infers zero-config local checks before applying accepted patches.
 - Pending or awaiting-test work gets deterministic `driver/tester` priority

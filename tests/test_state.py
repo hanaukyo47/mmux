@@ -44,6 +44,7 @@ from mmux.cli import (
     resident_mode_enabled,
     release_role,
     release_resource_lock,
+    requeue_task,
     resources_overlap,
     run,
     scan_resident_agent_output,
@@ -843,6 +844,65 @@ exit 1
             self.assertIsNotNone(row)
             payload = cli.decode_payload(row[0])
             self.assertEqual(payload["blocked_count"], 2)
+
+    def test_requeue_task_moves_blocked_task_to_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "blocked task", resource="src")
+            cli.finish_task(project, task_id, "blocked", message="needs human decision")
+
+            outcome = requeue_task(project, task_id, reason="decision made")
+
+            self.assertTrue(outcome.ok)
+            self.assertEqual(outcome.from_status, "blocked")
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.payload.get("requeued_from"), "blocked")
+            self.assertEqual(task.payload.get("requeued_reason"), "decision made")
+            with database(project) as db:
+                row = db.execute(
+                    "select payload from events where kind = ? order by id desc limit 1",
+                    ("task_requeued",),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            payload = cli.decode_payload(row[0])
+            self.assertEqual(payload["from"], "blocked")
+
+    def test_requeue_task_denies_active_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "running task", resource="src")
+            with database(project) as db:
+                db.execute("update tasks set status = ? where id = ?", ("running", task_id))
+
+            outcome = requeue_task(project, task_id)
+
+            self.assertFalse(outcome.ok)
+            self.assertEqual(outcome.from_status, "running")
+
+    def test_cmd_task_requeue_accepts_hash_prefixed_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "blocked task", resource="src")
+            cli.finish_task(project, task_id, "blocked", message="needs human decision")
+
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                code = cli.main(["task", "requeue", f"#{task_id}", "--project", str(project), "--reason", "fixed"])
+
+            self.assertEqual(code, 0)
+            self.assertIn("task requeued", output.getvalue())
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.status, "pending")
 
     def test_cmd_run_adds_default_task_when_queue_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
