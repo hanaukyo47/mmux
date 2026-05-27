@@ -6,11 +6,18 @@ Deterministic multi-agent pair programming over tmux.
 
 ![mmux alpha demo recording](docs/assets/mmux-demo.gif)
 
+- Two different LLMs pair on the same task: one drives, the other reviews.
+- A deterministic state machine, not an LLM, decides what is done.
+- Bounded runs with `--minutes N` and checkpoints; no infinite token burn.
+
 Unlike model-chat agent frameworks where LLMs negotiate outcomes, mmux keeps the
 referee outside the model loop. Codex and Claude Code can write, review, and
 discuss in visible tmux panes; a deterministic supervisor decides state
 transitions with timers, role leases, resource locks, git facts, and test
 results.
+
+mmux also dogfoods project-local `AGENTS.md` briefs: resident agents receive the
+same kind of repository context humans use to keep long-running work scoped.
 
 > Alpha: mmux is ready for controlled experiments and demo runs. It is not yet a
 > production-grade unattended coding system.
@@ -56,7 +63,8 @@ This repository starts as the control-plane skeleton:
   remains, writes checkpoints, stops it automatically, and prints a task
   summary.
 - `mmux start/run --resident-agents` opens persistent interactive Codex and
-  Claude panes with fixed resident worktrees under `.mmux/resident/`.
+  Claude panes with fixed resident worktrees under `.mmux/resident/`, and
+  includes a bounded project-local `AGENTS.md` brief when one exists.
 - `mmux tell` sends `MMUX_TASK`, `MMUX_REVIEW`, or `MMUX_NOTE` protocol lines to
   a resident agent through tmux.
 - `mmux report done|blocked` lets resident agents report task outcomes through

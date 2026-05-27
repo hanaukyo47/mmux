@@ -38,6 +38,8 @@ TEST_TIMEOUT_SECONDS = 10 * 60
 RUN_SHUTDOWN_GRACE_SECONDS = 15
 MIN_EXECUTION_BUDGET_SECONDS = 30
 MIN_TMUX_VERSION = (3, 0)
+AGENT_BRIEF_FILENAME = "AGENTS.md"
+MAX_AGENT_BRIEF_CHARS = 8000
 ASSIGNMENT_ROLE_PAIRS = (
     ("scout", "reviewer"),
     ("driver", "tester"),
@@ -2435,25 +2437,40 @@ def build_resident_prompt(agent: str, project: Path) -> str:
     tell_example = module_command(project, "tell", peer, "note", "<message>")
     report_done_example = module_command(project, "report", "done", "--task-id", "N", "<message>")
     report_blocked_example = module_command(project, "report", "blocked", "--task-id", "N", "<reason>")
-    return "\n".join(
-        [
-            f"You are the persistent {agent} agent running under mmux resident mode.",
-            "",
-            "This tmux session is the shared coordination surface.",
-            f"- Your peer is {peer}; talk to them in the tmux session when decisions need discussion.",
-            f"- To message your peer from a tool shell, run: {tell_example}",
-            "- Treat lines beginning with MMUX_TASK, MMUX_REVIEW, or MMUX_NOTE as control messages.",
-            f"- Preferred done channel: {report_done_example}",
-            f"- Preferred blocked channel: {report_blocked_example}",
-            "- If the report command is unavailable, print a single MMUX_DONE or MMUX_BLOCKED line with the task id.",
-            "",
-            "Work only in this resident git worktree. Keep changes scoped and testable.",
-            "After a done report, mmux may snapshot your diff and reset this resident worktree to HEAD.",
-            "Do not edit .mmux, secrets, or files outside the worktree.",
-            "A deterministic mmux gate outside the model will inspect diffs and run tests before applying anything.",
-            f"Project root: {project}",
-        ]
-    )
+    lines = [
+        f"You are the persistent {agent} agent running under mmux resident mode.",
+        "",
+        "This tmux session is the shared coordination surface.",
+        f"- Your peer is {peer}; talk to them in the tmux session when decisions need discussion.",
+        f"- To message your peer from a tool shell, run: {tell_example}",
+        "- Treat lines beginning with MMUX_TASK, MMUX_REVIEW, or MMUX_NOTE as control messages.",
+        f"- Preferred done channel: {report_done_example}",
+        f"- Preferred blocked channel: {report_blocked_example}",
+        "- If the report command is unavailable, print a single MMUX_DONE or MMUX_BLOCKED line with the task id.",
+        "",
+        "Work only in this resident git worktree. Keep changes scoped and testable.",
+        "After a done report, mmux may snapshot your diff and reset this resident worktree to HEAD.",
+        "Do not edit .mmux, secrets, or files outside the worktree.",
+        "A deterministic mmux gate outside the model will inspect diffs and run tests before applying anything.",
+        f"Project root: {project}",
+    ]
+    agent_brief = read_agent_brief(project)
+    if agent_brief:
+        lines.extend(["", f"Project {AGENT_BRIEF_FILENAME} brief:", agent_brief])
+    return "\n".join(lines)
+
+
+def read_agent_brief(project: Path) -> str:
+    path = project / AGENT_BRIEF_FILENAME
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if len(text) <= MAX_AGENT_BRIEF_CHARS:
+        return text
+    return text[:MAX_AGENT_BRIEF_CHARS].rstrip() + "\n\n[truncated]"
 
 
 def build_resident_command(agent: str, worktree: Path, prompt: str) -> str:

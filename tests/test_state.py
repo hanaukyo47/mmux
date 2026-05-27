@@ -47,6 +47,7 @@ from mmux.cli import (
     parse_reviewer_decision,
     parse_tmux_version,
     process_resident_protocol_events,
+    read_agent_brief,
     report_resident_protocol_event,
     resident_mode_enabled,
     resident_context_from_path,
@@ -1328,6 +1329,17 @@ exit 1
 
         worker_command = module_command(project, "worker", "codex")
         self.assertIn("PATH=", worker_command)
+
+    def test_resident_prompt_includes_project_agent_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "AGENTS.md").write_text("# Local brief\nStay scoped.\n", encoding="utf-8")
+
+            prompt = build_resident_prompt("codex", project)
+
+            self.assertIn("Project AGENTS.md brief:", prompt)
+            self.assertIn("Stay scoped.", prompt)
+            self.assertIn("Stay scoped.", read_agent_brief(project))
 
     def test_stream_agent_command_writes_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
