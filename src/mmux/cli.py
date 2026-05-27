@@ -101,6 +101,16 @@ class TestGateResult:
 
 
 @dataclass(frozen=True)
+class ResidentProtocolEvent:
+    agent: str
+    kind: str
+    task_id: int
+    message: str
+    line: str
+    line_hash: str
+
+
+@dataclass(frozen=True)
 class ProjectCheck:
     name: str
     command: tuple[str, ...]
@@ -325,6 +335,54 @@ def set_meta_json_db(db: sqlite3.Connection, key: str, value: dict[str, object])
 def agent_cooldown_key(agent: str) -> str:
     validate_agent(agent)
     return f"agent_cooldown:{agent}"
+
+
+def resident_seen_key(agent: str) -> str:
+    validate_agent(agent)
+    return f"resident_seen:{agent}"
+
+
+def resident_mode_key() -> str:
+    return "resident_mode"
+
+
+def tmux_panes_key() -> str:
+    return "tmux_panes"
+
+
+def set_tmux_pane_targets(project: Path, panes: dict[str, str]) -> None:
+    with database(project) as db:
+        apply_schema(db)
+        set_meta_json_db(db, tmux_panes_key(), {"panes": panes, "updated_at": utc_now()})
+
+
+def tmux_pane_target_from_meta(project: Path, name: str) -> str:
+    if not state_path(project).exists():
+        return ""
+    with database(project) as db:
+        apply_schema(db)
+        value = meta_json_db(db, tmux_panes_key())
+    panes = value.get("panes")
+    if not isinstance(panes, dict):
+        return ""
+    target = panes.get(name)
+    return str(target) if isinstance(target, str) and target else ""
+
+
+def set_resident_mode(project: Path, enabled: bool) -> None:
+    with database(project) as db:
+        apply_schema(db)
+        set_meta_json_db(db, resident_mode_key(), {"enabled": enabled, "updated_at": utc_now()})
+        record_event(db, "resident_mode_changed", {"enabled": enabled})
+
+
+def resident_mode_enabled(project: Path) -> bool:
+    if not state_path(project).exists():
+        return False
+    with database(project) as db:
+        apply_schema(db)
+        value = meta_json_db(db, resident_mode_key())
+    return value.get("enabled") is True
 
 
 def agent_cooldown_db(db: sqlite3.Connection, agent: str) -> dict[str, object]:
@@ -2040,6 +2098,9 @@ def tmux_has_session(name: str) -> bool:
 
 def resident_pane_target(project: Path, agent: str) -> str:
     validate_agent(agent)
+    stored = tmux_pane_target_from_meta(project, agent)
+    if stored:
+        return stored
     return f"{session_name(project)}:0.{RESIDENT_PANE_INDEXES[agent]}"
 
 
@@ -2055,6 +2116,131 @@ def format_resident_control_message(kind: str, message: str, *, task_id: int = 0
     return " ".join(parts)
 
 
+def resident_line_hash(agent: str, line: str) -> str:
+    return hashlib.sha1(f"{agent}\0{line}".encode("utf-8")).hexdigest()
+
+
+def task_id_from_token(token: str) -> Optional[int]:
+    cleaned = token.strip().rstrip(".,;:")
+    if cleaned.startswith("task=#"):
+        value = cleaned[6:]
+    elif cleaned.startswith("task="):
+        value = cleaned[5:].lstrip("#")
+    elif cleaned.startswith("#"):
+        value = cleaned[1:]
+    else:
+        return None
+    return int(value) if value.isdigit() else None
+
+
+def parse_resident_protocol_line(agent: str, line: str) -> Optional[ResidentProtocolEvent]:
+    validate_agent(agent)
+    stripped = line.strip()
+    if not stripped.startswith("MMUX_"):
+        return None
+    tokens = stripped.split()
+    if not tokens:
+        return None
+    marker = tokens[0]
+    if marker == "MMUX_DONE":
+        kind = "done"
+    elif marker == "MMUX_BLOCKED":
+        kind = "blocked"
+    else:
+        return None
+
+    task_id = 0
+    message_tokens = []
+    for token in tokens[1:]:
+        parsed_task_id = task_id_from_token(token)
+        if parsed_task_id is not None:
+            task_id = parsed_task_id
+            continue
+        if token.startswith("from="):
+            continue
+        message_tokens.append(token)
+
+    return ResidentProtocolEvent(
+        agent=agent,
+        kind=kind,
+        task_id=task_id,
+        message=" ".join(message_tokens),
+        line=stripped,
+        line_hash=resident_line_hash(agent, stripped),
+    )
+
+
+def seen_resident_hashes_db(db: sqlite3.Connection, agent: str) -> list[str]:
+    value = meta_json_db(db, resident_seen_key(agent))
+    hashes = value.get("hashes")
+    if not isinstance(hashes, list):
+        return []
+    return [str(item) for item in hashes if isinstance(item, str)]
+
+
+def record_resident_protocol_events(project: Path, events: Iterable[ResidentProtocolEvent]) -> int:
+    grouped = {agent: [] for agent in AGENTS}
+    for event in events:
+        validate_agent(event.agent)
+        grouped[event.agent].append(event)
+
+    recorded = 0
+    with database(project) as db:
+        apply_schema(db)
+        for agent, agent_events in grouped.items():
+            if not agent_events:
+                continue
+            seen = seen_resident_hashes_db(db, agent)
+            seen_set = set(seen)
+            for event in agent_events:
+                if event.line_hash in seen_set:
+                    continue
+                record_event(
+                    db,
+                    f"resident_agent_{event.kind}",
+                    {
+                        "agent": event.agent,
+                        "task_id": event.task_id,
+                        "message": event.message,
+                        "line": event.line,
+                        "line_hash": event.line_hash,
+                    },
+                )
+                seen.append(event.line_hash)
+                seen_set.add(event.line_hash)
+                recorded += 1
+            set_meta_json_db(db, resident_seen_key(agent), {"hashes": seen[-200:]})
+    return recorded
+
+
+def capture_resident_pane_output(project: Path, agent: str) -> str:
+    result = run(
+        ["tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", resident_pane_target(project, agent)],
+        check=False,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def scan_resident_agent_output(project: Path) -> int:
+    if not resident_mode_enabled(project):
+        return 0
+    if not tmux_has_session(session_name(project)):
+        return 0
+
+    events = []
+    for agent in AGENTS:
+        output = capture_resident_pane_output(project, agent)
+        for line in output.splitlines():
+            event = parse_resident_protocol_line(agent, line)
+            if event is not None:
+                events.append(event)
+
+    recorded = record_resident_protocol_events(project, events)
+    if recorded:
+        write_log(project, f"recorded {recorded} resident protocol event(s)")
+    return recorded
+
+
 def send_tmux_message(project: Path, agent: str, message: str) -> None:
     validate_agent(agent)
     name = session_name(project)
@@ -2064,6 +2250,11 @@ def send_tmux_message(project: Path, agent: str, message: str) -> None:
     run(["tmux", "send-keys", "-t", target, "-l", message])
     run(["tmux", "send-keys", "-t", target, "Enter"])
     write_log(project, f"sent resident message to {agent}: {message[:200]}")
+
+
+def tmux_result_target(result: subprocess.CompletedProcess[str], fallback: str) -> str:
+    target = result.stdout.strip()
+    return target or fallback
 
 
 def module_command(project: Path, subcommand: str, *args: str) -> str:
@@ -2175,10 +2366,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             "select agent, pid, status, role, generation, updated_at from worker_heartbeats order by agent"
         ).fetchall()
         events = db.execute("select kind, created_at from events order by id desc limit 5").fetchall()
+        resident_enabled = meta_json_db(db, resident_mode_key()).get("enabled") is True
     cooldowns = list_agent_cooldowns(project)
 
     print(f"project: {project}")
     print(f"session: {session_name(project)}")
+    print(f"resident agents: {'enabled' if resident_enabled else 'disabled'}")
     print("tasks:")
     if tasks:
         for status, count in tasks:
@@ -2568,20 +2761,42 @@ def start_tmux_session(
         codex_cmd = codex_worker_cmd
         claude_cmd = claude_worker_cmd
 
-    run(["tmux", "new-session", "-d", "-s", name, "-c", str(project), supervisor_cmd])
-    run(["tmux", "split-window", "-h", "-t", f"{name}:0.0", "-c", str(project), codex_cmd])
-    run(["tmux", "split-window", "-v", "-t", f"{name}:0.0", "-c", str(project), log_cmd])
-    run(["tmux", "split-window", "-v", "-t", f"{name}:0.1", "-c", str(project), claude_cmd])
-    run(["tmux", "select-pane", "-t", f"{name}:0.0", "-T", "supervisor"], check=False)
-    run(["tmux", "select-pane", "-t", resident_pane_target(project, "codex"), "-T", "codex"], check=False)
-    run(["tmux", "select-pane", "-t", f"{name}:0.2", "-T", "log"], check=False)
-    run(["tmux", "select-pane", "-t", resident_pane_target(project, "claude"), "-T", "claude"], check=False)
+    supervisor_result = run(
+        ["tmux", "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name, "-c", str(project), supervisor_cmd]
+    )
+    supervisor_pane = tmux_result_target(supervisor_result, f"{name}:0.0")
+    codex_result = run(
+        ["tmux", "split-window", "-h", "-P", "-F", "#{pane_id}", "-t", supervisor_pane, "-c", str(project), codex_cmd]
+    )
+    codex_pane = tmux_result_target(codex_result, f"{name}:0.1")
+    log_result = run(
+        ["tmux", "split-window", "-v", "-P", "-F", "#{pane_id}", "-t", supervisor_pane, "-c", str(project), log_cmd]
+    )
+    log_pane = tmux_result_target(log_result, f"{name}:0.2")
+    claude_result = run(
+        ["tmux", "split-window", "-v", "-P", "-F", "#{pane_id}", "-t", codex_pane, "-c", str(project), claude_cmd]
+    )
+    claude_pane = tmux_result_target(claude_result, f"{name}:0.3")
+    set_tmux_pane_targets(
+        project,
+        {
+            "supervisor": supervisor_pane,
+            "codex": codex_pane,
+            "log": log_pane,
+            "claude": claude_pane,
+        },
+    )
+    run(["tmux", "select-pane", "-t", supervisor_pane, "-T", "supervisor"], check=False)
+    run(["tmux", "select-pane", "-t", codex_pane, "-T", "codex"], check=False)
+    run(["tmux", "select-pane", "-t", log_pane, "-T", "log"], check=False)
+    run(["tmux", "select-pane", "-t", claude_pane, "-T", "claude"], check=False)
     if resident_agents and execute_agents:
         run(["tmux", "new-window", "-t", name, "-n", "automation", "-c", str(project), codex_worker_cmd])
         run(["tmux", "split-window", "-v", "-t", f"{name}:1.0", "-c", str(project), claude_worker_cmd])
         run(["tmux", "select-window", "-t", f"{name}:0"])
     run(["tmux", "select-layout", "-t", name, "tiled"], check=False)
 
+    set_resident_mode(project, resident_agents)
     mode = "resident" if resident_agents else "worker"
     write_log(project, f"started tmux session {name} mode={mode}")
     return True
@@ -2593,9 +2808,13 @@ def stop_tmux_session(project: Path) -> bool:
         raise SystemExit("tmux is not installed")
     if not tmux_has_session(name):
         cleanup_runtime_state(project)
+        if state_path(project).exists():
+            set_resident_mode(project, False)
         return False
     run(["tmux", "kill-session", "-t", name])
     cleanup_runtime_state(project)
+    if state_path(project).exists():
+        set_resident_mode(project, False)
     write_log(project, f"stopped tmux session {name}")
     return True
 
@@ -2788,8 +3007,14 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
             status = " ".join(ensured) or "none"
             conflict_text = f" conflicts={' '.join(conflicts)}" if conflicts else ""
             slot = supervisor_assignment_slot(now)
-            write_log(project, f"heartbeat slot={slot} ttl={ttl} leases={status}{conflict_text}")
-            print(f"{utc_now()} slot={slot} ttl={ttl} leases={status}{conflict_text}")
+            try:
+                resident_events = scan_resident_agent_output(project)
+            except Exception as exc:
+                resident_events = 0
+                write_log(project, f"resident scan failed: {exc}")
+            resident_text = f" resident_events={resident_events}" if resident_events else ""
+            write_log(project, f"heartbeat slot={slot} ttl={ttl} leases={status}{conflict_text}{resident_text}")
+            print(f"{utc_now()} slot={slot} ttl={ttl} leases={status}{conflict_text}{resident_text}")
             sys.stdout.flush()
             time.sleep(SUPERVISOR_TICK_SECONDS)
     except KeyboardInterrupt:

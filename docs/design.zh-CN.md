@@ -169,7 +169,7 @@ MMUX_NOTE from=mmux ...
 mmux tell claude note "Please review the Codex plan" --project PROJECT
 ```
 
-常驻 agent 会被提示用 `MMUX_DONE` 或 `MMUX_BLOCKED` 行回应。当前 MVP 里，这些行还是可观察的协议约定，尚未自动转换为状态机事件。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/tester gate，同时让常驻 pane 保持长期上下文。
+常驻 agent 会被提示用 `MMUX_DONE` 或 `MMUX_BLOCKED` 行回应。supervisor 会从 tmux pane 捕获这些行，去重后记录 `resident_agent_done` / `resident_agent_blocked` 事件。当前 MVP 里，这些事件尚未自动转换为任务状态，也不会单独让 diff 通过验收。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/tester gate，同时让常驻 pane 保持长期上下文。
 
 ## 限时运行
 
@@ -215,7 +215,7 @@ tmux 用于观察和人工接管。数据库仍然是事实源。
 当前实现已经支持受控任务执行，但还不是完整无人值守系统。仍需补齐：
 
 - `scout` 自动生成 frontier task。
-- 自动解析 resident pane 的 `MMUX_DONE` / `MMUX_BLOCKED` 输出。
+- 将捕获到的 resident 事件转换成任务状态机动作。
 - 将 resident diff 接入现有确定性 gate。
 - `reviewer` 的真实 review gate。
 - 可配置 tester 命令。

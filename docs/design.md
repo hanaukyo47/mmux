@@ -202,9 +202,11 @@ mmux tell claude note "Please review the Codex plan" --project PROJECT
 ```
 
 Resident agents are prompted to respond with `MMUX_DONE` or `MMUX_BLOCKED`
-lines. In the current MVP, those lines are a visible protocol convention, not
-yet an automated state transition. When `--resident-agents --execute-agents` are
-used together, mmux opens an extra `automation` tmux window for the existing
+lines. The supervisor captures those lines from tmux panes, deduplicates them,
+and records `resident_agent_done` / `resident_agent_blocked` events. In the
+current MVP, those events are not yet automated task transitions and do not
+accept diffs by themselves. When `--resident-agents --execute-agents` are used
+together, mmux opens an extra `automation` tmux window for the existing
 non-interactive workers, preserving the deterministic driver/tester gate while
 the resident panes keep their long-lived context.
 
@@ -281,7 +283,7 @@ The current implementation supports controlled task execution, but it is not a
 complete unattended system yet. Remaining work:
 
 - Automatic `scout` generation of frontier tasks.
-- Automated parsing of resident pane `MMUX_DONE` / `MMUX_BLOCKED` output.
+- Turning captured resident events into task state transitions.
 - Routing resident diffs through the existing deterministic gate.
 - A real `reviewer` gate.
 - User-configurable tester commands.

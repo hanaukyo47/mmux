@@ -28,6 +28,8 @@ This repository starts as the control-plane skeleton:
   Claude panes with fixed resident worktrees under `.mmux/resident/`.
 - `mmux tell` sends `MMUX_TASK`, `MMUX_REVIEW`, or `MMUX_NOTE` protocol lines to
   a resident agent through tmux.
+- The supervisor captures resident `MMUX_DONE` and `MMUX_BLOCKED` lines from
+  tmux panes and records them as deterministic events.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
 - `mmux roles` prints role leases and worker heartbeats.
@@ -150,6 +152,8 @@ mmux stop /path/to/project
 - Agent execution happens in task git worktrees under `.mmux/worktrees/`.
 - Resident agent context lives in fixed git worktrees under `.mmux/resident/`.
 - Resident agent communication is a tmux protocol line, not a model judge.
+- Resident `MMUX_DONE` / `MMUX_BLOCKED` output is captured as events, not yet
+  treated as acceptance.
 - Diff policy rejects protected paths and files outside the task resource.
 - Tester gate infers zero-config local checks before applying accepted patches.
 - Pending or awaiting-test work gets deterministic `driver/tester` priority

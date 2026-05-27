@@ -38,12 +38,16 @@ from mmux.cli import (
     mark_agent_cooldown,
     maybe_replenish_default_task,
     MIN_EXECUTION_BUDGET_SECONDS,
+    parse_resident_protocol_line,
+    resident_mode_enabled,
     release_role,
     release_resource_lock,
     resources_overlap,
     run,
+    scan_resident_agent_output,
     session_name,
     send_tmux_message,
+    set_resident_mode,
     state_path,
     stream_agent_command,
     supervisor_role_plan,
@@ -635,6 +639,7 @@ exit 1
             self.assertTrue(any("new-window" in call and "automation" in call for call in joined_calls))
             self.assertTrue(any("select-window" in call for call in joined_calls))
             self.assertTrue(any("select-pane" in call and "codex" in call for call in joined_calls))
+            self.assertTrue(resident_mode_enabled(project))
 
     def test_send_tmux_message_targets_resident_pane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -663,6 +668,56 @@ exit 1
     def test_format_resident_control_message(self) -> None:
         message = format_resident_control_message("task", "  add tests\nnow  ", task_id=12)
         self.assertEqual(message, "MMUX_TASK from=mmux task=#12 add tests now")
+
+    def test_parse_resident_protocol_line(self) -> None:
+        event = parse_resident_protocol_line("codex", "  MMUX_BLOCKED from=codex task=#12 needs input  ")
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.agent, "codex")
+        self.assertEqual(event.kind, "blocked")
+        self.assertEqual(event.task_id, 12)
+        self.assertEqual(event.message, "needs input")
+        self.assertIsNone(parse_resident_protocol_line("codex", "MMUX_NOTE from=claude hi"))
+
+    def test_scan_resident_agent_output_records_protocol_events_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            ensure_layout(project)
+            set_resident_mode(project, True)
+            original_capture = cli.capture_resident_pane_output
+            original_tmux_has_session = cli.tmux_has_session
+
+            def fake_capture(_project, agent):
+                if agent == "codex":
+                    return "\n".join(
+                        [
+                            "ordinary terminal output",
+                            "MMUX_DONE from=codex task=#7 implemented",
+                            "MMUX_BLOCKED from=codex task=#8 needs decision",
+                        ]
+                    )
+                return ""
+
+            cli.capture_resident_pane_output = fake_capture
+            cli.tmux_has_session = lambda _name: True
+            try:
+                first = scan_resident_agent_output(project)
+                second = scan_resident_agent_output(project)
+            finally:
+                cli.capture_resident_pane_output = original_capture
+                cli.tmux_has_session = original_tmux_has_session
+
+            self.assertEqual(first, 2)
+            self.assertEqual(second, 0)
+            with database(project) as db:
+                rows = db.execute(
+                    "select kind, payload from events where kind like ? order by id",
+                    ("resident_agent_%",),
+                ).fetchall()
+            self.assertEqual([row[0] for row in rows], ["resident_agent_done", "resident_agent_blocked"])
+            payload = cli.decode_payload(rows[0][1])
+            self.assertEqual(payload["agent"], "codex")
+            self.assertEqual(payload["task_id"], 7)
 
     def test_cmd_run_adds_default_task_when_queue_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
