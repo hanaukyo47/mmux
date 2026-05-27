@@ -209,11 +209,13 @@ resident worktree diff. If deterministic diff policy accepts it, mmux freezes
 the patch into a normal task worktree under `.mmux/worktrees/`, resets the
 resident worktree back to `HEAD`, and moves the task to `awaiting_test`; the
 existing tester gate still decides whether the patch can be applied to the main
-worktree. `MMUX_BLOCKED` is recorded but does not yet drive retry or takeover
-policy. When `--resident-agents --execute-agents` are used together, mmux opens
-an extra `automation` tmux window for the existing non-interactive workers,
-preserving the deterministic driver/tester gate while the resident panes keep
-their long-lived context.
+worktree. `MMUX_BLOCKED task=#N` records the blocked reason on the task payload
+and sends the peer resident agent a deterministic `MMUX_TASK` takeover request
+through tmux. It does not fail the task or apply any partial diff from the
+blocked agent. When `--resident-agents --execute-agents` are used together, mmux
+opens an extra `automation` tmux window for the existing non-interactive
+workers, preserving the deterministic driver/tester gate while the resident
+panes keep their long-lived context.
 
 ## Timed Runs
 
@@ -288,7 +290,7 @@ The current implementation supports controlled task execution, but it is not a
 complete unattended system yet. Remaining work:
 
 - Automatic `scout` generation of frontier tasks.
-- Full retry and takeover policy for resident blocked events.
+- Multi-block retry cooldowns and human escalation policy.
 - A real `reviewer` gate.
 - User-configurable tester commands.
 - Worktree cleanup and archival policy.

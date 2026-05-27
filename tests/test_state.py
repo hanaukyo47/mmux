@@ -767,6 +767,50 @@ exit 1
             self.assertIn("rejected", messages[0])
             self.assertIn("resource_violation", task.payload.get("diff_policy"))
 
+    def test_process_resident_blocked_requests_peer_takeover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            init_git_project(project)
+            ensure_layout(project)
+            set_resident_mode(project, True)
+            task_id = enqueue_task(project, "blocked task", resource="src")
+            event = parse_resident_protocol_line("codex", f"MMUX_BLOCKED from=codex task=#{task_id} need architecture call")
+            assert event is not None
+            calls = []
+            original_run = cli.run
+            original_tmux_has_session = cli.tmux_has_session
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            cli.run = fake_run
+            cli.tmux_has_session = lambda _name: True
+            try:
+                messages = process_resident_protocol_events(project, [event])
+            finally:
+                cli.run = original_run
+                cli.tmux_has_session = original_tmux_has_session
+
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.payload.get("resident_blocked_by"), "codex")
+            self.assertEqual(task.payload.get("resident_takeover_agent"), "claude")
+            self.assertIn("takeover requested from claude", messages[0])
+            joined_calls = [" ".join(str(part) for part in cmd) for cmd in calls]
+            self.assertTrue(any("send-keys" in call and "MMUX_TASK" in call for call in joined_calls))
+            with database(project) as db:
+                row = db.execute(
+                    "select payload from events where kind = ? order by id desc limit 1",
+                    ("resident_blocked_takeover_requested",),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            payload = cli.decode_payload(row[0])
+            self.assertEqual(payload["peer"], "claude")
+            self.assertTrue(payload["delivered"])
+
     def test_cmd_run_adds_default_task_when_queue_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)

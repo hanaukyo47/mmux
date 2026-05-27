@@ -167,6 +167,11 @@ def agent_order_for_slot(now: Optional[dt.datetime] = None) -> tuple[str, ...]:
     return AGENTS if slot % 2 == 0 else tuple(reversed(AGENTS))
 
 
+def peer_agent(agent: str) -> str:
+    validate_agent(agent)
+    return next(candidate for candidate in AGENTS if candidate != agent)
+
+
 def seconds_until_next_assignment(now: Optional[dt.datetime] = None) -> int:
     moment = now or utc_now_dt()
     slot = supervisor_assignment_slot(moment)
@@ -2370,8 +2375,58 @@ def process_resident_done_event(project: Path, event: ResidentProtocolEvent) -> 
 
 
 def process_resident_blocked_event(project: Path, event: ResidentProtocolEvent) -> str:
-    record_resident_processing_event(project, "resident_blocked_recorded", event, {"message": event.message})
-    return f"resident {event.agent} blocked task #{event.task_id}: {event.message}"
+    if event.task_id <= 0:
+        record_resident_processing_event(project, "resident_blocked_ignored", event, {"reason": "missing task id"})
+        return "ignored: missing task id"
+
+    task = get_task(project, event.task_id)
+    if task is None:
+        record_resident_processing_event(project, "resident_blocked_ignored", event, {"reason": "unknown task"})
+        return f"ignored: unknown task #{event.task_id}"
+    if task.status != "pending":
+        record_resident_processing_event(
+            project,
+            "resident_blocked_ignored",
+            event,
+            {"reason": f"task status is {task.status}", "status": task.status},
+        )
+        return f"ignored: task #{task.id} status is {task.status}"
+
+    peer = peer_agent(event.agent)
+    payload_updates = {
+        "resident_blocked_by": event.agent,
+        "resident_blocked_reason": event.message,
+        "resident_blocked_at": utc_now(),
+        "resident_blocked_event": event.line_hash,
+        "resident_takeover_agent": peer,
+    }
+    update_task_payload(project, task.id, payload_updates)
+
+    delivered = False
+    takeover_line = format_resident_control_message(
+        "task",
+        f"take over task #{task.id}: {task.title}; {event.agent} blocked: {event.message}",
+        task_id=task.id,
+    )
+    if resident_mode_enabled(project) and tmux_has_session(session_name(project)):
+        try:
+            send_tmux_message(project, peer, takeover_line)
+            delivered = True
+        except Exception:
+            delivered = False
+
+    record_resident_processing_event(
+        project,
+        "resident_blocked_takeover_requested",
+        event,
+        {
+            "message": event.message,
+            "peer": peer,
+            "delivered": delivered,
+            "takeover_line": takeover_line,
+        },
+    )
+    return f"resident {event.agent} blocked task #{task.id}; takeover requested from {peer}"
 
 
 def process_resident_protocol_events(project: Path, events: Iterable[ResidentProtocolEvent]) -> list[str]:

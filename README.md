@@ -33,6 +33,8 @@ This repository starts as the control-plane skeleton:
 - Resident `MMUX_DONE task=#N` freezes the agent's resident diff into a task
   worktree, resets the resident worktree, and moves the task to `awaiting_test`;
   tester still gates acceptance.
+- Resident `MMUX_BLOCKED task=#N` records the blocked reason and sends the peer
+  resident agent a deterministic `MMUX_TASK` takeover request through tmux.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
 - `mmux roles` prints role leases and worker heartbeats.
@@ -156,6 +158,7 @@ mmux stop /path/to/project
 - Resident agent context lives in fixed git worktrees under `.mmux/resident/`.
 - Resident agent communication is a tmux protocol line, not a model judge.
 - Resident `MMUX_DONE` can hand work to tester; it is not treated as acceptance.
+- Resident `MMUX_BLOCKED` requests peer takeover without failing the task.
 - Diff policy rejects protected paths and files outside the task resource.
 - Tester gate infers zero-config local checks before applying accepted patches.
 - Pending or awaiting-test work gets deterministic `driver/tester` priority
