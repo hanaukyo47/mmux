@@ -203,12 +203,17 @@ mmux tell claude note "Please review the Codex plan" --project PROJECT
 
 Resident agents are prompted to respond with `MMUX_DONE` or `MMUX_BLOCKED`
 lines. The supervisor captures those lines from tmux panes, deduplicates them,
-and records `resident_agent_done` / `resident_agent_blocked` events. In the
-current MVP, those events are not yet automated task transitions and do not
-accept diffs by themselves. When `--resident-agents --execute-agents` are used
-together, mmux opens an extra `automation` tmux window for the existing
-non-interactive workers, preserving the deterministic driver/tester gate while
-the resident panes keep their long-lived context.
+and records `resident_agent_done` / `resident_agent_blocked` events. A
+`MMUX_DONE task=#N` line for a pending task makes mmux inspect that agent's
+resident worktree diff. If deterministic diff policy accepts it, mmux freezes
+the patch into a normal task worktree under `.mmux/worktrees/`, resets the
+resident worktree back to `HEAD`, and moves the task to `awaiting_test`; the
+existing tester gate still decides whether the patch can be applied to the main
+worktree. `MMUX_BLOCKED` is recorded but does not yet drive retry or takeover
+policy. When `--resident-agents --execute-agents` are used together, mmux opens
+an extra `automation` tmux window for the existing non-interactive workers,
+preserving the deterministic driver/tester gate while the resident panes keep
+their long-lived context.
 
 ## Timed Runs
 
@@ -283,8 +288,7 @@ The current implementation supports controlled task execution, but it is not a
 complete unattended system yet. Remaining work:
 
 - Automatic `scout` generation of frontier tasks.
-- Turning captured resident events into task state transitions.
-- Routing resident diffs through the existing deterministic gate.
+- Full retry and takeover policy for resident blocked events.
 - A real `reviewer` gate.
 - User-configurable tester commands.
 - Worktree cleanup and archival policy.

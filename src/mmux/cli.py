@@ -1100,6 +1100,20 @@ def list_tasks(project: Path) -> list[TaskRecord]:
         return [task_from_row(row) for row in rows]
 
 
+def get_task(project: Path, task_id: int) -> Optional[TaskRecord]:
+    with database(project) as db:
+        apply_schema(db)
+        row = db.execute(
+            """
+            select id, title, status, payload, claimed_by, claimed_role, claimed_generation
+            from tasks
+            where id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+    return task_from_row(row) if row else None
+
+
 def claim_task_with_status(
     project: Path,
     agent: str,
@@ -1426,9 +1440,13 @@ def prepare_resident_worktree(project: Path, agent: str) -> Path:
         return path
     if not (path / ".git").exists():
         raise RuntimeError(f"resident path exists but is not a git worktree: {path}")
-    run(["git", "reset", "--hard", "HEAD"], cwd=path)
-    run(["git", "clean", "-fd"], cwd=path)
+    reset_resident_worktree(path)
     return path
+
+
+def reset_resident_worktree(worktree: Path) -> None:
+    run(["git", "reset", "--hard", "HEAD"], cwd=worktree)
+    run(["git", "clean", "-fd"], cwd=worktree)
 
 
 def create_task_worktree(project: Path, task: TaskRecord, agent: str) -> Path:
@@ -1495,6 +1513,17 @@ def apply_worktree_patch(project: Path, patch: str) -> None:
     if not main_worktree_is_clean(project):
         raise RuntimeError("main worktree has tracked changes; refusing to apply task patch")
     run_with_input(["git", "apply", "--binary", "-"], cwd=project, input_text=patch)
+
+
+def apply_patch_to_worktree(worktree: Path, patch: str) -> None:
+    if patch.strip():
+        run_with_input(["git", "apply", "--binary", "-"], cwd=worktree, input_text=patch)
+
+
+def export_resident_patch(worktree: Path) -> str:
+    patch = export_worktree_patch(worktree)
+    run(["git", "reset"], cwd=worktree, check=False)
+    return patch
 
 
 def changed_python_files(worktree: Path, changed_files: Iterable[str]) -> list[str]:
@@ -1933,6 +1962,7 @@ def build_resident_prompt(agent: str, project: Path) -> str:
             "- When blocked, print a single line starting with MMUX_BLOCKED and include the task id and reason.",
             "",
             "Work only in this resident git worktree. Keep changes scoped and testable.",
+            "After MMUX_DONE, mmux may snapshot your diff and reset this resident worktree to HEAD.",
             "Do not edit .mmux, secrets, or files outside the worktree.",
             "A deterministic mmux gate outside the model will inspect diffs and run tests before applying anything.",
             f"Project root: {project}",
@@ -2178,13 +2208,13 @@ def seen_resident_hashes_db(db: sqlite3.Connection, agent: str) -> list[str]:
     return [str(item) for item in hashes if isinstance(item, str)]
 
 
-def record_resident_protocol_events(project: Path, events: Iterable[ResidentProtocolEvent]) -> int:
+def record_resident_protocol_events(project: Path, events: Iterable[ResidentProtocolEvent]) -> list[ResidentProtocolEvent]:
     grouped = {agent: [] for agent in AGENTS}
     for event in events:
         validate_agent(event.agent)
         grouped[event.agent].append(event)
 
-    recorded = 0
+    recorded: list[ResidentProtocolEvent] = []
     with database(project) as db:
         apply_schema(db)
         for agent, agent_events in grouped.items():
@@ -2208,9 +2238,154 @@ def record_resident_protocol_events(project: Path, events: Iterable[ResidentProt
                 )
                 seen.append(event.line_hash)
                 seen_set.add(event.line_hash)
-                recorded += 1
+                recorded.append(event)
             set_meta_json_db(db, resident_seen_key(agent), {"hashes": seen[-200:]})
     return recorded
+
+
+def record_resident_processing_event(project: Path, kind: str, event: ResidentProtocolEvent, payload: dict[str, object]) -> None:
+    data = {
+        "agent": event.agent,
+        "task_id": event.task_id,
+        "resident_event": event.line_hash,
+    }
+    data.update(payload)
+    record_project_event(project, kind, data)
+
+
+def process_resident_done_event(project: Path, event: ResidentProtocolEvent) -> str:
+    if event.task_id <= 0:
+        record_resident_processing_event(project, "resident_done_ignored", event, {"reason": "missing task id"})
+        return "ignored: missing task id"
+
+    task = get_task(project, event.task_id)
+    if task is None:
+        record_resident_processing_event(project, "resident_done_ignored", event, {"reason": "unknown task"})
+        return f"ignored: unknown task #{event.task_id}"
+    if task.status != "pending":
+        record_resident_processing_event(
+            project,
+            "resident_done_ignored",
+            event,
+            {"reason": f"task status is {task.status}", "status": task.status},
+        )
+        return f"ignored: task #{task.id} status is {task.status}"
+
+    resident_worktree = resident_worktree_path(project, event.agent)
+    if not resident_worktree.exists():
+        record_resident_processing_event(project, "resident_done_ignored", event, {"reason": "resident worktree missing"})
+        return f"ignored: {event.agent} resident worktree missing"
+
+    resource = task_resource(task)
+    policy = check_diff_policy(project, resident_worktree, resource)
+    payload_updates = {
+        "resident_agent": event.agent,
+        "resident_event": event.line_hash,
+        "resident_message": event.message,
+        "diff_policy": policy.status,
+        "changed_files": list(policy.changed_files),
+    }
+
+    if policy.status == "no_change":
+        finish_task(
+            project,
+            task.id,
+            "no_change",
+            message=policy.reason,
+            payload_updates=payload_updates,
+        )
+        reset_resident_worktree(resident_worktree)
+        record_resident_processing_event(project, "resident_done_no_change", event, {"reason": policy.reason})
+        return f"task #{task.id} no_change from resident {event.agent}"
+
+    if not policy.ok:
+        finish_task(
+            project,
+            task.id,
+            "rejected",
+            message=policy.reason,
+            payload_updates=payload_updates,
+        )
+        reset_resident_worktree(resident_worktree)
+        record_resident_processing_event(project, "resident_done_rejected", event, {"reason": policy.reason})
+        return f"task #{task.id} rejected from resident {event.agent}: {policy.reason}"
+
+    snapshot = create_task_worktree(project, task, event.agent)
+    try:
+        patch = export_resident_patch(resident_worktree)
+        apply_patch_to_worktree(snapshot, patch)
+    except Exception as exc:
+        finish_task(
+            project,
+            task.id,
+            "failed",
+            message=f"resident snapshot failed: {exc}",
+            payload_updates=payload_updates,
+        )
+        record_resident_processing_event(project, "resident_done_failed", event, {"reason": str(exc)})
+        return f"task #{task.id} failed: resident snapshot failed: {exc}"
+
+    snapshot_policy = check_diff_policy(project, snapshot, resource)
+    payload_updates.update(
+        {
+            "worktree": relative_to_project(project, snapshot),
+            "resident_source_worktree": relative_to_project(project, resident_worktree),
+            "diff_policy": snapshot_policy.status,
+            "changed_files": list(snapshot_policy.changed_files),
+        }
+    )
+    if not snapshot_policy.ok or snapshot_policy.status == "no_change":
+        status = "no_change" if snapshot_policy.status == "no_change" else "rejected"
+        finish_task(
+            project,
+            task.id,
+            status,
+            message=snapshot_policy.reason,
+            payload_updates=payload_updates,
+        )
+        reset_resident_worktree(resident_worktree)
+        record_resident_processing_event(
+            project,
+            f"resident_done_{status}",
+            event,
+            {"reason": snapshot_policy.reason, "worktree": relative_to_project(project, snapshot)},
+        )
+        return f"task #{task.id} {status} after resident snapshot"
+
+    move_task_to_status(
+        project,
+        task.id,
+        "awaiting_test",
+        message=event.message,
+        payload_updates=payload_updates,
+    )
+    reset_resident_worktree(resident_worktree)
+    record_resident_processing_event(
+        project,
+        "resident_done_awaiting_test",
+        event,
+        {"worktree": relative_to_project(project, snapshot), "changed_files": list(snapshot_policy.changed_files)},
+    )
+    return f"task #{task.id} awaiting_test from resident {event.agent}"
+
+
+def process_resident_blocked_event(project: Path, event: ResidentProtocolEvent) -> str:
+    record_resident_processing_event(project, "resident_blocked_recorded", event, {"message": event.message})
+    return f"resident {event.agent} blocked task #{event.task_id}: {event.message}"
+
+
+def process_resident_protocol_events(project: Path, events: Iterable[ResidentProtocolEvent]) -> list[str]:
+    messages = []
+    for event in events:
+        try:
+            if event.kind == "done":
+                messages.append(process_resident_done_event(project, event))
+            elif event.kind == "blocked":
+                messages.append(process_resident_blocked_event(project, event))
+        except Exception as exc:
+            record_resident_processing_event(project, "resident_event_processing_failed", event, {"reason": str(exc)})
+            messages.append(f"resident event failed: {exc}")
+    return messages
 
 
 def capture_resident_pane_output(project: Path, agent: str) -> str:
@@ -2235,10 +2410,14 @@ def scan_resident_agent_output(project: Path) -> int:
             if event is not None:
                 events.append(event)
 
-    recorded = record_resident_protocol_events(project, events)
-    if recorded:
-        write_log(project, f"recorded {recorded} resident protocol event(s)")
-    return recorded
+    recorded_events = record_resident_protocol_events(project, events)
+    if recorded_events:
+        messages = process_resident_protocol_events(project, recorded_events)
+        write_log(project, f"recorded {len(recorded_events)} resident protocol event(s)")
+        for message in messages:
+            write_log(project, f"resident event: {message}")
+    return len(recorded_events)
+
 
 
 def send_tmux_message(project: Path, agent: str, message: str) -> None:

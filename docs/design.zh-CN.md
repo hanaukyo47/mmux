@@ -169,7 +169,7 @@ MMUX_NOTE from=mmux ...
 mmux tell claude note "Please review the Codex plan" --project PROJECT
 ```
 
-常驻 agent 会被提示用 `MMUX_DONE` 或 `MMUX_BLOCKED` 行回应。supervisor 会从 tmux pane 捕获这些行，去重后记录 `resident_agent_done` / `resident_agent_blocked` 事件。当前 MVP 里，这些事件尚未自动转换为任务状态，也不会单独让 diff 通过验收。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/tester gate，同时让常驻 pane 保持长期上下文。
+常驻 agent 会被提示用 `MMUX_DONE` 或 `MMUX_BLOCKED` 行回应。supervisor 会从 tmux pane 捕获这些行，去重后记录 `resident_agent_done` / `resident_agent_blocked` 事件。对于 pending 任务，`MMUX_DONE task=#N` 会触发 mmux 检查该 agent 的 resident worktree diff；如果确定性 diff policy 通过，mmux 会把 patch 冻结到 `.mmux/worktrees/` 下的普通 task worktree，随后把 resident worktree 重置回 `HEAD`，并把任务推进到 `awaiting_test`。最终能否应用到主工作区，仍然由现有 tester gate 决定。`MMUX_BLOCKED` 目前只记录事件，尚未驱动 retry 或 takeover 策略。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/tester gate，同时让常驻 pane 保持长期上下文。
 
 ## 限时运行
 
@@ -215,8 +215,7 @@ tmux 用于观察和人工接管。数据库仍然是事实源。
 当前实现已经支持受控任务执行，但还不是完整无人值守系统。仍需补齐：
 
 - `scout` 自动生成 frontier task。
-- 将捕获到的 resident 事件转换成任务状态机动作。
-- 将 resident diff 接入现有确定性 gate。
+- resident blocked 事件的 retry / takeover 策略。
 - `reviewer` 的真实 review gate。
 - 可配置 tester 命令。
 - worktree 清理和归档策略。

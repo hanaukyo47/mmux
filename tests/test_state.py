@@ -31,6 +31,7 @@ from mmux.cli import (
     format_task_counts,
     format_task_delta,
     format_utc,
+    get_task,
     apply_worktree_patch,
     inspect_project,
     list_resource_locks,
@@ -39,6 +40,7 @@ from mmux.cli import (
     maybe_replenish_default_task,
     MIN_EXECUTION_BUDGET_SECONDS,
     parse_resident_protocol_line,
+    process_resident_protocol_events,
     resident_mode_enabled,
     release_role,
     release_resource_lock,
@@ -718,6 +720,52 @@ exit 1
             payload = cli.decode_payload(rows[0][1])
             self.assertEqual(payload["agent"], "codex")
             self.assertEqual(payload["task_id"], 7)
+
+    def test_process_resident_done_snapshots_diff_for_tester(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "resident change", resource="src")
+            resident = cli.prepare_resident_worktree(project, "codex")
+            (resident / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
+            event = parse_resident_protocol_line("codex", f"MMUX_DONE from=codex task=#{task_id} implemented")
+            assert event is not None
+
+            messages = process_resident_protocol_events(project, [event])
+
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.status, "awaiting_test")
+            self.assertIn("awaiting_test", messages[0])
+            worktree_value = task.payload.get("worktree")
+            self.assertIsInstance(worktree_value, str)
+            snapshot = project / str(worktree_value)
+            self.assertTrue(snapshot.exists())
+            self.assertEqual((snapshot / "src" / "app.py").read_text(encoding="utf-8"), "value = 2\n")
+            self.assertEqual((resident / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
+            self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
+
+    def test_process_resident_done_rejects_resource_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "resident change", resource="src")
+            resident = cli.prepare_resident_worktree(project, "codex")
+            (resident / "README.md").write_text("# changed\n", encoding="utf-8")
+            event = parse_resident_protocol_line("codex", f"MMUX_DONE from=codex task=#{task_id} implemented")
+            assert event is not None
+
+            messages = process_resident_protocol_events(project, [event])
+
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.status, "rejected")
+            self.assertIn("rejected", messages[0])
+            self.assertIn("resource_violation", task.payload.get("diff_policy"))
 
     def test_cmd_run_adds_default_task_when_queue_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
