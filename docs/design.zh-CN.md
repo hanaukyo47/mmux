@@ -143,7 +143,7 @@ supervisor 仍然不调用模型。它只发放租约、检查文件事实、记
 
 ## 限时运行
 
-`mmux run PROJECT --minutes N` 是普通使用时的顶层受控入口。它会在需要时初始化本地 `.mmux/` 目录，拒绝复用已经存在的 tmux session，先生成项目画像；如果任务队列里没有 pending 或进行中的工作，会自动补一个保守默认任务。`--no-default-task` 可以关闭这个队列引导，用于纯观察运行。随后命令记录 `run_started` 事件，启动与 `mmux start` 相同的四窗格工作区，并用墙钟时间驱动运行窗口。
+`mmux run PROJECT --minutes N` 是普通使用时的顶层受控入口。它会在需要时初始化本地 `.mmux/` 目录，拒绝复用已经存在的 tmux session，先生成项目画像；如果任务队列里没有 pending 或进行中的工作，会自动补一个保守默认任务。运行期间，每个 checkpoint 也会在 open work 耗尽且剩余执行预算足够时继续补下一个保守默认任务。`--no-default-task` 可以关闭这个队列引导与补给，用于纯观察运行。随后命令记录 `run_started` 事件，启动与 `mmux start` 相同的四窗格工作区，并用墙钟时间驱动运行窗口。
 
 运行期间，它会定期把剩余时间和任务状态计数写到 stdout 与 supervisor log。到达时限或收到 `KeyboardInterrupt` 后，它会停止 tmux session，清理运行期 lease、lock、heartbeat，把未完成的 `running` 任务恢复为 `pending`，把未完成的 `running_test` 任务恢复为 `awaiting_test`，记录 `run_finished`，并打印 before/after/delta 任务汇总。
 

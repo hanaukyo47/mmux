@@ -2236,6 +2236,21 @@ def ensure_default_task(project: Path, profile: ProjectProfile) -> Optional[int]
     return task_id
 
 
+def maybe_replenish_default_task(
+    project: Path,
+    profile: ProjectProfile,
+    *,
+    disabled: bool,
+    remaining_seconds: int,
+    shutdown_grace_seconds: int,
+) -> Optional[int]:
+    if disabled:
+        return None
+    if remaining_seconds < MIN_EXECUTION_BUDGET_SECONDS + shutdown_grace_seconds:
+        return None
+    return ensure_default_task(project, profile)
+
+
 def cmd_task_add(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     ensure_existing_schema(project)
@@ -2553,9 +2568,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             if remaining <= 0:
                 break
             time.sleep(min(checkpoint_seconds, remaining))
-            counts = task_status_counts(project)
             remaining_seconds = max(0, int(deadline - time.monotonic()))
+            replenished_task_id = maybe_replenish_default_task(
+                project,
+                profile,
+                disabled=args.no_default_task,
+                remaining_seconds=remaining_seconds,
+                shutdown_grace_seconds=args.shutdown_grace_seconds,
+            )
+            counts = task_status_counts(project)
             message = f"run checkpoint remaining={remaining_seconds}s tasks={format_task_counts(counts)}"
+            if replenished_task_id is not None:
+                message += f" default_task_added=#{replenished_task_id}"
             write_log(project, message)
             print(f"{utc_now()} {message}")
             sys.stdout.flush()

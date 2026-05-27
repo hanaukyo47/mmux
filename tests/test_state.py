@@ -33,6 +33,8 @@ from mmux.cli import (
     list_resource_locks,
     list_worker_heartbeats,
     mark_agent_cooldown,
+    maybe_replenish_default_task,
+    MIN_EXECUTION_BUDGET_SECONDS,
     release_role,
     release_resource_lock,
     resources_overlap,
@@ -626,6 +628,57 @@ exit 1
             with database(project.resolve()) as db:
                 event = db.execute("select kind from events where kind = ?", ("default_task_added",)).fetchone()
             self.assertEqual(event[0], "default_task_added")
+
+    def test_replenish_default_task_respects_open_work_and_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+            profile = inspect_project(project)
+
+            first = maybe_replenish_default_task(
+                project,
+                profile,
+                disabled=False,
+                remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 15,
+                shutdown_grace_seconds=15,
+            )
+            blocked_by_open = maybe_replenish_default_task(
+                project,
+                profile,
+                disabled=False,
+                remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 15,
+                shutdown_grace_seconds=15,
+            )
+            with database(project) as db:
+                db.execute("update tasks set status = ? where id = ?", ("completed", first))
+            too_late = maybe_replenish_default_task(
+                project,
+                profile,
+                disabled=False,
+                remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 14,
+                shutdown_grace_seconds=15,
+            )
+            disabled = maybe_replenish_default_task(
+                project,
+                profile,
+                disabled=True,
+                remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 15,
+                shutdown_grace_seconds=15,
+            )
+            second = maybe_replenish_default_task(
+                project,
+                profile,
+                disabled=False,
+                remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 15,
+                shutdown_grace_seconds=15,
+            )
+
+            self.assertEqual(first, 1)
+            self.assertIsNone(blocked_by_open)
+            self.assertIsNone(too_late)
+            self.assertIsNone(disabled)
+            self.assertEqual(second, 2)
+            self.assertEqual(task_status_counts(project), {"pending": 1, "completed": 1})
 
     def test_cmd_run_can_disable_default_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -21,8 +21,9 @@ This repository starts as the control-plane skeleton:
 - `mmux start` creates a four-pane tmux workspace for supervisor, Codex worker,
   Claude worker, and logs.
 - `mmux run --minutes N` starts the tmux workspace for a bounded wall-clock
-  window, adds a conservative default task when the queue is empty, writes
-  checkpoints, stops it automatically, and prints a task summary.
+  window, adds conservative default tasks when the open queue is empty and time
+  remains, writes checkpoints, stops it automatically, and prints a task
+  summary.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
 - `mmux roles` prints role leases and worker heartbeats.
@@ -66,10 +67,11 @@ mmux inspect .
 mmux run . --minutes 30
 ```
 
-This observes only. It initializes `.mmux/`, profiles the project, adds one
+This observes only. It initializes `.mmux/`, profiles the project, adds a
 conservative default task if the queue is empty, starts tmux, writes
-checkpoints, and stops at the deadline. To let Codex and Claude Code actually
-edit code inside the deterministic gates:
+checkpoints, replenishes default tasks when the open queue is exhausted and time
+remains, and stops at the deadline. To let Codex and Claude Code actually edit
+code inside the deterministic gates:
 
 ```bash
 mmux run . --minutes 30 --execute-agents
