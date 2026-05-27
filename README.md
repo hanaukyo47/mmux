@@ -176,6 +176,8 @@ mmux stop /path/to/project
 - Blocked tasks can be manually requeued after human recovery.
 - Diff policy rejects protected paths and files outside the task resource.
 - Tester gate infers zero-config local checks before applying accepted patches.
+- Suite-level tester checks are baseline-aware, so pre-existing suite failures
+  are logged without automatically rejecting unrelated patches.
 - Pending or awaiting-test work gets deterministic `driver/tester` priority
   during timed runs.
 - Agent adapters have bounded runtime and no-output timeouts tied to the timed

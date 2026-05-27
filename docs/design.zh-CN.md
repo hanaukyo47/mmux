@@ -150,6 +150,8 @@ driver 执行结束后，确定性策略会检查 worktree diff：
 - 如果存在 `tests/`，运行 `python -m unittest discover -s tests`
 - 当项目画像确认无需安装依赖即可运行时，执行本地 package test，例如已有 `node_modules` 的 Node `test` script
 
+diff 范围内的检查，例如 whitespace 和 changed-file 语法检查，必须在 patched task worktree 上通过。suite 级检查，例如 `unittest` 和本地 package test，会先在临时 `HEAD` baseline worktree 里跑同一条命令。如果 baseline 本来就失败，patched suite 结果只作为诊断日志记录，任务 payload 会写入 `tester_baseline_failures`；已有的 suite 失败本身不会直接拒绝 patch。如果 baseline 通过，则 patched suite 必须通过。
+
 只有 tester 通过的 patch 才会应用回主工作区，并且主工作区必须没有 tracked changes。
 
 supervisor 仍然不调用模型。它只发放租约、检查文件事实、记录结果；模型工作只发生在 worker adapter 内部。

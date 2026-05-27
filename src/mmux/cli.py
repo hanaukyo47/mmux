@@ -109,6 +109,7 @@ class TestGateResult:
     ok: bool
     log_file: str
     message: str
+    baseline_failures: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1567,6 +1568,21 @@ def create_task_worktree(project: Path, task: TaskRecord, agent: str) -> Path:
     return path
 
 
+def create_baseline_worktree(project: Path, task: TaskRecord) -> Path:
+    run(["git", "rev-parse", "--show-toplevel"], cwd=project)
+    run(["git", "rev-parse", "--verify", "HEAD"], cwd=project)
+    stamp = utc_now().replace(":", "").replace("+", "Z")
+    path = worktree_root(project) / f"baseline-{task.id}-{os.getpid()}-{stamp}"
+    run(["git", "worktree", "add", "--detach", str(path), "HEAD"], cwd=project)
+    return path
+
+
+def remove_git_worktree(project: Path, path: Path) -> None:
+    run(["git", "worktree", "remove", "--force", str(path)], cwd=project, check=False)
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def split_nul_paths(output: str) -> list[str]:
     return [part for part in output.split("\0") if part]
 
@@ -1948,6 +1964,10 @@ def build_tester_checks(worktree: Path, changed_files: Iterable[str]) -> list[Pr
     return checks
 
 
+def baseline_aware_check(check: ProjectCheck) -> bool:
+    return check.name in {"unittest", "node-test"}
+
+
 def command_text(command: Iterable[str]) -> str:
     return " ".join(sh_quote(part) for part in command)
 
@@ -2203,26 +2223,68 @@ def run_tester_gate(
     timeout_seconds: int = TEST_TIMEOUT_SECONDS,
 ) -> TestGateResult:
     log_file = run_log_path(project, "tester", task.id)
-    checks = build_tester_checks(worktree, changed_files)
+    changed_file_list = list(changed_files)
+    checks = build_tester_checks(worktree, changed_file_list)
+    baseline_worktree: Optional[Path] = None
+    baseline_failures: list[str] = []
 
-    with log_file.open("w", encoding="utf-8") as handle:
-        handle.write(f"{utc_now()} tester gate for task #{task.id}\n")
-        handle.write(f"worktree: {worktree}\n")
-        handle.write(f"changed_files: {', '.join(changed_files)}\n")
-        handle.write(f"timeout_seconds: {timeout_seconds}\n")
-        for check in checks:
-            ok, message = run_logged_test_command(
-                handle,
-                worktree,
-                check.name,
-                list(check.command),
-                timeout_seconds=timeout_seconds,
-            )
-            if not ok:
-                handle.write(f"\n{utc_now()} tester failed: {message}\n")
-                return TestGateResult(False, relative_to_project(project, log_file), message)
-        handle.write(f"\n{utc_now()} tester passed\n")
-    return TestGateResult(True, relative_to_project(project, log_file), "tester passed")
+    try:
+        with log_file.open("w", encoding="utf-8") as handle:
+            handle.write(f"{utc_now()} tester gate for task #{task.id}\n")
+            handle.write(f"worktree: {worktree}\n")
+            handle.write(f"changed_files: {', '.join(changed_file_list)}\n")
+            handle.write(f"timeout_seconds: {timeout_seconds}\n")
+            for check in checks:
+                if baseline_aware_check(check):
+                    if baseline_worktree is None:
+                        baseline_worktree = create_baseline_worktree(project, task)
+                        handle.write(f"baseline_worktree: {baseline_worktree}\n")
+                    baseline_ok, baseline_message = run_logged_test_command(
+                        handle,
+                        baseline_worktree,
+                        f"baseline:{check.name}",
+                        list(check.command),
+                        timeout_seconds=timeout_seconds,
+                    )
+                    if not baseline_ok:
+                        baseline_failures.append(f"{check.name}: {baseline_message}")
+                        handle.write(
+                            f"\n{utc_now()} baseline already failing for {check.name}; "
+                            "patched result is diagnostic only\n"
+                        )
+                        patched_ok, patched_message = run_logged_test_command(
+                            handle,
+                            worktree,
+                            check.name,
+                            list(check.command),
+                            timeout_seconds=timeout_seconds,
+                        )
+                        if patched_ok:
+                            handle.write(f"\n{utc_now()} patched {check.name} passed despite failing baseline\n")
+                        else:
+                            handle.write(f"\n{utc_now()} patched {check.name} still failing: {patched_message}\n")
+                        continue
+
+                ok, message = run_logged_test_command(
+                    handle,
+                    worktree,
+                    check.name,
+                    list(check.command),
+                    timeout_seconds=timeout_seconds,
+                )
+                if not ok:
+                    handle.write(f"\n{utc_now()} tester failed: {message}\n")
+                    return TestGateResult(False, relative_to_project(project, log_file), message)
+
+            if baseline_failures:
+                message = "tester passed with pre-existing failures: " + "; ".join(baseline_failures)
+            else:
+                message = "tester passed"
+            handle.write(f"\n{utc_now()} {message}\n")
+            return TestGateResult(True, relative_to_project(project, log_file), message, tuple(baseline_failures))
+    finally:
+        if baseline_worktree is not None:
+            remove_git_worktree(project, baseline_worktree)
 
 
 def build_agent_prompt(agent: str, task: TaskRecord, role_generation: int, resource: str) -> str:
@@ -4038,6 +4100,8 @@ def execute_tester_task(
 
         test_result = run_tester_gate(project, worktree, task, policy.changed_files, timeout_seconds=timeout_seconds)
         payload_updates["tester_log"] = test_result.log_file
+        if test_result.baseline_failures:
+            payload_updates["tester_baseline_failures"] = list(test_result.baseline_failures)
         if not test_result.ok:
             finish_task(
                 project,

@@ -1487,6 +1487,104 @@ exit 1
             self.assertEqual(tasks[-1].status, "failed")
             self.assertEqual(tasks[-1].payload["patch_applied"] if "patch_applied" in tasks[-1].payload else False, False)
 
+    def test_execute_tester_task_tolerates_preexisting_unittest_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "tests").mkdir()
+            (project / "tests" / "test_existing.py").write_text(
+                "\n".join(
+                    [
+                        "import unittest",
+                        "",
+                        "class ExistingFailure(unittest.TestCase):",
+                        "    def test_existing_failure(self):",
+                        "        self.assertEqual(1, 2)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            run(["git", "add", "tests/test_existing.py"], cwd=project)
+            run(["git", "commit", "-m", "add existing failing test"], cwd=project)
+            ensure_layout(project)
+            enqueue_task(project, "change src with existing failing suite", resource="src")
+            driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            original = cli.invoke_agent_adapter
+
+            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource, **kwargs):
+                (execution_root / "src" / "app.py").write_text("value = 5\n", encoding="utf-8")
+                return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
+
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    execute_driver_task(project, "codex", driver.generation)
+            finally:
+                cli.invoke_agent_adapter = original
+
+            tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
+            with contextlib.redirect_stdout(io.StringIO()):
+                message = execute_tester_task(project, "claude", tester.generation)
+
+            self.assertIn("completed", message)
+            self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 5\n")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "completed")
+            failures = tasks[-1].payload.get("tester_baseline_failures")
+            self.assertIsInstance(failures, list)
+            self.assertIn("unittest", str(failures))
+
+    def test_execute_tester_task_fails_unittest_regression_when_baseline_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "src" / "__init__.py").write_text("", encoding="utf-8")
+            (project / "tests").mkdir()
+            (project / "tests" / "test_app.py").write_text(
+                "\n".join(
+                    [
+                        "import unittest",
+                        "from src import app",
+                        "",
+                        "class AppTest(unittest.TestCase):",
+                        "    def test_value(self):",
+                        "        self.assertEqual(app.value, 1)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            run(["git", "add", "src/__init__.py", "tests/test_app.py"], cwd=project)
+            run(["git", "commit", "-m", "add passing test"], cwd=project)
+            ensure_layout(project)
+            enqueue_task(project, "break tested behavior", resource="src")
+            driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            original = cli.invoke_agent_adapter
+
+            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource, **kwargs):
+                (execution_root / "src" / "app.py").write_text("value = 9\n", encoding="utf-8")
+                return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
+
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    execute_driver_task(project, "codex", driver.generation)
+            finally:
+                cli.invoke_agent_adapter = original
+
+            tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
+            with contextlib.redirect_stdout(io.StringIO()):
+                message = execute_tester_task(project, "claude", tester.generation)
+
+            self.assertIn("failed", message)
+            self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "failed")
+            self.assertNotIn("tester_baseline_failures", tasks[-1].payload)
+
 
 if __name__ == "__main__":
     unittest.main()

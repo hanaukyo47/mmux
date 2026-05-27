@@ -180,6 +180,14 @@ worktree:
 - local package tests when the profile says they are available without
   dependency installation, such as a Node `test` script with `node_modules`
 
+Diff-scoped checks such as whitespace and changed-file syntax must pass on the
+patched task worktree. Suite-level checks such as `unittest` and local package
+tests are baseline-aware: mmux first runs the same command in a temporary
+`HEAD` worktree. If the baseline is already failing, the patched suite result is
+logged as diagnostic output and the task payload records
+`tester_baseline_failures`; pre-existing suite failures do not by themselves
+reject the patch. If the baseline passes, the patched suite must pass.
+
 Only tester-passed patches are applied back to the main worktree, and only if
 the main worktree has no tracked changes.
 
