@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
+import re
 import shutil
 import select
 import signal
@@ -28,7 +29,7 @@ REQUEUEABLE_TASK_STATUSES = ("blocked", "failed", "rejected", "no_change")
 ROLE_LEASE_TTL_SECONDS = 2 * 60
 RESOURCE_LOCK_TTL_SECONDS = 10 * 60
 WORKER_REFRESH_SECONDS = 5
-SUPERVISOR_TICK_SECONDS = 30
+SUPERVISOR_TICK_SECONDS = 5
 SUPERVISOR_ASSIGNMENT_SECONDS = 5 * 60
 AGENT_TIMEOUT_SECONDS = 20 * 60
 AGENT_NO_OUTPUT_TIMEOUT_SECONDS = 2 * 60
@@ -36,6 +37,7 @@ AGENT_ADAPTER_COOLDOWN_SECONDS = 10 * 60
 TEST_TIMEOUT_SECONDS = 10 * 60
 RUN_SHUTDOWN_GRACE_SECONDS = 15
 MIN_EXECUTION_BUDGET_SECONDS = 30
+MIN_TMUX_VERSION = (3, 0)
 ASSIGNMENT_ROLE_PAIRS = (
     ("scout", "reviewer"),
     ("driver", "tester"),
@@ -1602,7 +1604,8 @@ def create_task_worktree(project: Path, task: TaskRecord, agent: str) -> Path:
     run(["git", "rev-parse", "--show-toplevel"], cwd=project)
     run(["git", "rev-parse", "--verify", "HEAD"], cwd=project)
     stamp = utc_now().replace(":", "").replace("+", "Z")
-    path = worktree_root(project) / f"task-{task.id}-{agent}-{os.getpid()}-{stamp}"
+    generation = task.claimed_generation or 0
+    path = worktree_root(project) / f"task-{task.id}-{agent}-gen{generation}-{os.getpid()}-{stamp}"
     run(["git", "worktree", "add", "--detach", str(path), "HEAD"], cwd=project)
     return path
 
@@ -1767,7 +1770,12 @@ SOURCE_SUFFIXES = {
     ".cs",
 }
 TEXT_FRONTIER_SUFFIXES = SOURCE_SUFFIXES | {".md", ".rst", ".txt", ".toml", ".yaml", ".yml", ".json", ".sh"}
-TODO_MARKERS = ("todo", "fixme", "xxx")
+TODO_MARKER_PATTERN = re.compile(r"(?<![A-Za-z0-9_])(TODO|FIXME|XXX)(?![A-Za-z0-9_])")
+
+
+def todo_marker_in_line(line: str) -> str:
+    match = TODO_MARKER_PATTERN.search(line)
+    return match.group(1).lower() if match else ""
 
 
 def list_project_files(project: Path, *, limit: int = 5000) -> list[str]:
@@ -2125,8 +2133,7 @@ def discover_todo_frontiers(project: Path, files: Iterable[str]) -> list[Frontie
         if not content:
             continue
         for line_number, line in enumerate(content.splitlines(), start=1):
-            lowered = line.lower()
-            marker = next((item for item in TODO_MARKERS if item in lowered), "")
+            marker = todo_marker_in_line(line)
             if not marker:
                 continue
             snippet = compact_text(line)
@@ -2450,9 +2457,11 @@ def build_resident_prompt(agent: str, project: Path) -> str:
 
 
 def build_resident_command(agent: str, worktree: Path, prompt: str) -> str:
+    path_env = f"PATH={sh_quote(os.environ.get('PATH', ''))}"
     if agent == "codex":
         return " ".join(
             [
+                path_env,
                 "codex",
                 "--cd",
                 sh_quote(str(worktree)),
@@ -2467,6 +2476,7 @@ def build_resident_command(agent: str, worktree: Path, prompt: str) -> str:
     if agent == "claude":
         return " ".join(
             [
+                path_env,
                 "claude",
                 "--permission-mode",
                 "acceptEdits",
@@ -3104,6 +3114,7 @@ def module_command(project: Path, subcommand: str, *args: str) -> str:
     package_root = Path(__file__).resolve().parents[1]
     python = sh_quote(sys.executable)
     pieces = [
+        f"PATH={sh_quote(os.environ.get('PATH', ''))}",
         f"PYTHONPATH={sh_quote(str(package_root))}",
         python,
         "-m",
@@ -3131,19 +3142,58 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     checks = [
-        ("tmux", "required"),
-        ("codex", "worker"),
-        ("claude", "worker"),
-        ("git", "required"),
+        ("git", "required", "required for worktrees and patch application"),
+        ("tmux", "required", "required for visible workspaces"),
+        ("codex", "worker", "required only for real --execute-agents Codex work"),
+        ("claude", "worker", "required only for real --execute-agents Claude work"),
     ]
     failed_required = False
-    for name, level in checks:
+    print(f"python   ok       {sys.executable} {sys.version.split()[0]}")
+    for name, level, note in checks:
         found = shutil.which(name)
         status = "ok" if found else "missing"
-        print(f"{name:8} {status:8} {found or ''}")
+        detail = found or note
+        if name == "tmux" and found:
+            version_text = tmux_version_text(found)
+            version = parse_tmux_version(version_text)
+            detail = f"{found} {version_text}".strip()
+            if version is None:
+                status = "unknown"
+                detail = f"{detail} (could not parse version; expected tmux >= {format_version(MIN_TMUX_VERSION)})"
+            elif not version_at_least(version, MIN_TMUX_VERSION):
+                status = "too_old"
+                detail = f"{detail} (need tmux >= {format_version(MIN_TMUX_VERSION)})"
+                failed_required = True
+        print(f"{name:8} {status:8} {detail}")
         if level == "required" and not found:
             failed_required = True
+    if not shutil.which("codex") or not shutil.which("claude"):
+        print("note: missing worker CLIs are okay for observe mode and deterministic fake-agent demos.")
+        print("      install and authenticate both CLIs before real --execute-agents runs.")
     return 1 if failed_required else 0
+
+
+def format_version(version: tuple[int, ...]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def parse_tmux_version(text: str) -> Optional[tuple[int, ...]]:
+    match = re.search(r"tmux\s+([0-9]+(?:\.[0-9]+)*)", text)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def tmux_version_text(path: str) -> str:
+    result = run([path, "-V"], check=False)
+    return (result.stdout or result.stderr).strip()
+
+
+def version_at_least(version: tuple[int, ...], minimum: tuple[int, ...]) -> bool:
+    length = max(len(version), len(minimum))
+    padded_version = version + (0,) * (length - len(version))
+    padded_minimum = minimum + (0,) * (length - len(minimum))
+    return padded_version >= padded_minimum
 
 
 def format_names(values: Iterable[str]) -> str:

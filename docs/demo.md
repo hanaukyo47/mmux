@@ -18,14 +18,19 @@ Expected shape:
 
 ```text
 mmux alpha deterministic loop demo
-task: #1 Change a small Python value
+project: <temporary demo repository>
+task: #1 Resolve TODO in src/todo_core.py
 
-driver   codex  -> awaiting_review  (isolated diff)
+driver   codex  -> awaiting_review  (trim-only diff)
+reviewer claude -> pending  (request changes)
+                  reason: empty titles still accepted
+driver   codex  -> awaiting_review  (reject blank titles)
 reviewer claude -> awaiting_test  (approve)
-tester   claude -> completed  (patch applied)
+tester   claude -> completed  (tests passed, patch applied)
 
 final task status: completed
-main worktree src/app.py: value = 7
+main worktree src/todo_core.py: rejects blank titles
+contains ValueError: True
 ```
 
 Use this for docs, smoke checks, and rehearsing the voiceover. Do not present it
@@ -49,8 +54,36 @@ docs/assets/mmux-demo.gif
 
 ## Real Agent Demo
 
-Use a small throwaway repository. The ideal feature is tiny, visible, and has a
-testable outcome.
+For a stable first run, use the public example repository. It includes fake
+agents for a zero-token deterministic run and can also be reset for real
+Codex/Claude runs:
+
+```bash
+git clone https://github.com/hanaukyo47/mmux-example-todo.git
+cd mmux-example-todo
+./demo.sh
+```
+
+The important frame to capture is the reviewer request:
+
+```text
+reviewer claude -> pending  (request changes)
+                  reason: empty titles still accepted
+driver   codex  -> awaiting_review  (reject blank titles)
+```
+
+For a real-agent recording, reset the example repo and remove the fake-agent
+PATH wrapper:
+
+```bash
+git reset --hard HEAD
+rm -rf .mmux
+mmux doctor
+mmux run . --minutes 10 --execute-agents
+```
+
+Alternatively, use a small throwaway repository. The ideal feature is tiny,
+visible, and has a testable outcome.
 
 ```bash
 mkdir /tmp/mmux-real-demo
@@ -102,8 +135,8 @@ Record the tmux session, not only the final terminal output.
 ## README Visual
 
 The README currently uses `docs/assets/mmux-demo.gif` as the first-screen visual.
-Replace it with a real `.webp` or `.gif` after recording:
+Regenerate it after changing `scripts/demo_alpha.py`:
 
-```markdown
-![mmux demo](docs/assets/mmux-demo.webp)
+```bash
+vhs docs/demo.tape
 ```

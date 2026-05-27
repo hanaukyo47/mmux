@@ -28,6 +28,10 @@ need() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
 }
 
+is_root() {
+  [ "$(id -u)" = "0" ]
+}
+
 python_bin() {
   if command -v python3 >/dev/null 2>&1; then
     command -v python3
@@ -49,9 +53,17 @@ ensure_tmux() {
     return
   fi
 
+  if [ "$INSTALL_DEPS" = "1" ] && command -v apt-get >/dev/null 2>&1 && is_root; then
+    say "Installing tmux with apt-get..."
+    apt-get update
+    apt-get install -y tmux
+    return
+  fi
+
   warn "tmux is not installed. Install it before running mmux tmux workspaces."
   warn "On macOS with Homebrew: brew install tmux"
-  warn "Or rerun with: MMUX_INSTALL_DEPS=1 sh install.sh"
+  warn "On Ubuntu/Debian: apt-get install -y tmux"
+  warn "Or rerun with MMUX_INSTALL_DEPS=1 where Homebrew is available or apt-get is running as root."
 }
 
 install_repo() {
@@ -73,7 +85,9 @@ install_repo() {
 install_python_package() {
   py="$(python_bin)"
   say "Creating virtual environment in $VENV_DIR..."
-  "$py" -m venv "$VENV_DIR"
+  if ! "$py" -m venv "$VENV_DIR"; then
+    fail "could not create a Python virtual environment. On Ubuntu/Debian install python3-venv, then rerun this installer."
+  fi
   "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools >/dev/null
   "$VENV_DIR/bin/python" -m pip install -e "$REPO_DIR"
 }
@@ -100,6 +114,10 @@ print_done() {
       warn "$BIN_DIR is not in PATH."
       say "Add this to your shell profile:"
       say "  export PATH=\"$BIN_DIR:\$PATH\""
+      say "For this shell, run:"
+      say "  export PATH=\"$BIN_DIR:\$PATH\""
+      say "Or call mmux directly as:"
+      say "  $BIN_PATH"
       ;;
   esac
 

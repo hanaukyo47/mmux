@@ -10,21 +10,24 @@ OUT = ROOT / "docs" / "assets" / "mmux-demo.svg"
 
 
 LINES = [
-    "$ mmux task add \"Change a small Python value\" --resource src",
+    "$ mmux task add \"Resolve TODO in src/todo_core.py\" --resource src",
     "task added: #1 resource=src",
     "",
     "$ mmux run . --minutes 10 --execute-agents",
     "supervisor: deterministic role leases online",
     "driver   codex  -> task #1 awaiting_review",
+    "reviewer claude -> task #1 pending request_changes",
+    "                  reason: empty titles still accepted",
+    "driver   codex  -> task #1 awaiting_review",
     "reviewer claude -> task #1 awaiting_test review=approve",
     "tester   claude -> task #1 completed",
     "",
     "$ mmux tasks .",
-    "#1 completed resource=src Change a small Python value",
+    "#1 completed resource=src Resolve TODO in src/todo_core.py",
     "",
-    "$ git diff -- src/app.py",
-    "-value = 1",
-    "+value = 7",
+    "$ git diff -- src/todo_core.py",
+    "+    if not normalized:",
+    "+        raise ValueError(\"todo title cannot be empty\")",
 ]
 
 

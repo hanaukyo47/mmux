@@ -21,6 +21,16 @@ curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | s
 - [Demo 指南](docs/demo.md)
 - [发布文案](docs/launch.md)
 
+五分钟沙盒：
+
+```bash
+git clone https://github.com/hanaukyo47/mmux-example-todo.git
+cd mmux-example-todo
+./demo.sh
+```
+
+这个沙盒使用确定性的 fake `codex` / `claude` 命令，不消耗模型 token，但会跑真实的 mmux supervisor 流程：frontier 发现任务、driver 写隔离 diff、peer reviewer 先 request changes、driver 修正、reviewer approve、tester gate 通过后再 apply patch。
+
 ## 当前状态
 
 mmux 目前是一个可试用的 MVP，适合受控执行明确任务，还不建议无人值守长时间自我迭代。
@@ -71,6 +81,16 @@ curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | M
 ```
 
 ## 快速开始
+
+如果只是想先确认 mmux 好不好使，不要直接拿真实工程试，先跑 example repo：
+
+```bash
+git clone https://github.com/hanaukyo47/mmux-example-todo.git
+cd mmux-example-todo
+./demo.sh
+```
+
+这是推荐的第一次运行。它会把本地 fake agent 命令临时加到 `PATH`，然后执行一个两分钟的 `mmux run --execute-agents` 窗口，用于稳定复现完整控制流。
 
 最低摩擦的第一次运行：
 

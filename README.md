@@ -26,6 +26,19 @@ Demo and launch materials:
 - [Demo guide](docs/demo.md)
 - [Launch copy](docs/launch.md)
 
+Five-minute sandbox:
+
+```bash
+git clone https://github.com/hanaukyo47/mmux-example-todo.git
+cd mmux-example-todo
+./demo.sh
+```
+
+The sandbox uses deterministic fake `codex` / `claude` commands, so it does not
+spend model tokens. It still runs the real mmux supervisor loop: frontier task,
+driver diff, peer review request-changes, driver fix, reviewer approve, tester
+gate, patch applied.
+
 ## Current Scope
 
 This repository starts as the control-plane skeleton:
@@ -105,6 +118,18 @@ curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | M
 ```
 
 ## Quick Start
+
+To try mmux without touching a real project, use the example repository:
+
+```bash
+git clone https://github.com/hanaukyo47/mmux-example-todo.git
+cd mmux-example-todo
+./demo.sh
+```
+
+That deterministic sandbox is the recommended first run. It prepends local fake
+agent commands to `PATH`, then runs a two-minute `mmux run --execute-agents`
+window.
 
 For a low-friction first run:
 

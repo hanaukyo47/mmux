@@ -42,8 +42,10 @@ from mmux.cli import (
     mark_agent_cooldown,
     maybe_replenish_default_task,
     MIN_EXECUTION_BUDGET_SECONDS,
+    module_command,
     parse_resident_protocol_line,
     parse_reviewer_decision,
+    parse_tmux_version,
     process_resident_protocol_events,
     report_resident_protocol_event,
     resident_mode_enabled,
@@ -62,6 +64,8 @@ from mmux.cli import (
     supervisor_role_plan,
     supervisor_role_plan_for_project,
     task_status_counts,
+    todo_marker_in_line,
+    version_at_least,
     list_tasks,
     update_worker_heartbeat,
     utc_now_dt,
@@ -207,6 +211,21 @@ class StateTests(unittest.TestCase):
             self.assertEqual(status, "parked")
             self.assertIsNone(role)
             self.assertIsNone(generation)
+
+    def test_tmux_version_parsing_accepts_patch_suffixes(self) -> None:
+        self.assertEqual(parse_tmux_version("tmux 3.6b"), (3, 6))
+        self.assertEqual(parse_tmux_version("tmux 3.2a"), (3, 2))
+        self.assertIsNone(parse_tmux_version("not tmux"))
+        self.assertTrue(version_at_least((3, 2), (3, 0)))
+        self.assertTrue(version_at_least((3, 0), (3, 0)))
+        self.assertFalse(version_at_least((2, 9), (3, 0)))
+
+    def test_todo_marker_matching_ignores_words_and_paths(self) -> None:
+        self.assertEqual(todo_marker_in_line("# TODO: fix this"), "todo")
+        self.assertEqual(todo_marker_in_line("/* FIXME handle this */"), "fixme")
+        self.assertEqual(todo_marker_in_line("src/todo_core.py"), "")
+        self.assertEqual(todo_marker_in_line("todoist integration"), "")
+        self.assertEqual(todo_marker_in_line("# mmux example todo"), "")
 
     def test_supervisor_plan_rotates_agent_roles(self) -> None:
         first = dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
@@ -490,6 +509,59 @@ class StateTests(unittest.TestCase):
             self.assertTrue(candidates)
             self.assertEqual(candidates[0].resource, "src/app.py")
             self.assertIn("TODO", candidates[0].title)
+
+    def test_requeued_driver_task_gets_unique_worktree_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "change src twice", resource="src")
+            attempts = {"count": 0}
+            original_driver = cli.invoke_agent_adapter
+            original_reviewer = cli.invoke_reviewer_adapter
+            original_utc_now = cli.utc_now
+
+            def fake_driver(_project, execution_root, _agent, _task, _generation, _resource, **kwargs):
+                attempts["count"] += 1
+                (execution_root / "src" / "app.py").write_text(
+                    f"value = {attempts['count'] + 1}\n",
+                    encoding="utf-8",
+                )
+                return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
+
+            def fake_review(_project, _worktree, _agent, _task, _generation, _resource, _changed_files, **kwargs):
+                return cli.ReviewResult("request_changes", ".mmux/runs/fake-review.log", "try again", True)
+
+            cli.invoke_agent_adapter = fake_driver
+            cli.invoke_reviewer_adapter = fake_review
+            cli.utc_now = lambda: "2026-01-01T00:00:00+00:00"
+            try:
+                first_driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    execute_driver_task(project, "codex", first_driver.generation)
+                first_task = get_task(project, task_id)
+                self.assertIsNotNone(first_task)
+                assert first_task is not None
+                first_worktree = first_task.payload.get("worktree")
+
+                reviewer = acquire_role(project, "reviewer", "claude", ttl_seconds=60)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    execute_reviewer_task(project, "claude", reviewer.generation)
+
+                second_driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_driver_task(project, "codex", second_driver.generation)
+                second_task = get_task(project, task_id)
+            finally:
+                cli.invoke_agent_adapter = original_driver
+                cli.invoke_reviewer_adapter = original_reviewer
+                cli.utc_now = original_utc_now
+
+            self.assertIn("awaiting_review", message)
+            self.assertIsNotNone(second_task)
+            assert second_task is not None
+            self.assertEqual(second_task.status, "awaiting_review")
+            self.assertNotEqual(first_worktree, second_task.payload.get("worktree"))
 
     def test_ensure_default_task_uses_frontier_before_generic_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1249,8 +1321,13 @@ exit 1
         self.assertIn("MMUX_TASK", resident_prompt)
         self.assertIn("MMUX_DONE", resident_prompt)
         self.assertIn("report", resident_prompt)
+        self.assertIn("PATH=", resident_codex)
+        self.assertIn("PATH=", resident_claude)
         self.assertIn("--no-alt-screen", resident_codex)
         self.assertIn("--permission-mode", resident_claude)
+
+        worker_command = module_command(project, "worker", "codex")
+        self.assertIn("PATH=", worker_command)
 
     def test_stream_agent_command_writes_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
