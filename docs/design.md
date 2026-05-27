@@ -100,6 +100,9 @@ Project state lives under `.mmux/`:
     supervisor.log
   runs/
   worktrees/
+  resident/
+    codex/
+    claude/
   sessions/
   inbox/
 ```
@@ -129,6 +132,8 @@ Resource locks are exclusive path-prefix leases. A lock on `src` conflicts with
 `src/mmux/cli.py`, and a lock on `.` conflicts with every project file. When a
 worker acquires a resource lock under a role, the current role generation is
 stored with the lock so stale driver work can be rejected deterministically.
+
+## Task Execution
 
 Task execution is explicit. `mmux start` only observes by default. With
 `--execute-agents`, the worker holding `driver` claims one pending task, acquires
@@ -165,6 +170,43 @@ the main worktree has no tracked changes.
 
 The supervisor still does not call a model. It only grants leases, evaluates
 file facts, and records outcomes; model work happens inside worker adapters.
+
+## Resident Agents
+
+`--resident-agents` opens long-lived interactive Codex and Claude panes instead
+of showing the non-interactive worker adapters in the main window. Each resident
+agent gets a fixed git worktree:
+
+```text
+.mmux/resident/codex/
+.mmux/resident/claude/
+```
+
+These worktrees are reset to `HEAD` when the resident session starts. They are
+for stable context, conversation, exploration, and human takeover; the
+deterministic gate still decides which diffs may affect the main worktree.
+
+The tmux session is also the communication surface. mmux can send one-line
+control messages into stable resident panes:
+
+```text
+MMUX_TASK from=mmux task=#12 ...
+MMUX_REVIEW from=mmux task=#12 ...
+MMUX_NOTE from=mmux ...
+```
+
+Human operators and future deterministic dispatchers use the same path:
+
+```bash
+mmux tell claude note "Please review the Codex plan" --project PROJECT
+```
+
+Resident agents are prompted to respond with `MMUX_DONE` or `MMUX_BLOCKED`
+lines. In the current MVP, those lines are a visible protocol convention, not
+yet an automated state transition. When `--resident-agents --execute-agents` are
+used together, mmux opens an extra `automation` tmux window for the existing
+non-interactive workers, preserving the deterministic driver/tester gate while
+the resident panes keep their long-lived context.
 
 ## Timed Runs
 
@@ -214,6 +256,10 @@ The first workspace uses four panes:
 
 tmux is for observation and takeover. The database remains the source of truth.
 
+With `--resident-agents`, the same visible pane positions hold persistent Codex
+and Claude sessions, and worker automation, if enabled, moves to the
+`automation` window.
+
 ## Frontier Policy
 
 When a task completes before the time window ends, the next task must move toward
@@ -235,6 +281,8 @@ The current implementation supports controlled task execution, but it is not a
 complete unattended system yet. Remaining work:
 
 - Automatic `scout` generation of frontier tasks.
+- Automated parsing of resident pane `MMUX_DONE` / `MMUX_BLOCKED` output.
+- Routing resident diffs through the existing deterministic gate.
 - A real `reviewer` gate.
 - User-configurable tester commands.
 - Worktree cleanup and archival policy.

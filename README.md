@@ -24,6 +24,10 @@ This repository starts as the control-plane skeleton:
   window, adds conservative default tasks when the open queue is empty and time
   remains, writes checkpoints, stops it automatically, and prints a task
   summary.
+- `mmux start/run --resident-agents` opens persistent interactive Codex and
+  Claude panes with fixed resident worktrees under `.mmux/resident/`.
+- `mmux tell` sends `MMUX_TASK`, `MMUX_REVIEW`, or `MMUX_NOTE` protocol lines to
+  a resident agent through tmux.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
 - `mmux roles` prints role leases and worker heartbeats.
@@ -39,6 +43,14 @@ creates an isolated git worktree, and runs Codex or Claude Code
 non-interactively. Accepted driver diffs move to `awaiting_test`; the worker
 holding `tester` runs deterministic checks and only then applies the patch back
 to the main worktree.
+
+Resident mode is for visibility and long-lived agent context. With
+`--resident-agents`, the visible Codex and Claude panes are real interactive
+sessions, and the tmux session becomes their shared coordination surface. The
+current deterministic worker/gate path is still the authority for applying code:
+when `--resident-agents --execute-agents` are used together, mmux opens a second
+`automation` window for the existing non-interactive workers while the resident
+agents remain available for discussion and human takeover.
 
 ## Install
 
@@ -77,6 +89,12 @@ code inside the deterministic gates:
 mmux run . --minutes 30 --execute-agents
 ```
 
+For the experimental resident-agent view:
+
+```bash
+mmux run . --minutes 30 --resident-agents
+```
+
 ## Install For Local Development
 
 ```bash
@@ -101,10 +119,14 @@ mmux doctor
 mmux inspect /path/to/project
 mmux run /path/to/project --minutes 30
 mmux run /path/to/project --minutes 30 --execute-agents
+mmux run /path/to/project --minutes 30 --resident-agents
+mmux run /path/to/project --minutes 30 --resident-agents --execute-agents
 mmux run /path/to/project --minutes 30 --no-default-task
 mmux run /path/to/project --minutes 30 --agent-no-output-seconds 120
 mmux start /path/to/project
 mmux start /path/to/project --execute-agents
+mmux start /path/to/project --resident-agents
+mmux tell claude note "Please review the Codex plan" --project /path/to/project
 mmux attach /path/to/project
 mmux status /path/to/project
 mmux tasks /path/to/project
@@ -126,6 +148,8 @@ mmux stop /path/to/project
 - A role lease has a generation token; stale work is ignored.
 - Resource locks prevent concurrent writes to the same files or modules.
 - Agent execution happens in task git worktrees under `.mmux/worktrees/`.
+- Resident agent context lives in fixed git worktrees under `.mmux/resident/`.
+- Resident agent communication is a tmux protocol line, not a model judge.
 - Diff policy rejects protected paths and files outside the task resource.
 - Tester gate infers zero-config local checks before applying accepted patches.
 - Pending or awaiting-test work gets deterministic `driver/tester` priority

@@ -92,6 +92,9 @@ supervisor 不负责：
     supervisor.log
   runs/
   worktrees/
+  resident/
+    codex/
+    claude/
   sessions/
   inbox/
 ```
@@ -141,6 +144,33 @@ driver 执行结束后，确定性策略会检查 worktree diff：
 
 supervisor 仍然不调用模型。它只发放租约、检查文件事实、记录结果；模型工作只发生在 worker adapter 内部。
 
+## 常驻 Agent
+
+`--resident-agents` 会在主窗口里打开长期存在的交互式 Codex 和 Claude pane，而不是把非交互 worker adapter 放在可见 pane 里。每个常驻 agent 都有固定 git worktree：
+
+```text
+.mmux/resident/codex/
+.mmux/resident/claude/
+```
+
+这些 worktree 会在常驻 session 启动时 reset 到 `HEAD`。它们用于稳定上下文、讨论、探索和人工接管；真正能不能影响主工作区，仍然由确定性 gate 决定。
+
+tmux session 同时也是通信面。mmux 可以向稳定的 resident pane 投递单行控制消息：
+
+```text
+MMUX_TASK from=mmux task=#12 ...
+MMUX_REVIEW from=mmux task=#12 ...
+MMUX_NOTE from=mmux ...
+```
+
+人和未来的确定性 dispatcher 走同一条路径：
+
+```bash
+mmux tell claude note "Please review the Codex plan" --project PROJECT
+```
+
+常驻 agent 会被提示用 `MMUX_DONE` 或 `MMUX_BLOCKED` 行回应。当前 MVP 里，这些行还是可观察的协议约定，尚未自动转换为状态机事件。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/tester gate，同时让常驻 pane 保持长期上下文。
+
 ## 限时运行
 
 `mmux run PROJECT --minutes N` 是普通使用时的顶层受控入口。它会在需要时初始化本地 `.mmux/` 目录，拒绝复用已经存在的 tmux session，先生成项目画像；如果任务队列里没有 pending 或进行中的工作，会自动补一个保守默认任务。运行期间，每个 checkpoint 也会在 open work 耗尽且剩余执行预算足够时继续补下一个保守默认任务。`--no-default-task` 可以关闭这个队列引导与补给，用于纯观察运行。随后命令记录 `run_started` 事件，启动与 `mmux start` 相同的四窗格工作区，并用墙钟时间驱动运行窗口。
@@ -166,6 +196,8 @@ supervisor 仍然不调用模型。它只发放租约、检查文件事实、记
 
 tmux 用于观察和人工接管。数据库仍然是事实源。
 
+加上 `--resident-agents` 后，同样的可见 pane 位置会放长期存在的 Codex 和 Claude 会话；如果同时启用执行，worker 自动化会移动到 `automation` window。
+
 ## Frontier 策略
 
 任务在时间窗口结束前完成时，下一个任务必须走向未探索边界：
@@ -183,6 +215,8 @@ tmux 用于观察和人工接管。数据库仍然是事实源。
 当前实现已经支持受控任务执行，但还不是完整无人值守系统。仍需补齐：
 
 - `scout` 自动生成 frontier task。
+- 自动解析 resident pane 的 `MMUX_DONE` / `MMUX_BLOCKED` 输出。
+- 将 resident diff 接入现有确定性 gate。
 - `reviewer` 的真实 review gate。
 - 可配置 tester 命令。
 - worktree 清理和归档策略。

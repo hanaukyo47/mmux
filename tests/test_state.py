@@ -14,6 +14,8 @@ from mmux.cli import (
     acquire_resource_lock,
     build_tester_checks,
     build_agent_command,
+    build_resident_command,
+    build_resident_prompt,
     check_diff_policy,
     claim_next_task,
     cleanup_runtime_state,
@@ -25,6 +27,7 @@ from mmux.cli import (
     execute_tester_task,
     execute_worker_available_task,
     export_worktree_patch,
+    format_resident_control_message,
     format_task_counts,
     format_task_delta,
     format_utc,
@@ -40,6 +43,7 @@ from mmux.cli import (
     resources_overlap,
     run,
     session_name,
+    send_tmux_message,
     state_path,
     stream_agent_command,
     supervisor_role_plan,
@@ -596,6 +600,70 @@ exit 1
                 ]
             self.assertEqual(events, ["run_started", "run_finished"])
 
+    def test_start_tmux_session_can_open_resident_agent_panes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            ensure_layout(project)
+            calls = []
+            original_run = cli.run
+            original_tmux_has_session = cli.tmux_has_session
+            original_prepare = cli.prepare_resident_worktree
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            def fake_prepare(_project, agent):
+                path = _project / ".mmux" / "resident" / agent
+                path.mkdir(parents=True, exist_ok=True)
+                return path
+
+            cli.run = fake_run
+            cli.tmux_has_session = lambda _name: False
+            cli.prepare_resident_worktree = fake_prepare
+            try:
+                started = cli.start_tmux_session(project, execute_agents=True, resident_agents=True)
+            finally:
+                cli.run = original_run
+                cli.tmux_has_session = original_tmux_has_session
+                cli.prepare_resident_worktree = original_prepare
+
+            joined_calls = [" ".join(str(part) for part in cmd) for cmd in calls]
+            self.assertTrue(started)
+            self.assertTrue(any("codex" in call and "--no-alt-screen" in call for call in joined_calls))
+            self.assertTrue(any("claude" in call and "--permission-mode" in call for call in joined_calls))
+            self.assertTrue(any("new-window" in call and "automation" in call for call in joined_calls))
+            self.assertTrue(any("select-window" in call for call in joined_calls))
+            self.assertTrue(any("select-pane" in call and "codex" in call for call in joined_calls))
+
+    def test_send_tmux_message_targets_resident_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            ensure_layout(project)
+            calls = []
+            original_run = cli.run
+            original_tmux_has_session = cli.tmux_has_session
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            cli.run = fake_run
+            cli.tmux_has_session = lambda _name: True
+            try:
+                send_tmux_message(project, "claude", "MMUX_NOTE from=test hello")
+            finally:
+                cli.run = original_run
+                cli.tmux_has_session = original_tmux_has_session
+
+            self.assertEqual(calls[0][:4], ["tmux", "send-keys", "-t", f"{session_name(project)}:0.3"])
+            self.assertEqual(calls[0][4:], ["-l", "MMUX_NOTE from=test hello"])
+            self.assertEqual(calls[1], ["tmux", "send-keys", "-t", f"{session_name(project)}:0.3", "Enter"])
+
+    def test_format_resident_control_message(self) -> None:
+        message = format_resident_control_message("task", "  add tests\nnow  ", task_id=12)
+        self.assertEqual(message, "MMUX_TASK from=mmux task=#12 add tests now")
+
     def test_cmd_run_adds_default_task_when_queue_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -731,6 +799,15 @@ exit 1
         self.assertIn("--verbose", claude)
         self.assertIn("stream-json", claude)
         self.assertIn("--include-partial-messages", claude)
+
+        resident_prompt = build_resident_prompt("codex", project)
+        resident_codex = build_resident_command("codex", project / ".mmux" / "resident" / "codex", resident_prompt)
+        resident_claude = build_resident_command("claude", project / ".mmux" / "resident" / "claude", resident_prompt)
+
+        self.assertIn("MMUX_TASK", resident_prompt)
+        self.assertIn("MMUX_DONE", resident_prompt)
+        self.assertIn("--no-alt-screen", resident_codex)
+        self.assertIn("--permission-mode", resident_claude)
 
     def test_stream_agent_command_writes_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

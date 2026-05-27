@@ -21,6 +21,8 @@ from typing import Iterable, Optional
 
 ROLES = ("driver", "reviewer", "scout", "tester", "summarizer")
 AGENTS = ("codex", "claude")
+RESIDENT_MESSAGE_KINDS = ("task", "review", "note")
+RESIDENT_PANE_INDEXES = {"codex": "1", "claude": "3"}
 ROLE_LEASE_TTL_SECONDS = 2 * 60
 RESOURCE_LOCK_TTL_SECONDS = 10 * 60
 WORKER_REFRESH_SECONDS = 5
@@ -381,6 +383,7 @@ def ensure_layout(project: Path, task: str = "") -> None:
     (root / "sessions").mkdir(parents=True, exist_ok=True)
     (root / "runs").mkdir(parents=True, exist_ok=True)
     (root / "worktrees").mkdir(parents=True, exist_ok=True)
+    (root / "resident").mkdir(parents=True, exist_ok=True)
     (root / "inbox").mkdir(parents=True, exist_ok=True)
 
     config = {
@@ -1345,6 +1348,31 @@ def worktree_root(project: Path) -> Path:
     return root
 
 
+def resident_root(project: Path) -> Path:
+    root = mmux_dir(project) / "resident"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def resident_worktree_path(project: Path, agent: str) -> Path:
+    validate_agent(agent)
+    return resident_root(project) / agent
+
+
+def prepare_resident_worktree(project: Path, agent: str) -> Path:
+    path = resident_worktree_path(project, agent)
+    run(["git", "rev-parse", "--show-toplevel"], cwd=project)
+    run(["git", "rev-parse", "--verify", "HEAD"], cwd=project)
+    if not path.exists():
+        run(["git", "worktree", "add", "--detach", str(path), "HEAD"], cwd=project)
+        return path
+    if not (path / ".git").exists():
+        raise RuntimeError(f"resident path exists but is not a git worktree: {path}")
+    run(["git", "reset", "--hard", "HEAD"], cwd=path)
+    run(["git", "clean", "-fd"], cwd=path)
+    return path
+
+
 def create_task_worktree(project: Path, task: TaskRecord, agent: str) -> Path:
     validate_agent(agent)
     run(["git", "rev-parse", "--show-toplevel"], cwd=project)
@@ -1832,6 +1860,55 @@ def build_agent_command(agent: str, project: Path, prompt: str, output_file: Pat
     raise ValueError(f"unknown agent: {agent}")
 
 
+def build_resident_prompt(agent: str, project: Path) -> str:
+    peer = "claude" if agent == "codex" else "codex"
+    tell_example = module_command(project, "tell", peer, "note", "<message>")
+    return "\n".join(
+        [
+            f"You are the persistent {agent} agent running under mmux resident mode.",
+            "",
+            "This tmux session is the shared coordination surface.",
+            f"- Your peer is {peer}; talk to them in the tmux session when decisions need discussion.",
+            f"- To message your peer from a tool shell, run: {tell_example}",
+            "- Treat lines beginning with MMUX_TASK, MMUX_REVIEW, or MMUX_NOTE as control messages.",
+            "- When you finish a task, print a single line starting with MMUX_DONE and include the task id.",
+            "- When blocked, print a single line starting with MMUX_BLOCKED and include the task id and reason.",
+            "",
+            "Work only in this resident git worktree. Keep changes scoped and testable.",
+            "Do not edit .mmux, secrets, or files outside the worktree.",
+            "A deterministic mmux gate outside the model will inspect diffs and run tests before applying anything.",
+            f"Project root: {project}",
+        ]
+    )
+
+
+def build_resident_command(agent: str, worktree: Path, prompt: str) -> str:
+    if agent == "codex":
+        return " ".join(
+            [
+                "codex",
+                "--cd",
+                sh_quote(str(worktree)),
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+                "--no-alt-screen",
+                sh_quote(prompt),
+            ]
+        )
+    if agent == "claude":
+        return " ".join(
+            [
+                "claude",
+                "--permission-mode",
+                "acceptEdits",
+                sh_quote(prompt),
+            ]
+        )
+    raise ValueError(f"unknown agent: {agent}")
+
+
 def stop_process_tree(process: subprocess.Popen[str]) -> None:
     try:
         if hasattr(os, "killpg"):
@@ -1959,6 +2036,34 @@ def is_adapter_health_failure(result: AdapterResult) -> bool:
 def tmux_has_session(name: str) -> bool:
     result = run(["tmux", "has-session", "-t", name], check=False)
     return result.returncode == 0
+
+
+def resident_pane_target(project: Path, agent: str) -> str:
+    validate_agent(agent)
+    return f"{session_name(project)}:0.{RESIDENT_PANE_INDEXES[agent]}"
+
+
+def format_resident_control_message(kind: str, message: str, *, task_id: int = 0, sender: str = "mmux") -> str:
+    if kind not in RESIDENT_MESSAGE_KINDS:
+        raise ValueError(f"unknown resident message kind: {kind}")
+    normalized = " ".join(message.split())
+    parts = [f"MMUX_{kind.upper()}", f"from={sender}"]
+    if task_id:
+        parts.append(f"task=#{task_id}")
+    if normalized:
+        parts.append(normalized)
+    return " ".join(parts)
+
+
+def send_tmux_message(project: Path, agent: str, message: str) -> None:
+    validate_agent(agent)
+    name = session_name(project)
+    if not tmux_has_session(name):
+        raise RuntimeError(f"tmux session is not running: {name}")
+    target = resident_pane_target(project, agent)
+    run(["tmux", "send-keys", "-t", target, "-l", message])
+    run(["tmux", "send-keys", "-t", target, "Enter"])
+    write_log(project, f"sent resident message to {agent}: {message[:200]}")
 
 
 def module_command(project: Path, subcommand: str, *args: str) -> str:
@@ -2407,10 +2512,23 @@ def cmd_lock_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tell(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    require_project_state(project)
+    message = format_resident_control_message(args.kind, args.message, task_id=args.task_id)
+    try:
+        send_tmux_message(project, args.agent, message)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"sent to {args.agent}: {message}")
+    return 0
+
+
 def start_tmux_session(
     project: Path,
     *,
     execute_agents: bool = False,
+    resident_agents: bool = False,
     run_deadline: str = "",
     agent_timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
     agent_no_output_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
@@ -2437,17 +2555,35 @@ def start_tmux_session(
     )
     if run_deadline:
         worker_flags.extend(["--run-deadline", run_deadline])
-    codex_cmd = module_command(project, "worker", *worker_flags, "codex")
-    claude_cmd = module_command(project, "worker", *worker_flags, "claude")
+    codex_worker_cmd = module_command(project, "worker", *worker_flags, "codex")
+    claude_worker_cmd = module_command(project, "worker", *worker_flags, "claude")
     log_cmd = f"mkdir -p .mmux/logs; touch .mmux/logs/supervisor.log; tail -f .mmux/logs/supervisor.log"
+
+    if resident_agents:
+        codex_worktree = prepare_resident_worktree(project, "codex")
+        claude_worktree = prepare_resident_worktree(project, "claude")
+        codex_cmd = build_resident_command("codex", codex_worktree, build_resident_prompt("codex", project))
+        claude_cmd = build_resident_command("claude", claude_worktree, build_resident_prompt("claude", project))
+    else:
+        codex_cmd = codex_worker_cmd
+        claude_cmd = claude_worker_cmd
 
     run(["tmux", "new-session", "-d", "-s", name, "-c", str(project), supervisor_cmd])
     run(["tmux", "split-window", "-h", "-t", f"{name}:0.0", "-c", str(project), codex_cmd])
     run(["tmux", "split-window", "-v", "-t", f"{name}:0.0", "-c", str(project), log_cmd])
     run(["tmux", "split-window", "-v", "-t", f"{name}:0.1", "-c", str(project), claude_cmd])
+    run(["tmux", "select-pane", "-t", f"{name}:0.0", "-T", "supervisor"], check=False)
+    run(["tmux", "select-pane", "-t", resident_pane_target(project, "codex"), "-T", "codex"], check=False)
+    run(["tmux", "select-pane", "-t", f"{name}:0.2", "-T", "log"], check=False)
+    run(["tmux", "select-pane", "-t", resident_pane_target(project, "claude"), "-T", "claude"], check=False)
+    if resident_agents and execute_agents:
+        run(["tmux", "new-window", "-t", name, "-n", "automation", "-c", str(project), codex_worker_cmd])
+        run(["tmux", "split-window", "-v", "-t", f"{name}:1.0", "-c", str(project), claude_worker_cmd])
+        run(["tmux", "select-window", "-t", f"{name}:0"])
     run(["tmux", "select-layout", "-t", name, "tiled"], check=False)
 
-    write_log(project, f"started tmux session {name}")
+    mode = "resident" if resident_agents else "worker"
+    write_log(project, f"started tmux session {name} mode={mode}")
     return True
 
 
@@ -2468,12 +2604,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     ensure_layout(project, args.task or "")
     name = session_name(project)
-    if not start_tmux_session(project, execute_agents=args.execute_agents):
+    if not start_tmux_session(project, execute_agents=args.execute_agents, resident_agents=args.resident_agents):
         print(f"tmux session already exists: {name}")
         return 0
 
     print(f"started tmux session: {name}")
     print(f"attach with: tmux attach -t {name}")
+    if args.resident_agents:
+        print("resident agents: enabled")
     if args.execute_agents:
         print("agent execution: enabled")
     return 0
@@ -2523,6 +2661,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         {
             "duration_seconds": duration_seconds,
             "execute_agents": args.execute_agents,
+            "resident_agents": args.resident_agents,
             "task": args.task or "",
             "default_task_id": default_task_id,
             "run_deadline": run_deadline,
@@ -2536,6 +2675,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not start_tmux_session(
         project,
         execute_agents=args.execute_agents,
+        resident_agents=args.resident_agents,
         run_deadline=run_deadline,
         agent_timeout_seconds=args.agent_timeout_seconds,
         agent_no_output_seconds=args.agent_no_output_seconds,
@@ -2548,6 +2688,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"duration: {duration_seconds}s")
     print(f"deadline: {run_deadline}")
     print(f"agent execution: {'enabled' if args.execute_agents else 'disabled'}")
+    print(f"resident agents: {'enabled' if args.resident_agents else 'disabled'}")
     print(f"agent timeout max: {args.agent_timeout_seconds}s")
     print(f"agent no-output timeout: {args.agent_no_output_seconds}s")
     print(f"test timeout max: {args.test_timeout_seconds}s")
@@ -3167,6 +3308,14 @@ def build_parser() -> argparse.ArgumentParser:
     lock_release.add_argument("--project", default=".")
     lock_release.set_defaults(func=cmd_lock_release)
 
+    tell = subparsers.add_parser("tell", help="send a protocol line to a resident agent pane")
+    tell.add_argument("agent", choices=AGENTS)
+    tell.add_argument("kind", choices=RESIDENT_MESSAGE_KINDS)
+    tell.add_argument("message")
+    tell.add_argument("--task-id", type=nonnegative_int, default=0)
+    tell.add_argument("--project", default=".")
+    tell.set_defaults(func=cmd_tell)
+
     start = subparsers.add_parser("start", help="start the tmux observation workspace")
     start.add_argument("project", nargs="?", default=".")
     start.add_argument("--task", default="")
@@ -3174,6 +3323,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute-agents",
         action="store_true",
         help="allow workers to run codex/claude non-interactively when they hold driver",
+    )
+    start.add_argument(
+        "--resident-agents",
+        action="store_true",
+        help="open persistent interactive Codex/Claude panes with fixed resident worktrees",
     )
     start.set_defaults(func=cmd_start)
 
@@ -3196,6 +3350,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute-agents",
         action="store_true",
         help="allow workers to run codex/claude non-interactively inside the timed window",
+    )
+    run_parser.add_argument(
+        "--resident-agents",
+        action="store_true",
+        help="open persistent interactive Codex/Claude panes with fixed resident worktrees",
     )
     run_parser.set_defaults(func=cmd_run)
 
