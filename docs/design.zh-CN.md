@@ -121,7 +121,7 @@ SQLite 表：
 
 role lease 是以 role 为 key 的单行租约。持有者执行 stale-sensitive 动作时必须带上当前 generation token；过期 lease 可以被其他 worker 重新获取。worker heartbeat 只表示运行状态，用于 CLI 和 tmux pane 可观察性，不参与策略判断。
 
-基础 role plan 仍然按 role pair 轮转，避免 agent 固定占用某个角色。当存在可执行工作时，项目级 plan 会确定性覆盖轮转：有 `awaiting_test` 任务时优先 `tester/driver`，有 `pending` 任务时优先 `driver/tester`。agent 分配仍然按墙钟 slot 交替，所以 Codex 和 Claude Code 不会永久拥有某个角色。
+基础 role plan 仍然按 role pair 轮转，避免 agent 固定占用某个角色。当存在可执行工作时，项目级 plan 会确定性覆盖轮转：有 `awaiting_test` 任务时优先 `tester`，有 `awaiting_review` 任务时优先 peer `reviewer`，有 `pending` 任务时优先 `driver`。agent 分配仍然按墙钟 slot 交替，所以 Codex 和 Claude Code 不会永久拥有某个角色。
 
 resource lock 是排他的路径前缀租约。锁住 `src` 会与 `src/mmux/cli.py` 冲突；锁住 `.` 会与整个项目冲突。worker 在某个 role 下获取 resource lock 时，当前 role generation 会写入 lock，防止过期 driver 工作继续提交。
 
@@ -139,7 +139,16 @@ driver 执行结束后，确定性策略会检查 worktree diff：
 - 无 diff -> `no_change`
 - 修改 `.git`、`.mmux`、`.env*` 等保护路径 -> `rejected`
 - 任意 changed path 不在任务 resource lock 内 -> `rejected`
-- 通过 driver diff policy -> `awaiting_test`
+- 通过 driver diff policy -> `awaiting_review`
+
+持有 `reviewer` 的 worker 随后检查同一个 task worktree。reviewer 输出被限制为结构化协议：
+
+```text
+MMUX_REVIEW APPROVE
+MMUX_REVIEW REQUEST_CHANGES: <short reason>
+```
+
+`APPROVE` 会把任务推进到 `awaiting_test`。`REQUEST_CHANGES` 会把任务放回 `pending`，并把 review note 写入 task payload。reviewer 不能 review 自己作为 driver 产出的工作，也不能改 task diff；如果 reviewer 输出格式错误、adapter 失败或超时，mmux 会记录日志并 bypass 到 `awaiting_test`，避免 review 层变成第二个模型裁判或新的死锁点。
 
 持有 `tester` 的 worker 随后在同一个 task worktree 里运行确定性检查：
 
@@ -190,19 +199,19 @@ mmux report blocked --task-id 12 "needs API decision" --agent claude --project P
 
 如果命令是在 `.mmux/resident/codex/` 或 `.mmux/resident/claude/` 里运行，mmux 可以自动推断所属 project 和 agent。CLI report 通道和 tmux 屏幕 fallback 会产生同一种去重后的 `resident_agent_done` / `resident_agent_blocked` 事件，后续 gate 仍然只有一条处理路径。
 
-对于 pending 任务，done report 会触发 mmux 检查该 agent 的 resident worktree diff；如果确定性 diff policy 通过，mmux 会把 patch 冻结到 `.mmux/worktrees/` 下的普通 task worktree，随后把 resident worktree 重置回 `HEAD`，并把任务推进到 `awaiting_test`。最终能否应用到主工作区，仍然由现有 tester gate 决定。blocked report 会把阻塞原因写入任务 payload，并通过 tmux 给另一个常驻 agent 发确定性的 `MMUX_TASK` 接管请求；它不会让任务失败，也不会应用 blocked agent 的半成品 diff。同一任务第二次 resident block 后会升级为 `blocked`，从 open queue 里让出位置，限时运行可以继续处理其他工作。人工处理清楚后，可以用 `mmux task requeue #N` 把任务重新放回 `pending`。
+对于 pending 任务，done report 会触发 mmux 检查该 agent 的 resident worktree diff；如果确定性 diff policy 通过，mmux 会把 patch 冻结到 `.mmux/worktrees/` 下的普通 task worktree，随后把 resident worktree 重置回 `HEAD`，并把任务推进到 `awaiting_review`。review note 和最终 tester gate 继续决定能否应用到主工作区。blocked report 会把阻塞原因写入任务 payload，并通过 tmux 给另一个常驻 agent 发确定性的 `MMUX_TASK` 接管请求；它不会让任务失败，也不会应用 blocked agent 的半成品 diff。同一任务第二次 resident block 后会升级为 `blocked`，从 open queue 里让出位置，限时运行可以继续处理其他工作。人工处理清楚后，可以用 `mmux task requeue #N` 把任务重新放回 `pending`。
 
-如果 report 命令不可用，常驻 agent 仍然可以在 tmux 中输出 `MMUX_DONE task=#N`、`MMUX_BLOCKED task=#N`，或者 `<<MMUX:DONE task=#N ...>>` 这类 sentinel 行。supervisor 会从 tmux pane 捕获这些行，并和 report 事件共用去重与 gate 处理。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/tester gate，同时让常驻 pane 保持长期上下文。
+如果 report 命令不可用，常驻 agent 仍然可以在 tmux 中输出 `MMUX_DONE task=#N`、`MMUX_BLOCKED task=#N`，或者 `<<MMUX:DONE task=#N ...>>` 这类 sentinel 行。supervisor 会从 tmux pane 捕获这些行，并和 report 事件共用去重与 gate 处理。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/reviewer/tester gate，同时让常驻 pane 保持长期上下文。
 
 ## 限时运行
 
 `mmux run PROJECT --minutes N` 是普通使用时的顶层受控入口。它会在需要时初始化本地 `.mmux/` 目录，拒绝复用已经存在的 tmux session，先生成项目画像；如果任务队列里没有 pending 或进行中的工作，会自动补一个保守默认任务。运行期间，每个 checkpoint 也会在 open work 耗尽且剩余执行预算足够时继续补下一个保守默认任务。`--no-default-task` 可以关闭这个队列引导与补给，用于纯观察运行。随后命令记录 `run_started` 事件，启动与 `mmux start` 相同的四窗格工作区，并用墙钟时间驱动运行窗口。
 
-运行期间，它会定期把剩余时间和任务状态计数写到 stdout 与 supervisor log。到达时限或收到 `KeyboardInterrupt` 后，它会停止 tmux session，清理运行期 lease、lock、heartbeat，把未完成的 `running` 任务恢复为 `pending`，把未完成的 `running_test` 任务恢复为 `awaiting_test`，记录 `run_finished`，并打印 before/after/delta 任务汇总。
+运行期间，它会定期把剩余时间和任务状态计数写到 stdout 与 supervisor log。到达时限或收到 `KeyboardInterrupt` 后，它会停止 tmux session，清理运行期 lease、lock、heartbeat，把未完成的 `running` 任务恢复为 `pending`，把未完成的 `running_review` 任务恢复为 `awaiting_review`，把未完成的 `running_test` 任务恢复为 `awaiting_test`，记录 `run_finished`，并打印 before/after/delta 任务汇总。
 
 默认情况下，限时运行只观察，不让 agent 改代码。加上 `--execute-agents` 后，Codex 和 Claude Code 才会在上面描述的确定性 gate 内非交互执行任务。
 
-限时运行会把绝对 deadline 传给 worker。worker 领取任务前，会根据 deadline、配置的 adapter 超时和停止前预留时间计算剩余执行预算；预算太小时不会再启动新的 driver 或 tester 动作。agent adapter 还有无输出超时：如果 CLI 在配置时间内没有产生 stdout/stderr，mmux 会终止它，并把原因写入 task log。adapter 超时和无输出会被视为 agent health failure：mmux 会重新排队任务，在确定性状态里记录 agent cooldown，并在 cooldown 过期前跳过该 agent 的 driver lease。
+限时运行会把绝对 deadline 传给 worker。worker 领取任务前，会根据 deadline、配置的 adapter 超时和停止前预留时间计算剩余执行预算；预算太小时不会再启动新的 driver、reviewer 或 tester 动作。agent adapter 还有无输出超时：如果 CLI 在配置时间内没有产生 stdout/stderr，mmux 会终止它，并把原因写入 task log。adapter 超时和无输出会被视为 agent health failure：mmux 会重新排队任务，在确定性状态里记录 agent cooldown，并在 cooldown 过期前跳过该 agent 的 driver lease。
 
 ## Tmux 布局
 

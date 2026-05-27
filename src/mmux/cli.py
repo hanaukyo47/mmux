@@ -113,6 +113,14 @@ class TestGateResult:
 
 
 @dataclass(frozen=True)
+class ReviewResult:
+    decision: str
+    log_file: str
+    message: str
+    adapter_ok: bool
+
+
+@dataclass(frozen=True)
 class ResidentProtocolEvent:
     agent: str
     kind: str
@@ -1284,6 +1292,17 @@ def claim_next_test_task(project: Path, agent: str, generation: int) -> Optional
     )
 
 
+def claim_next_review_task(project: Path, agent: str, generation: int) -> Optional[TaskRecord]:
+    return claim_task_with_status(
+        project,
+        agent,
+        "reviewer",
+        generation,
+        source_status="awaiting_review",
+        running_status="running_review",
+    )
+
+
 def release_task_claim(project: Path, task_id: int, reason: str) -> None:
     release_task_claim_to(project, task_id, "pending", reason, running_status="running")
 
@@ -1405,6 +1424,7 @@ def cleanup_runtime_state(project: Path) -> None:
         apply_schema(db)
         now = utc_now()
         driver_rows = db.execute("select id from tasks where status = ?", ("running",)).fetchall()
+        reviewer_rows = db.execute("select id from tasks where status = ?", ("running_review",)).fetchall()
         tester_rows = db.execute("select id from tasks where status = ?", ("running_test",)).fetchall()
         db.execute(
             """
@@ -1414,6 +1434,15 @@ def cleanup_runtime_state(project: Path) -> None:
             where status = ?
             """,
             ("pending", now, "runtime stopped before driver completed", "running"),
+        )
+        db.execute(
+            """
+            update tasks
+            set status = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
+                claimed_at = '', updated_at = ?, last_error = ?
+            where status = ?
+            """,
+            ("awaiting_review", now, "runtime stopped before reviewer completed", "running_review"),
         )
         db.execute(
             """
@@ -1451,6 +1480,16 @@ def cleanup_runtime_state(project: Path) -> None:
                     "id": int(row[0]),
                     "status": "awaiting_test",
                     "reason": "runtime stopped before tester completed",
+                },
+            )
+        for row in reviewer_rows:
+            record_event(
+                db,
+                "task_requeued",
+                {
+                    "id": int(row[0]),
+                    "status": "awaiting_review",
+                    "reason": "runtime stopped before reviewer completed",
                 },
             )
         record_event(db, "runtime_stopped", {})
@@ -2308,6 +2347,54 @@ def build_agent_prompt(agent: str, task: TaskRecord, role_generation: int, resou
     )
 
 
+def build_reviewer_prompt(
+    agent: str,
+    task: TaskRecord,
+    role_generation: int,
+    resource: str,
+    changed_files: Iterable[str],
+) -> str:
+    files = ", ".join(changed_files) or "none"
+    return "\n".join(
+        [
+            f"You are the {agent} reviewer running under mmux.",
+            "",
+            "The mmux supervisor is deterministic and has already granted you:",
+            "- role: reviewer",
+            f"- role generation: {role_generation}",
+            f"- resource lock: {resource}",
+            "- execution root: the driver's isolated git worktree",
+            "",
+            f"Task #{task.id}: {task.title}",
+            f"Changed files: {files}",
+            "",
+            "Review the existing diff only. Do not edit files.",
+            "Focus on correctness, scope, obvious regressions, and whether the diff is ready for deterministic tests.",
+            "You are not the final judge; tester gate still decides whether anything applies to the main worktree.",
+            "",
+            "Finish with exactly one final protocol line:",
+            "MMUX_REVIEW APPROVE",
+            "or",
+            "MMUX_REVIEW REQUEST_CHANGES: <short reason>",
+        ]
+    )
+
+
+def parse_reviewer_decision(text: str) -> tuple[str, str]:
+    for line in reversed(text.splitlines()):
+        normalized = line.strip().strip("`").strip()
+        if not normalized:
+            continue
+        if normalized.upper().startswith("MMUX_REVIEW"):
+            normalized = normalized[len("MMUX_REVIEW") :].strip()
+        upper = normalized.upper()
+        if upper.startswith("REQUEST_CHANGES"):
+            return "request_changes", normalized[len("REQUEST_CHANGES") :].lstrip(" :-")
+        if upper.startswith("APPROVE"):
+            return "approve", normalized[len("APPROVE") :].lstrip(" :-")
+    return "invalid", "missing MMUX_REVIEW APPROVE or MMUX_REVIEW REQUEST_CHANGES"
+
+
 def build_agent_command(agent: str, project: Path, prompt: str, output_file: Path) -> list[str]:
     if agent == "codex":
         return [
@@ -2505,6 +2592,44 @@ def invoke_agent_adapter(
             handle.write(output_file.read_text(encoding="utf-8", errors="replace"))
             handle.write("\n")
     return result
+
+
+def invoke_reviewer_adapter(
+    project: Path,
+    worktree: Path,
+    agent: str,
+    task: TaskRecord,
+    role_generation: int,
+    resource: str,
+    changed_files: Iterable[str],
+    *,
+    timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> ReviewResult:
+    prompt = build_reviewer_prompt(agent, task, role_generation, resource, changed_files)
+    log_file = run_log_path(project, f"{agent}-review", task.id)
+    output_file = log_file.with_suffix(".last-message.txt")
+    cmd = build_agent_command(agent, worktree, prompt, output_file)
+    result = stream_agent_command(
+        worktree,
+        cmd,
+        log_file,
+        timeout_seconds=timeout_seconds,
+        no_output_timeout_seconds=no_output_timeout_seconds,
+    )
+    review_text = ""
+    if output_file.exists():
+        review_text = output_file.read_text(encoding="utf-8", errors="replace")
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("\n--- last message ---\n")
+            handle.write(review_text)
+            handle.write("\n")
+    if not review_text:
+        review_text = log_file.read_text(encoding="utf-8", errors="replace")
+    if not result.ok:
+        return ReviewResult("adapter_failed", relative_to_project(project, log_file), result.message, False)
+    decision, message = parse_reviewer_decision(review_text)
+    return ReviewResult(decision, relative_to_project(project, log_file), message, True)
 
 
 def is_adapter_health_failure(result: AdapterResult) -> bool:
@@ -2734,6 +2859,7 @@ def process_resident_done_event(project: Path, event: ResidentProtocolEvent) -> 
         "resident_agent": event.agent,
         "resident_event": event.line_hash,
         "resident_message": event.message,
+        "driver_agent": event.agent,
         "diff_policy": policy.status,
         "changed_files": list(policy.changed_files),
     }
@@ -2807,18 +2933,18 @@ def process_resident_done_event(project: Path, event: ResidentProtocolEvent) -> 
     move_task_to_status(
         project,
         task.id,
-        "awaiting_test",
+        "awaiting_review",
         message=event.message,
         payload_updates=payload_updates,
     )
     reset_resident_worktree(resident_worktree)
     record_resident_processing_event(
         project,
-        "resident_done_awaiting_test",
+        "resident_done_awaiting_review",
         event,
         {"worktree": relative_to_project(project, snapshot), "changed_files": list(snapshot_policy.changed_files)},
     )
-    return f"task #{task.id} awaiting_test from resident {event.agent}"
+    return f"task #{task.id} awaiting_review from resident {event.agent}"
 
 
 def process_resident_blocked_event(project: Path, event: ResidentProtocolEvent) -> str:
@@ -3184,6 +3310,8 @@ def cmd_tasks(args: argparse.Namespace) -> int:
 TASK_STATUS_ORDER = (
     "pending",
     "running",
+    "awaiting_review",
+    "running_review",
     "awaiting_test",
     "running_test",
     "completed",
@@ -3192,7 +3320,7 @@ TASK_STATUS_ORDER = (
     "no_change",
     "blocked",
 )
-OPEN_TASK_STATUSES = ("pending", "running", "awaiting_test", "running_test")
+OPEN_TASK_STATUSES = ("pending", "running", "awaiting_review", "running_review", "awaiting_test", "running_test")
 
 
 def task_status_counts(project: Path) -> dict[str, int]:
@@ -3240,14 +3368,37 @@ def paired_tester_agent(driver: str, ordered_agents: tuple[str, ...]) -> str:
     return next((agent for agent in ordered_agents if agent != driver), driver)
 
 
+def oldest_awaiting_review_driver(project: Path) -> str:
+    with database(project) as db:
+        apply_schema(db)
+        row = db.execute(
+            "select payload from tasks where status = ? order by id limit 1",
+            ("awaiting_review",),
+        ).fetchone()
+    if row is None:
+        return ""
+    driver = decode_payload(row[0]).get("driver_agent")
+    return str(driver) if isinstance(driver, str) and driver in AGENTS else ""
+
+
 def supervisor_role_plan_for_project(project: Path, now: Optional[dt.datetime] = None) -> tuple[tuple[str, str], ...]:
     counts = task_status_counts(project)
     agents = agent_order_for_slot(now)
     driver_agents = available_driver_agents(project, now)
     if counts.get("awaiting_test", 0) > 0:
+        if counts.get("awaiting_review", 0) > 0:
+            review_driver = oldest_awaiting_review_driver(project)
+            reviewer = peer_agent(review_driver) if review_driver else agents[0]
+            tester = paired_tester_agent(reviewer, agents)
+            return (("tester", tester), ("reviewer", reviewer))
         driver = driver_agents[0] if driver_agents else agents[1]
         tester = paired_tester_agent(driver, agents)
         return (("tester", tester), ("driver", driver))
+    if counts.get("awaiting_review", 0) > 0:
+        review_driver = oldest_awaiting_review_driver(project)
+        reviewer = peer_agent(review_driver) if review_driver else agents[0]
+        driver = paired_tester_agent(reviewer, agents)
+        return (("reviewer", reviewer), ("driver", driver))
     if counts.get("pending", 0) > 0:
         if not driver_agents:
             return (("scout", agents[0]), ("reviewer", agents[1]))
@@ -3988,16 +4139,18 @@ def execute_driver_task(
             return f"task #{task.id} rejected: {policy.reason}"
         if result.ok:
             payload_updates["driver_log"] = result.log_file
+            payload_updates["driver_agent"] = agent
+            payload_updates["driver_generation"] = generation
             move_task_to_status(
                 project,
                 task.id,
-                "awaiting_test",
+                "awaiting_review",
                 message=result.message,
                 log_file=result.log_file,
                 payload_updates=payload_updates,
             )
-            write_log(project, f"{agent} moved task #{task.id} to awaiting_test log={result.log_file}")
-            return f"task #{task.id} awaiting_test log={result.log_file}"
+            write_log(project, f"{agent} moved task #{task.id} to awaiting_review log={result.log_file}")
+            return f"task #{task.id} awaiting_review log={result.log_file}"
 
         finish_task(
             project,
@@ -4018,6 +4171,181 @@ def execute_driver_task(
             role_generation=generation,
         )
         release_role(project, "driver", holder=agent, generation=generation)
+
+
+def execute_reviewer_task(
+    project: Path,
+    agent: str,
+    generation: int,
+    *,
+    timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> str:
+    task = claim_next_review_task(project, agent, generation)
+    if task is None:
+        return "no awaiting_review task"
+    driver_agent = task.payload.get("driver_agent")
+    if driver_agent == agent:
+        release_task_claim_to(
+            project,
+            task.id,
+            "awaiting_review",
+            "reviewer cannot review its own driver work",
+            running_status="running_review",
+        )
+        release_role(project, "reviewer", holder=agent, generation=generation)
+        return f"task #{task.id} requeued: reviewer cannot review own work"
+    role = acquire_role(project, "reviewer", agent, timeout_seconds + 60, renew_if_same=True)
+    if not role.ok or role.generation != generation:
+        release_task_claim_to(
+            project,
+            task.id,
+            "awaiting_review",
+            "reviewer role lease is stale",
+            running_status="running_review",
+        )
+        return f"task #{task.id} requeued: reviewer role lease is stale"
+
+    resource = task_resource(task)
+    lock = acquire_resource_lock(
+        project,
+        resource,
+        agent,
+        max(RESOURCE_LOCK_TTL_SECONDS, timeout_seconds + 60),
+        role="reviewer",
+        role_generation=generation,
+        renew_if_same=True,
+    )
+    if not lock.ok:
+        release_task_claim_to(project, task.id, "awaiting_review", lock.reason, running_status="running_review")
+        release_role(project, "reviewer", holder=agent, generation=generation)
+        return f"task #{task.id} requeued: {lock.reason}"
+
+    try:
+        worktree = task_worktree_path(project, task)
+        if worktree is None or not worktree.exists():
+            message = "task worktree is missing"
+            finish_task(project, task.id, "failed", message=message)
+            write_log(project, f"{agent} failed reviewer task #{task.id}: {message}")
+            return f"task #{task.id} failed: {message}"
+
+        update_worker_heartbeat(project, agent, "reviewing", role="reviewer", generation=generation)
+        print(f"reviewing task #{task.id}: {task.title}")
+        print(f"resource lock: {lock.resource}")
+        print(f"worktree: {worktree}")
+        print(f"review timeout: {timeout_seconds}s")
+        sys.stdout.flush()
+
+        policy = check_diff_policy(project, worktree, lock.resource)
+        payload_updates = {
+            "worktree": relative_to_project(project, worktree),
+            "diff_policy": policy.status,
+            "changed_files": list(policy.changed_files),
+            "reviewer_agent": agent,
+            "reviewer_generation": generation,
+        }
+        if policy.status == "no_change":
+            finish_task(
+                project,
+                task.id,
+                "no_change",
+                message=policy.reason,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} reviewer found no changes for task #{task.id}")
+            return f"task #{task.id} no_change"
+        if not policy.ok:
+            finish_task(
+                project,
+                task.id,
+                "rejected",
+                message=policy.reason,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} reviewer rejected task #{task.id}: {policy.reason}")
+            return f"task #{task.id} rejected: {policy.reason}"
+
+        before_patch = export_worktree_patch(worktree)
+        try:
+            review = invoke_reviewer_adapter(
+                project,
+                worktree,
+                agent,
+                task,
+                generation,
+                lock.resource,
+                policy.changed_files,
+                timeout_seconds=timeout_seconds,
+                no_output_timeout_seconds=min(no_output_timeout_seconds, timeout_seconds),
+            )
+        except Exception as exc:
+            fallback_log = run_log_path(project, f"{agent}-review", task.id)
+            fallback_log.write_text(f"{utc_now()} reviewer adapter failed: {exc}\n", encoding="utf-8")
+            review = ReviewResult("adapter_failed", relative_to_project(project, fallback_log), str(exc), False)
+        after_patch = export_worktree_patch(worktree)
+        reviewer_modified_diff = before_patch != after_patch
+        if reviewer_modified_diff:
+            reset_resident_worktree(worktree)
+            apply_patch_to_worktree(worktree, before_patch)
+
+        payload_updates.update(
+            {
+                "reviewer_log": review.log_file,
+                "review_decision": review.decision,
+                "review_message": review.message,
+                "reviewer_modified_diff": reviewer_modified_diff,
+            }
+        )
+
+        if review.decision == "request_changes" and not reviewer_modified_diff:
+            move_task_to_status(
+                project,
+                task.id,
+                "pending",
+                message=review.message or "reviewer requested changes",
+                log_file=review.log_file,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} requested changes for task #{task.id}: {review.message}")
+            return f"task #{task.id} pending: reviewer requested changes"
+
+        if reviewer_modified_diff or review.decision != "approve":
+            payload_updates["review_bypassed"] = True
+            if review.decision == "adapter_failed" and (
+                "timed out" in review.message or "produced no output" in review.message
+            ):
+                mark_agent_cooldown(project, agent, review.message)
+            reason = "reviewer modified diff" if reviewer_modified_diff else review.message
+            move_task_to_status(
+                project,
+                task.id,
+                "awaiting_test",
+                message=f"review bypassed: {review.decision}: {reason}",
+                log_file=review.log_file,
+                payload_updates=payload_updates,
+            )
+            write_log(project, f"{agent} review bypassed for task #{task.id}: {review.decision} {reason}")
+            return f"task #{task.id} awaiting_test review_bypassed={review.decision}"
+
+        move_task_to_status(
+            project,
+            task.id,
+            "awaiting_test",
+            message=review.message or "review approved",
+            log_file=review.log_file,
+            payload_updates=payload_updates,
+        )
+        write_log(project, f"{agent} approved task #{task.id} for tester log={review.log_file}")
+        return f"task #{task.id} awaiting_test review=approve log={review.log_file}"
+    finally:
+        release_resource_lock(
+            project,
+            lock.resource,
+            holder=agent,
+            role="reviewer",
+            role_generation=generation,
+        )
+        release_role(project, "reviewer", holder=agent, generation=generation)
 
 
 def execute_tester_task(
@@ -4166,6 +4494,7 @@ def execute_worker_available_task(
 ) -> Optional[str]:
     counts = task_status_counts(project)
     tester = next((role for role in roles if role[0] == "tester"), None)
+    reviewer = next((role for role in roles if role[0] == "reviewer"), None)
     driver = next((role for role in roles if role[0] == "driver"), None)
 
     if tester and counts.get("awaiting_test", 0) > 0:
@@ -4174,6 +4503,20 @@ def execute_worker_available_task(
             return f"not enough run time for tester budget={budget}s"
         message = execute_tester_task(project, agent, tester[1], timeout_seconds=budget)
         if message != "no awaiting_test task":
+            return message
+
+    if reviewer and counts.get("awaiting_review", 0) > 0:
+        budget = execution_budget_seconds(run_deadline, agent_timeout_seconds, shutdown_grace_seconds)
+        if budget < MIN_EXECUTION_BUDGET_SECONDS:
+            return f"not enough run time for reviewer budget={budget}s"
+        message = execute_reviewer_task(
+            project,
+            agent,
+            reviewer[1],
+            timeout_seconds=budget,
+            no_output_timeout_seconds=min(agent_no_output_seconds, budget),
+        )
+        if message != "no awaiting_review task":
             return message
 
     if driver and counts.get("pending", 0) > 0:
@@ -4229,7 +4572,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     "role leases:",
                     *role_lines,
                     "",
-                    "adapter: driver writes task worktrees; tester gates and applies patches",
+                    "adapter: driver writes, reviewer checks, tester gates and applies patches",
                 ]
             )
             if rendered != last_rendered:

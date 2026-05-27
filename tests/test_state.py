@@ -25,6 +25,7 @@ from mmux.cli import (
     ensure_layout,
     ensure_default_task,
     execute_driver_task,
+    execute_reviewer_task,
     execute_tester_task,
     execute_worker_available_task,
     export_worktree_patch,
@@ -42,6 +43,7 @@ from mmux.cli import (
     maybe_replenish_default_task,
     MIN_EXECUTION_BUDGET_SECONDS,
     parse_resident_protocol_line,
+    parse_reviewer_decision,
     process_resident_protocol_events,
     report_resident_protocol_event,
     resident_mode_enabled,
@@ -84,6 +86,39 @@ def claim_driver_task(project: Path, *, resource: str = "."):
     task = claim_next_task(project, "codex", "driver", lease.generation)
     assert task is not None
     return task
+
+
+def approve_review_task(project: Path, *, agent: str = "claude") -> str:
+    reviewer = acquire_role(project, "reviewer", agent, ttl_seconds=60)
+    original = cli.invoke_reviewer_adapter
+
+    def fake_review(_project, _worktree, _agent, _task, _generation, _resource, _changed_files, **kwargs):
+        return cli.ReviewResult("approve", ".mmux/runs/fake-review.log", "ok", True)
+
+    cli.invoke_reviewer_adapter = fake_review
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return execute_reviewer_task(project, agent, reviewer.generation)
+    finally:
+        cli.invoke_reviewer_adapter = original
+
+
+def drive_task_to_review(project: Path, *, value: str = "value = 4\n", resource: str = "src") -> int:
+    task_id = enqueue_task(project, "change src", resource=resource)
+    driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+    original = cli.invoke_agent_adapter
+
+    def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource, **kwargs):
+        (execution_root / "src" / "app.py").write_text(value, encoding="utf-8")
+        return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
+
+    cli.invoke_agent_adapter = fake_adapter
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            execute_driver_task(project, "codex", driver.generation)
+    finally:
+        cli.invoke_agent_adapter = original
+    return task_id
 
 
 class StateTests(unittest.TestCase):
@@ -200,6 +235,13 @@ class StateTests(unittest.TestCase):
                 db.execute("update tasks set status = ? where id = ?", ("awaiting_test", 1))
             self.assertEqual(supervisor_role_plan_for_project(project, first), (("tester", "claude"), ("driver", "codex")))
 
+            with database(project) as db:
+                db.execute(
+                    "update tasks set status = ?, payload = ? where id = ?",
+                    ("awaiting_review", cli.encode_payload({"driver_agent": "codex"}), 1),
+                )
+            self.assertEqual(supervisor_role_plan_for_project(project, first), (("reviewer", "claude"), ("driver", "codex")))
+
     def test_cleanup_runtime_state_releases_active_runtime_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -226,6 +268,7 @@ class StateTests(unittest.TestCase):
             project = Path(tmp)
             ensure_layout(project)
             running_id = enqueue_task(project, "driver task", resource=".")
+            review_id = enqueue_task(project, "review task", resource=".")
             test_id = enqueue_task(project, "tester task", resource=".")
             with database(project) as db:
                 db.execute(
@@ -242,6 +285,14 @@ class StateTests(unittest.TestCase):
                     set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?
                     where id = ?
                     """,
+                    ("running_review", "claude", "reviewer", 3, review_id),
+                )
+                db.execute(
+                    """
+                    update tasks
+                    set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?
+                    where id = ?
+                    """,
                     ("running_test", "claude", "tester", 2, test_id),
                 )
 
@@ -250,6 +301,8 @@ class StateTests(unittest.TestCase):
 
             self.assertEqual(tasks[running_id].status, "pending")
             self.assertEqual(tasks[running_id].claimed_by, "")
+            self.assertEqual(tasks[review_id].status, "awaiting_review")
+            self.assertEqual(tasks[review_id].claimed_by, "")
             self.assertEqual(tasks[test_id].status, "awaiting_test")
             self.assertEqual(tasks[test_id].claimed_by, "")
 
@@ -787,7 +840,7 @@ exit 1
             self.assertEqual(payload["agent"], "codex")
             self.assertEqual(payload["task_id"], 7)
 
-    def test_process_resident_done_snapshots_diff_for_tester(self) -> None:
+    def test_process_resident_done_snapshots_diff_for_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             init_git_project(project)
@@ -803,8 +856,8 @@ exit 1
             task = get_task(project, task_id)
             self.assertIsNotNone(task)
             assert task is not None
-            self.assertEqual(task.status, "awaiting_test")
-            self.assertIn("awaiting_test", messages[0])
+            self.assertEqual(task.status, "awaiting_review")
+            self.assertIn("awaiting_review", messages[0])
             worktree_value = task.payload.get("worktree")
             self.assertIsInstance(worktree_value, str)
             snapshot = project / str(worktree_value)
@@ -835,8 +888,8 @@ exit 1
             self.assertEqual(event.line, f"MMUX_DONE from=codex task=#{task_id} implemented through cli")
             self.assertIsNotNone(task)
             assert task is not None
-            self.assertEqual(task.status, "awaiting_test")
-            self.assertIn("awaiting_test", messages[0])
+            self.assertEqual(task.status, "awaiting_review")
+            self.assertIn("awaiting_review", messages[0])
             with database(project) as db:
                 rows = db.execute(
                     "select kind from events where kind = ?",
@@ -1326,7 +1379,7 @@ exit 1
 
             self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 3\n")
 
-    def test_execute_driver_task_moves_accepted_patch_to_awaiting_test(self) -> None:
+    def test_execute_driver_task_moves_accepted_patch_to_awaiting_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             init_git_project(project)
@@ -1348,11 +1401,12 @@ exit 1
             finally:
                 cli.invoke_agent_adapter = original
 
-            self.assertIn("awaiting_test", message)
+            self.assertIn("awaiting_review", message)
             self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
             tasks = list_tasks(project)
-            self.assertEqual(tasks[-1].status, "awaiting_test")
+            self.assertEqual(tasks[-1].status, "awaiting_review")
             self.assertEqual(tasks[-1].payload["diff_policy"], "ok")
+            self.assertEqual(tasks[-1].payload["driver_agent"], "codex")
             self.assertIn("worktree", tasks[-1].payload)
 
     def test_execute_driver_task_requeues_adapter_health_failure(self) -> None:
@@ -1402,7 +1456,7 @@ exit 1
 
             def fake_driver(_project, _agent, generation, **kwargs):
                 calls.append(("driver", generation, kwargs["timeout_seconds"]))
-                return "task #1 awaiting_test log=.mmux/runs/fake.log"
+                return "task #1 awaiting_review log=.mmux/runs/fake.log"
 
             cli.execute_tester_task = fake_tester
             cli.execute_driver_task = fake_driver
@@ -1421,8 +1475,137 @@ exit 1
                 cli.execute_driver_task = original_driver
                 cli.execute_tester_task = original_tester
 
-            self.assertIn("awaiting_test", message)
+            self.assertIn("awaiting_review", message)
             self.assertEqual(calls, [("driver", 11, 60)])
+
+    def test_parse_reviewer_decision_accepts_protocol_line(self) -> None:
+        decision, message = parse_reviewer_decision("Looks fine\nMMUX_REVIEW APPROVE")
+        self.assertEqual(decision, "approve")
+        self.assertEqual(message, "")
+
+        decision, message = parse_reviewer_decision("MMUX_REVIEW REQUEST_CHANGES: missing test")
+        self.assertEqual(decision, "request_changes")
+        self.assertEqual(message, "missing test")
+
+        decision, message = parse_reviewer_decision("no protocol")
+        self.assertEqual(decision, "invalid")
+        self.assertIn("missing", message)
+
+    def test_execute_reviewer_task_approves_patch_for_tester(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = drive_task_to_review(project)
+
+            message = approve_review_task(project)
+
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertIn("awaiting_test", message)
+            self.assertEqual(task.status, "awaiting_test")
+            self.assertEqual(task.payload.get("review_decision"), "approve")
+
+    def test_execute_reviewer_task_requests_changes_to_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = drive_task_to_review(project)
+            reviewer = acquire_role(project, "reviewer", "claude", ttl_seconds=60)
+            original = cli.invoke_reviewer_adapter
+
+            def fake_review(_project, _worktree, _agent, _task, _generation, _resource, _changed_files, **kwargs):
+                return cli.ReviewResult("request_changes", ".mmux/runs/fake-review.log", "needs narrower diff", True)
+
+            cli.invoke_reviewer_adapter = fake_review
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_reviewer_task(project, "claude", reviewer.generation)
+            finally:
+                cli.invoke_reviewer_adapter = original
+
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertIn("pending", message)
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.payload.get("review_decision"), "request_changes")
+
+    def test_execute_reviewer_task_bypasses_invalid_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = drive_task_to_review(project)
+            reviewer = acquire_role(project, "reviewer", "claude", ttl_seconds=60)
+            original = cli.invoke_reviewer_adapter
+
+            def fake_review(_project, _worktree, _agent, _task, _generation, _resource, _changed_files, **kwargs):
+                return cli.ReviewResult("invalid", ".mmux/runs/fake-review.log", "bad format", True)
+
+            cli.invoke_reviewer_adapter = fake_review
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_reviewer_task(project, "claude", reviewer.generation)
+            finally:
+                cli.invoke_reviewer_adapter = original
+
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertIn("awaiting_test", message)
+            self.assertEqual(task.status, "awaiting_test")
+            self.assertEqual(task.payload.get("review_bypassed"), True)
+
+    def test_execute_reviewer_task_bypasses_and_restores_modified_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = drive_task_to_review(project, value="value = 4\n")
+            reviewer = acquire_role(project, "reviewer", "claude", ttl_seconds=60)
+            original = cli.invoke_reviewer_adapter
+
+            def fake_review(_project, worktree, _agent, _task, _generation, _resource, _changed_files, **kwargs):
+                (worktree / "src" / "app.py").write_text("value = 99\n", encoding="utf-8")
+                return cli.ReviewResult("approve", ".mmux/runs/fake-review.log", "ok", True)
+
+            cli.invoke_reviewer_adapter = fake_review
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_reviewer_task(project, "claude", reviewer.generation)
+            finally:
+                cli.invoke_reviewer_adapter = original
+
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertIn("awaiting_test", message)
+            self.assertEqual(task.status, "awaiting_test")
+            self.assertEqual(task.payload.get("review_bypassed"), True)
+            self.assertEqual(task.payload.get("reviewer_modified_diff"), True)
+            worktree_value = task.payload.get("worktree")
+            self.assertIsInstance(worktree_value, str)
+            self.assertEqual((project / str(worktree_value) / "src" / "app.py").read_text(encoding="utf-8"), "value = 4\n")
+
+    def test_execute_reviewer_task_requeues_self_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = drive_task_to_review(project)
+            reviewer = acquire_role(project, "reviewer", "codex", ttl_seconds=60)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                message = execute_reviewer_task(project, "codex", reviewer.generation)
+
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertIn("cannot review own work", message)
+            self.assertEqual(task.status, "awaiting_review")
 
     def test_execute_tester_task_applies_awaiting_patch_after_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1445,6 +1628,8 @@ exit 1
             finally:
                 cli.invoke_agent_adapter = original
 
+            review_message = approve_review_task(project)
+            self.assertIn("awaiting_test", review_message)
             tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
                 message = execute_tester_task(project, "claude", tester.generation)
@@ -1477,6 +1662,8 @@ exit 1
             finally:
                 cli.invoke_agent_adapter = original
 
+            review_message = approve_review_task(project)
+            self.assertIn("awaiting_test", review_message)
             tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
                 message = execute_tester_task(project, "claude", tester.generation)
@@ -1524,6 +1711,8 @@ exit 1
             finally:
                 cli.invoke_agent_adapter = original
 
+            review_message = approve_review_task(project)
+            self.assertIn("awaiting_test", review_message)
             tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
                 message = execute_tester_task(project, "claude", tester.generation)
@@ -1575,6 +1764,8 @@ exit 1
             finally:
                 cli.invoke_agent_adapter = original
 
+            review_message = approve_review_task(project)
+            self.assertIn("awaiting_test", review_message)
             tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
                 message = execute_tester_task(project, "claude", tester.generation)

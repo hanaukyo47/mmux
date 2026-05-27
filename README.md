@@ -36,12 +36,14 @@ This repository starts as the control-plane skeleton:
   from tmux panes as an observable fallback and records them as deterministic
   events.
 - Resident `MMUX_DONE task=#N` freezes the agent's resident diff into a task
-  worktree, resets the resident worktree, and moves the task to `awaiting_test`;
-  tester still gates acceptance.
+  worktree, resets the resident worktree, and moves the task to
+  `awaiting_review`; reviewer notes and tester still gate the path to main.
 - Resident `MMUX_BLOCKED task=#N` records the blocked reason and sends the peer
   resident agent a deterministic `MMUX_TASK` takeover request through tmux.
 - A task that receives a second resident `MMUX_BLOCKED` is escalated to
   `blocked`, freeing the timed run to continue with other work.
+- Driver diffs pass through a peer reviewer before tester; review can approve,
+  request changes, or be bypassed on invalid output without blocking the run.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
 - `mmux task requeue #N` moves a blocked or failed task back to `pending`.
@@ -55,9 +57,10 @@ By default, workers record heartbeat and lease state without editing code. Use
 `mmux start --execute-agents` for manual tmux control. With execution enabled,
 the worker holding `driver` claims a pending task, acquires its resource lock,
 creates an isolated git worktree, and runs Codex or Claude Code
-non-interactively. Accepted driver diffs move to `awaiting_test`; the worker
-holding `tester` runs deterministic checks and only then applies the patch back
-to the main worktree.
+non-interactively. Accepted driver diffs move to `awaiting_review`; the peer
+`reviewer` can approve or request changes, and only reviewed or bypassed diffs
+move to `awaiting_test`. The worker holding `tester` runs deterministic checks
+and only then applies the patch back to the main worktree.
 
 Resident mode is for visibility and long-lived agent context. With
 `--resident-agents`, the visible Codex and Claude panes are real interactive
@@ -170,21 +173,24 @@ mmux stop /path/to/project
 - Resident agent context lives in fixed git worktrees under `.mmux/resident/`.
 - Resident agent outcome reporting prefers the `mmux report` state channel;
   tmux protocol lines remain a fallback for visibility.
-- Resident `MMUX_DONE` can hand work to tester; it is not treated as acceptance.
+- Resident `MMUX_DONE` can hand work to review; it is not treated as acceptance.
 - Resident `MMUX_BLOCKED` requests peer takeover without failing the task.
 - Repeated resident blocks stop ping-pong by moving the task to `blocked`.
 - Blocked tasks can be manually requeued after human recovery.
 - Diff policy rejects protected paths and files outside the task resource.
+- Reviewer output is structured as approve/request-changes; invalid or timed-out
+  reviews are logged and bypassed to tester so review cannot deadlock the run.
 - Tester gate infers zero-config local checks before applying accepted patches.
 - Suite-level tester checks are baseline-aware, so pre-existing suite failures
   are logged without automatically rejecting unrelated patches.
-- Pending or awaiting-test work gets deterministic `driver/tester` priority
-  during timed runs.
+- Pending, awaiting-review, or awaiting-test work gets deterministic
+  `driver/reviewer/tester` priority during timed runs.
 - Agent adapters have bounded runtime and no-output timeouts tied to the timed
   run deadline.
 - Adapter timeout/no-output failures requeue the task and put that agent on
   cooldown, so another agent can take the next driver lease.
-- Stopping a run requeues unfinished `running` and `running_test` tasks.
+- Stopping a run requeues unfinished `running`, `running_review`, and
+  `running_test` tasks.
 - Time windows drive the loop; round counts are only internal diagnostics.
 - Queue replenishment prefers deterministic frontier candidates before generic
   default tasks.

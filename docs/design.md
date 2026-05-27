@@ -139,9 +139,10 @@ they make the tmux panes and CLI state observable but do not decide policy.
 
 The baseline role plan still rotates across role pairs to avoid fixed agent
 ownership. When executable work is present, the project plan overrides that
-rotation deterministically: `awaiting_test` tasks prioritize `tester/driver`,
-and `pending` tasks prioritize `driver/tester`. Agent assignment still alternates
-by wall-clock slot, so Codex and Claude Code do not permanently own either role.
+rotation deterministically: `awaiting_test` tasks prioritize `tester`,
+`awaiting_review` tasks prioritize the peer `reviewer`, and `pending` tasks
+prioritize `driver`. Agent assignment still alternates by wall-clock slot, so
+Codex and Claude Code do not permanently own any role.
 
 Resource locks are exclusive path-prefix leases. A lock on `src` conflicts with
 `src/mmux/cli.py`, and a lock on `.` conflicts with every project file. When a
@@ -167,7 +168,22 @@ After driver execution, deterministic policy checks inspect the worktree diff:
 - No diff becomes `no_change`.
 - Protected paths such as `.git`, `.mmux`, and `.env*` are rejected.
 - Every changed path must be inside the task resource lock.
-- Accepted driver diffs move to `awaiting_test`.
+- Accepted driver diffs move to `awaiting_review`.
+
+The worker holding `reviewer` then inspects the same task worktree. Reviewer
+output is intentionally narrow and structured:
+
+```text
+MMUX_REVIEW APPROVE
+MMUX_REVIEW REQUEST_CHANGES: <short reason>
+```
+
+`APPROVE` moves the task to `awaiting_test`. `REQUEST_CHANGES` moves it back to
+`pending` with the review note in task payload. A reviewer may not review its
+own driver work, and reviewer edits to the task diff are discarded. Invalid
+review output, adapter failures, and timeouts are logged and bypassed to
+`awaiting_test` so review cannot become a second model-owned referee or a
+deadlock point.
 
 The worker holding `tester` then runs deterministic checks in the same task
 worktree:
@@ -241,10 +257,11 @@ downstream gate remains single-path.
 A done report for a pending task makes mmux inspect that agent's resident
 worktree diff. If deterministic diff policy accepts it, mmux freezes the patch
 into a normal task worktree under `.mmux/worktrees/`, resets the resident
-worktree back to `HEAD`, and moves the task to `awaiting_test`; the existing
-tester gate still decides whether the patch can be applied to the main
-worktree. A blocked report records the blocked reason on the task payload and
-sends the peer resident agent a deterministic `MMUX_TASK` takeover request
+worktree back to `HEAD`, and moves the task to `awaiting_review`; reviewer
+notes and the existing tester gate still decide whether the patch can be
+applied to the main worktree. A blocked report records the blocked reason on
+the task payload and sends the peer resident agent a deterministic `MMUX_TASK`
+takeover request
 through tmux. It does not fail the task or apply any partial diff from the
 blocked agent. A second resident block for the same task escalates the task to
 `blocked`, which removes it from the open queue and lets timed runs continue
@@ -257,7 +274,7 @@ If the report command is unavailable, resident agents may still emit
 tmux panes, deduplicates them against reports, and processes them through the
 same gate. When `--resident-agents --execute-agents` are used together, mmux
 opens an extra `automation` tmux window for the existing non-interactive
-workers, preserving the deterministic driver/tester gate while the resident
+workers, preserving the deterministic driver/reviewer/tester gate while the resident
 panes keep their long-lived context.
 
 ## Timed Runs
@@ -276,8 +293,9 @@ During the window, it writes periodic checkpoints with remaining time and task
 status counts to stdout and the supervisor log. At the deadline, or on
 `KeyboardInterrupt`, it stops the tmux session, clears runtime leases, locks, and
 heartbeats, requeues unfinished `running` tasks to `pending`, requeues unfinished
-`running_test` tasks to `awaiting_test`, records `run_finished`, and prints
-before/after/delta task counts.
+`running_review` tasks to `awaiting_review`, requeues unfinished `running_test`
+tasks to `awaiting_test`, records `run_finished`, and prints before/after/delta
+task counts.
 
 By default, a timed run observes only. `--execute-agents` enables non-interactive
 Codex and Claude Code adapters inside the same deterministic gates described
@@ -286,9 +304,10 @@ above.
 Timed runs pass their absolute deadline to workers. Before claiming work, a
 worker computes a remaining execution budget from that deadline, the configured
 adapter timeout, and a shutdown grace period. Workers refuse to start a new
-driver or tester action when the remaining budget is too small. Agent adapters
-also have a no-output timeout; if a CLI produces no stdout/stderr for the
-configured interval, mmux terminates it and records the reason in the task log.
+driver, reviewer, or tester action when the remaining budget is too small.
+Agent adapters also have a no-output timeout; if a CLI produces no stdout/stderr
+for the configured interval, mmux terminates it and records the reason in the
+task log.
 Timeout and no-output adapter failures are treated as agent health failures:
 mmux requeues the task, records an agent cooldown in deterministic state, and
 skips that agent for future driver leases until the cooldown expires.
