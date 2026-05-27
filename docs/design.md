@@ -216,25 +216,41 @@ Human operators and future deterministic dispatchers use the same path:
 mmux tell claude note "Please review the Codex plan" --project PROJECT
 ```
 
-Resident agents are prompted to respond with `MMUX_DONE` or `MMUX_BLOCKED`
-lines. The supervisor captures those lines from tmux panes, deduplicates them,
-and records `resident_agent_done` / `resident_agent_blocked` events. A
-`MMUX_DONE task=#N` line for a pending task makes mmux inspect that agent's
-resident worktree diff. If deterministic diff policy accepts it, mmux freezes
-the patch into a normal task worktree under `.mmux/worktrees/`, resets the
-resident worktree back to `HEAD`, and moves the task to `awaiting_test`; the
-existing tester gate still decides whether the patch can be applied to the main
-worktree. `MMUX_BLOCKED task=#N` records the blocked reason on the task payload
-and sends the peer resident agent a deterministic `MMUX_TASK` takeover request
+Resident agents are prompted to report outcomes through an explicit state
+channel:
+
+```bash
+mmux report done --task-id 12 "implemented" --agent codex --project PROJECT
+mmux report blocked --task-id 12 "needs API decision" --agent claude --project PROJECT
+```
+
+When the command is run from inside `.mmux/resident/codex/` or
+`.mmux/resident/claude/`, mmux can infer both the owning project and resident
+agent. The CLI report path and the tmux screen fallback create the same
+deduplicated `resident_agent_done` / `resident_agent_blocked` events, so the
+downstream gate remains single-path.
+
+A done report for a pending task makes mmux inspect that agent's resident
+worktree diff. If deterministic diff policy accepts it, mmux freezes the patch
+into a normal task worktree under `.mmux/worktrees/`, resets the resident
+worktree back to `HEAD`, and moves the task to `awaiting_test`; the existing
+tester gate still decides whether the patch can be applied to the main
+worktree. A blocked report records the blocked reason on the task payload and
+sends the peer resident agent a deterministic `MMUX_TASK` takeover request
 through tmux. It does not fail the task or apply any partial diff from the
-blocked agent. A second resident `MMUX_BLOCKED` for the same task escalates the
-task to `blocked`, which removes it from the open queue and lets timed runs
-continue with other work. After a human resolves the ambiguity, `mmux task
-requeue #N` can move the task back to `pending`. When `--resident-agents
---execute-agents` are used together, mmux opens an extra `automation` tmux
-window for the existing
-non-interactive workers, preserving the deterministic driver/tester gate while
-the resident panes keep their long-lived context.
+blocked agent. A second resident block for the same task escalates the task to
+`blocked`, which removes it from the open queue and lets timed runs continue
+with other work. After a human resolves the ambiguity, `mmux task requeue #N`
+can move the task back to `pending`.
+
+If the report command is unavailable, resident agents may still emit
+`MMUX_DONE task=#N`, `MMUX_BLOCKED task=#N`, or sentinel lines such as
+`<<MMUX:DONE task=#N ...>>` in tmux. The supervisor captures those lines from
+tmux panes, deduplicates them against reports, and processes them through the
+same gate. When `--resident-agents --execute-agents` are used together, mmux
+opens an extra `automation` tmux window for the existing non-interactive
+workers, preserving the deterministic driver/tester gate while the resident
+panes keep their long-lived context.
 
 ## Timed Runs
 

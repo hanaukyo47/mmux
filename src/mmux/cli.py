@@ -1514,6 +1514,31 @@ def resident_worktree_path(project: Path, agent: str) -> Path:
     return resident_root(project) / agent
 
 
+def resident_context_from_path(path: Path) -> Optional[tuple[Path, str]]:
+    resolved = path.expanduser().resolve()
+    for ancestor in (resolved, *resolved.parents):
+        if ancestor.name not in AGENTS:
+            continue
+        resident_parent = ancestor.parent
+        mmux_parent = resident_parent.parent
+        if resident_parent.name != "resident" or mmux_parent.name != ".mmux":
+            continue
+        project = mmux_parent.parent
+        if state_path(project).exists():
+            return project, ancestor.name
+    return None
+
+
+def resolve_report_project(path: str) -> tuple[Path, str]:
+    candidate = resolve_project(path)
+    if state_path(candidate).exists():
+        return candidate, ""
+    context = resident_context_from_path(candidate)
+    if context is not None:
+        return context
+    return candidate, ""
+
+
 def prepare_resident_worktree(project: Path, agent: str) -> Path:
     path = resident_worktree_path(project, agent)
     run(["git", "rev-parse", "--show-toplevel"], cwd=project)
@@ -2252,6 +2277,8 @@ def build_agent_command(agent: str, project: Path, prompt: str, output_file: Pat
 def build_resident_prompt(agent: str, project: Path) -> str:
     peer = "claude" if agent == "codex" else "codex"
     tell_example = module_command(project, "tell", peer, "note", "<message>")
+    report_done_example = module_command(project, "report", "done", "--task-id", "N", "<message>")
+    report_blocked_example = module_command(project, "report", "blocked", "--task-id", "N", "<reason>")
     return "\n".join(
         [
             f"You are the persistent {agent} agent running under mmux resident mode.",
@@ -2260,11 +2287,12 @@ def build_resident_prompt(agent: str, project: Path) -> str:
             f"- Your peer is {peer}; talk to them in the tmux session when decisions need discussion.",
             f"- To message your peer from a tool shell, run: {tell_example}",
             "- Treat lines beginning with MMUX_TASK, MMUX_REVIEW, or MMUX_NOTE as control messages.",
-            "- When you finish a task, print a single line starting with MMUX_DONE and include the task id.",
-            "- When blocked, print a single line starting with MMUX_BLOCKED and include the task id and reason.",
+            f"- Preferred done channel: {report_done_example}",
+            f"- Preferred blocked channel: {report_blocked_example}",
+            "- If the report command is unavailable, print a single MMUX_DONE or MMUX_BLOCKED line with the task id.",
             "",
             "Work only in this resident git worktree. Keep changes scoped and testable.",
-            "After MMUX_DONE, mmux may snapshot your diff and reset this resident worktree to HEAD.",
+            "After a done report, mmux may snapshot your diff and reset this resident worktree to HEAD.",
             "Do not edit .mmux, secrets, or files outside the worktree.",
             "A deterministic mmux gate outside the model will inspect diffs and run tests before applying anything.",
             f"Project root: {project}",
@@ -2452,6 +2480,30 @@ def resident_line_hash(agent: str, line: str) -> str:
     return hashlib.sha1(f"{agent}\0{line}".encode("utf-8")).hexdigest()
 
 
+def normalize_resident_protocol_line(line: str) -> str:
+    stripped = line.strip()
+    if stripped.startswith("`") and stripped.endswith("`"):
+        stripped = stripped.strip("`").strip()
+    if stripped.startswith("<<MMUX:") and stripped.endswith(">>"):
+        inner = stripped[2:-2].strip()
+        if inner.startswith("MMUX:DONE"):
+            return "MMUX_DONE" + inner[len("MMUX:DONE") :]
+        if inner.startswith("MMUX:BLOCKED"):
+            return "MMUX_BLOCKED" + inner[len("MMUX:BLOCKED") :]
+    return stripped
+
+
+def format_resident_report_line(kind: str, agent: str, task_id: int, message: str) -> str:
+    validate_agent(agent)
+    if kind not in ("done", "blocked"):
+        raise ValueError(f"unknown resident report kind: {kind}")
+    normalized = " ".join(message.split())
+    parts = [f"MMUX_{kind.upper()}", f"from={agent}", f"task=#{task_id}"]
+    if normalized:
+        parts.append(normalized)
+    return " ".join(parts)
+
+
 def task_id_from_token(token: str) -> Optional[int]:
     cleaned = token.strip().rstrip(".,;:")
     if cleaned.startswith("task=#"):
@@ -2467,7 +2519,7 @@ def task_id_from_token(token: str) -> Optional[int]:
 
 def parse_resident_protocol_line(agent: str, line: str) -> Optional[ResidentProtocolEvent]:
     validate_agent(agent)
-    stripped = line.strip()
+    stripped = normalize_resident_protocol_line(line)
     if not stripped.startswith("MMUX_"):
         return None
     tokens = stripped.split()
@@ -2492,13 +2544,15 @@ def parse_resident_protocol_line(agent: str, line: str) -> Optional[ResidentProt
             continue
         message_tokens.append(token)
 
+    message = " ".join(message_tokens)
+    canonical = format_resident_report_line(kind, agent, task_id, message)
     return ResidentProtocolEvent(
         agent=agent,
         kind=kind,
         task_id=task_id,
-        message=" ".join(message_tokens),
+        message=message,
         line=stripped,
-        line_hash=resident_line_hash(agent, stripped),
+        line_hash=resident_line_hash(agent, canonical),
     )
 
 
@@ -2543,6 +2597,24 @@ def record_resident_protocol_events(project: Path, events: Iterable[ResidentProt
                 recorded.append(event)
             set_meta_json_db(db, resident_seen_key(agent), {"hashes": seen[-200:]})
     return recorded
+
+
+def report_resident_protocol_event(
+    project: Path,
+    *,
+    agent: str,
+    kind: str,
+    task_id: int,
+    message: str,
+) -> tuple[bool, list[str], ResidentProtocolEvent]:
+    line = format_resident_report_line(kind, agent, task_id, message)
+    event = parse_resident_protocol_line(agent, line)
+    if event is None:
+        raise RuntimeError(f"could not parse resident report line: {line}")
+    recorded = record_resident_protocol_events(project, [event])
+    if not recorded:
+        return False, [], event
+    return True, process_resident_protocol_events(project, recorded), event
 
 
 def record_resident_processing_event(project: Path, kind: str, event: ResidentProtocolEvent, payload: dict[str, object]) -> None:
@@ -3361,6 +3433,32 @@ def cmd_tell(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
     print(f"sent to {args.agent}: {message}")
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    project, detected_agent = resolve_report_project(args.project)
+    require_project_state(project)
+    agent = args.agent or detected_agent
+    if not agent:
+        raise SystemExit("--agent is required unless running from a resident worktree")
+    message = " ".join(args.message).strip()
+    try:
+        recorded, messages, event = report_resident_protocol_event(
+            project,
+            agent=agent,
+            kind=args.kind,
+            task_id=args.task_id,
+            message=message,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not recorded:
+        print(f"duplicate report ignored: {event.line}")
+        return 0
+    print(f"reported: {event.line}")
+    for item in messages:
+        print(item)
     return 0
 
 
@@ -4199,6 +4297,14 @@ def build_parser() -> argparse.ArgumentParser:
     tell.add_argument("--task-id", type=nonnegative_int, default=0)
     tell.add_argument("--project", default=".")
     tell.set_defaults(func=cmd_tell)
+
+    report = subparsers.add_parser("report", help="report resident done/blocked through the state channel")
+    report.add_argument("kind", choices=("done", "blocked"))
+    report.add_argument("message", nargs="*", help="optional report message")
+    report.add_argument("--task-id", "--task", dest="task_id", type=positive_task_id, required=True)
+    report.add_argument("--agent", choices=AGENTS)
+    report.add_argument("--project", default=".")
+    report.set_defaults(func=cmd_report)
 
     start = subparsers.add_parser("start", help="start the tmux observation workspace")
     start.add_argument("project", nargs="?", default=".")

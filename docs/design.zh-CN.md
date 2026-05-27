@@ -179,7 +179,18 @@ MMUX_NOTE from=mmux ...
 mmux tell claude note "Please review the Codex plan" --project PROJECT
 ```
 
-常驻 agent 会被提示用 `MMUX_DONE` 或 `MMUX_BLOCKED` 行回应。supervisor 会从 tmux pane 捕获这些行，去重后记录 `resident_agent_done` / `resident_agent_blocked` 事件。对于 pending 任务，`MMUX_DONE task=#N` 会触发 mmux 检查该 agent 的 resident worktree diff；如果确定性 diff policy 通过，mmux 会把 patch 冻结到 `.mmux/worktrees/` 下的普通 task worktree，随后把 resident worktree 重置回 `HEAD`，并把任务推进到 `awaiting_test`。最终能否应用到主工作区，仍然由现有 tester gate 决定。`MMUX_BLOCKED task=#N` 会把阻塞原因写入任务 payload，并通过 tmux 给另一个常驻 agent 发确定性的 `MMUX_TASK` 接管请求；它不会让任务失败，也不会应用 blocked agent 的半成品 diff。同一任务第二次收到 resident `MMUX_BLOCKED` 后会升级为 `blocked`，从 open queue 里让出位置，限时运行可以继续处理其他工作。人工处理清楚后，可以用 `mmux task requeue #N` 把任务重新放回 `pending`。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/tester gate，同时让常驻 pane 保持长期上下文。
+常驻 agent 会被提示优先通过显式状态库通道上报结果：
+
+```bash
+mmux report done --task-id 12 "implemented" --agent codex --project PROJECT
+mmux report blocked --task-id 12 "needs API decision" --agent claude --project PROJECT
+```
+
+如果命令是在 `.mmux/resident/codex/` 或 `.mmux/resident/claude/` 里运行，mmux 可以自动推断所属 project 和 agent。CLI report 通道和 tmux 屏幕 fallback 会产生同一种去重后的 `resident_agent_done` / `resident_agent_blocked` 事件，后续 gate 仍然只有一条处理路径。
+
+对于 pending 任务，done report 会触发 mmux 检查该 agent 的 resident worktree diff；如果确定性 diff policy 通过，mmux 会把 patch 冻结到 `.mmux/worktrees/` 下的普通 task worktree，随后把 resident worktree 重置回 `HEAD`，并把任务推进到 `awaiting_test`。最终能否应用到主工作区，仍然由现有 tester gate 决定。blocked report 会把阻塞原因写入任务 payload，并通过 tmux 给另一个常驻 agent 发确定性的 `MMUX_TASK` 接管请求；它不会让任务失败，也不会应用 blocked agent 的半成品 diff。同一任务第二次 resident block 后会升级为 `blocked`，从 open queue 里让出位置，限时运行可以继续处理其他工作。人工处理清楚后，可以用 `mmux task requeue #N` 把任务重新放回 `pending`。
+
+如果 report 命令不可用，常驻 agent 仍然可以在 tmux 中输出 `MMUX_DONE task=#N`、`MMUX_BLOCKED task=#N`，或者 `<<MMUX:DONE task=#N ...>>` 这类 sentinel 行。supervisor 会从 tmux pane 捕获这些行，并和 report 事件共用去重与 gate 处理。当同时使用 `--resident-agents --execute-agents` 时，mmux 会额外打开一个 `automation` tmux window 跑现有非交互 worker，从而保留确定性 driver/tester gate，同时让常驻 pane 保持长期上下文。
 
 ## 限时运行
 

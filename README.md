@@ -30,8 +30,11 @@ This repository starts as the control-plane skeleton:
   Claude panes with fixed resident worktrees under `.mmux/resident/`.
 - `mmux tell` sends `MMUX_TASK`, `MMUX_REVIEW`, or `MMUX_NOTE` protocol lines to
   a resident agent through tmux.
-- The supervisor captures resident `MMUX_DONE` and `MMUX_BLOCKED` lines from
-  tmux panes and records them as deterministic events.
+- `mmux report done|blocked` lets resident agents report task outcomes through
+  the state channel instead of relying on terminal text.
+- The supervisor still captures resident `MMUX_DONE` and `MMUX_BLOCKED` lines
+  from tmux panes as an observable fallback and records them as deterministic
+  events.
 - Resident `MMUX_DONE task=#N` freezes the agent's resident diff into a task
   worktree, resets the resident worktree, and moves the task to `awaiting_test`;
   tester still gates acceptance.
@@ -140,6 +143,8 @@ mmux start /path/to/project
 mmux start /path/to/project --execute-agents
 mmux start /path/to/project --resident-agents
 mmux tell claude note "Please review the Codex plan" --project /path/to/project
+mmux report done --task-id 12 "implemented" --agent codex --project /path/to/project
+mmux report blocked --task-id 12 "needs API decision" --agent claude --project /path/to/project
 mmux attach /path/to/project
 mmux status /path/to/project
 mmux tasks /path/to/project
@@ -163,7 +168,8 @@ mmux stop /path/to/project
 - Resource locks prevent concurrent writes to the same files or modules.
 - Agent execution happens in task git worktrees under `.mmux/worktrees/`.
 - Resident agent context lives in fixed git worktrees under `.mmux/resident/`.
-- Resident agent communication is a tmux protocol line, not a model judge.
+- Resident agent outcome reporting prefers the `mmux report` state channel;
+  tmux protocol lines remain a fallback for visibility.
 - Resident `MMUX_DONE` can hand work to tester; it is not treated as acceptance.
 - Resident `MMUX_BLOCKED` requests peer takeover without failing the task.
 - Repeated resident blocks stop ping-pong by moving the task to `blocked`.

@@ -43,7 +43,9 @@ from mmux.cli import (
     MIN_EXECUTION_BUDGET_SECONDS,
     parse_resident_protocol_line,
     process_resident_protocol_events,
+    report_resident_protocol_event,
     resident_mode_enabled,
+    resident_context_from_path,
     release_role,
     release_resource_lock,
     requeue_task,
@@ -736,6 +738,15 @@ exit 1
         self.assertEqual(event.message, "needs input")
         self.assertIsNone(parse_resident_protocol_line("codex", "MMUX_NOTE from=claude hi"))
 
+    def test_parse_resident_protocol_line_accepts_sentinel(self) -> None:
+        event = parse_resident_protocol_line("claude", "  <<MMUX:DONE task=#9 implemented>>  ")
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.agent, "claude")
+        self.assertEqual(event.kind, "done")
+        self.assertEqual(event.task_id, 9)
+        self.assertEqual(event.message, "implemented")
+
     def test_scan_resident_agent_output_records_protocol_events_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp).resolve()
@@ -801,6 +812,90 @@ exit 1
             self.assertEqual((snapshot / "src" / "app.py").read_text(encoding="utf-8"), "value = 2\n")
             self.assertEqual((resident / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
             self.assertEqual((project / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
+
+    def test_report_resident_done_uses_state_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "resident report change", resource="src")
+            resident = cli.prepare_resident_worktree(project, "codex")
+            (resident / "src" / "app.py").write_text("value = 3\n", encoding="utf-8")
+
+            recorded, messages, event = report_resident_protocol_event(
+                project,
+                agent="codex",
+                kind="done",
+                task_id=task_id,
+                message="implemented through cli",
+            )
+
+            task = get_task(project, task_id)
+            self.assertTrue(recorded)
+            self.assertEqual(event.line, f"MMUX_DONE from=codex task=#{task_id} implemented through cli")
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.status, "awaiting_test")
+            self.assertIn("awaiting_test", messages[0])
+            with database(project) as db:
+                rows = db.execute(
+                    "select kind from events where kind = ?",
+                    ("resident_agent_done",),
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+
+    def test_report_resident_event_dedupes_screen_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            ensure_layout(project)
+            first, _, event = report_resident_protocol_event(
+                project,
+                agent="codex",
+                kind="blocked",
+                task_id=42,
+                message="need input",
+            )
+            fallback = parse_resident_protocol_line("codex", "<<MMUX:BLOCKED task=#42 need input>>")
+            assert fallback is not None
+            second = cli.record_resident_protocol_events(project, [fallback])
+
+            self.assertTrue(first)
+            self.assertEqual(second, [])
+
+    def test_resident_context_from_path_detects_owner_project_and_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            init_git_project(project)
+            ensure_layout(project)
+            resident = cli.prepare_resident_worktree(project, "claude")
+            nested = resident / "src"
+
+            context = resident_context_from_path(nested)
+
+            self.assertEqual(context, (project, "claude"))
+
+    def test_cmd_report_auto_detects_resident_project_and_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = enqueue_task(project, "resident cli blocked", resource="src")
+            resident = cli.prepare_resident_worktree(project, "claude")
+            previous_cwd = Path.cwd()
+            output = io.StringIO()
+            try:
+                os.chdir(resident)
+                with contextlib.redirect_stdout(output):
+                    code = cli.main(["report", "blocked", "need", "input", "--task-id", str(task_id)])
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(code, 0)
+            self.assertIn("reported: MMUX_BLOCKED from=claude", output.getvalue())
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.payload.get("resident_blocked_by"), "claude")
 
     def test_process_resident_done_rejects_resource_violation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1100,6 +1195,7 @@ exit 1
 
         self.assertIn("MMUX_TASK", resident_prompt)
         self.assertIn("MMUX_DONE", resident_prompt)
+        self.assertIn("report", resident_prompt)
         self.assertIn("--no-alt-screen", resident_codex)
         self.assertIn("--permission-mode", resident_claude)
 
