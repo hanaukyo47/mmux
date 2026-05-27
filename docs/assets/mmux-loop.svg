@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="540" viewBox="0 0 1200 540" role="img" aria-labelledby="title desc">
+  <title id="title">mmux deterministic coding-agent loop</title>
+  <desc id="desc">A deterministic supervisor coordinates driver, reviewer, and tester agents over tmux while git facts, leases, locks, and tests decide outcomes.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f7f2; }
+      .ink { fill: #17211b; }
+      .muted { fill: #5e6b63; }
+      .panel { fill: #ffffff; stroke: #243128; stroke-width: 2; }
+      .soft { fill: #e7ecdf; stroke: #415044; stroke-width: 2; }
+      .green { fill: #dff2df; stroke: #2f6b3f; stroke-width: 2; }
+      .blue { fill: #dcebf7; stroke: #2d6387; stroke-width: 2; }
+      .gold { fill: #f6e8bd; stroke: #836a20; stroke-width: 2; }
+      .red { fill: #f7dddd; stroke: #8c3a35; stroke-width: 2; }
+      .line { stroke: #243128; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #5e6b63; stroke-width: 2; stroke-dasharray: 8 8; fill: none; }
+      .label { font: 700 28px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .small { font: 500 18px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .tiny { font: 500 15px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; }
+      .pulse2 { animation: pulse 2.4s ease-in-out .6s infinite; transform-origin: center; }
+      .pulse3 { animation: pulse 2.4s ease-in-out 1.2s infinite; transform-origin: center; }
+      @keyframes pulse {
+        0%, 100% { opacity: .92; }
+        50% { opacity: 1; }
+      }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#243128"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1200" height="540"/>
+
+  <text x="60" y="72" class="ink label">mmux</text>
+  <text x="60" y="106" class="muted small">Deterministic tmux supervisor for long-running Codex + Claude Code pair work</text>
+
+  <rect x="60" y="155" width="250" height="130" rx="10" class="blue pulse"/>
+  <text x="86" y="205" class="ink label">Driver</text>
+  <text x="86" y="236" class="muted small">writes a scoped diff</text>
+  <text x="86" y="262" class="muted tiny">isolated git worktree</text>
+
+  <path class="line" d="M 310 220 C 360 220 375 220 425 220"/>
+
+  <rect x="425" y="155" width="250" height="130" rx="10" class="gold pulse2"/>
+  <text x="451" y="205" class="ink label">Reviewer</text>
+  <text x="451" y="236" class="muted small">approve or request changes</text>
+  <text x="451" y="262" class="muted tiny">structured note, not final judge</text>
+
+  <path class="line" d="M 675 220 C 725 220 740 220 790 220"/>
+
+  <rect x="790" y="155" width="250" height="130" rx="10" class="green pulse3"/>
+  <text x="816" y="205" class="ink label">Tester Gate</text>
+  <text x="816" y="236" class="muted small">git facts and local checks</text>
+  <text x="816" y="262" class="muted tiny">baseline-aware suite checks</text>
+
+  <path class="line" d="M 915 285 C 915 330 825 360 705 360"/>
+  <rect x="455" y="325" width="250" height="105" rx="10" class="panel"/>
+  <text x="482" y="368" class="ink label">Main Worktree</text>
+  <text x="482" y="398" class="muted small">patch applies only after gates</text>
+
+  <path class="dash" d="M 185 285 C 185 375 280 405 455 390"/>
+  <text x="92" y="348" class="muted tiny">request changes</text>
+
+  <rect x="760" y="335" width="310" height="96" rx="10" class="soft"/>
+  <text x="787" y="373" class="ink small">Supervisor facts</text>
+  <text x="787" y="400" class="muted tiny">timers, leases, locks, git, tests</text>
+
+  <rect x="60" y="335" width="310" height="96" rx="10" class="soft"/>
+  <text x="87" y="373" class="ink small">tmux observation</text>
+  <text x="87" y="400" class="muted tiny">visible panes, fixed resident context</text>
+
+  <text x="60" y="486" class="muted small">Models propose, implement, review, and summarize. They do not referee the system.</text>
+</svg>

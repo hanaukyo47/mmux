@@ -4,11 +4,27 @@ Deterministic multi-agent pair programming over tmux.
 
 [简体中文说明](README.zh-CN.md)
 
-mmux is a local supervisor for long-running coding-agent collaboration. It uses
-tmux for visibility and human takeover, but keeps orchestration deterministic:
-timers, role leases, resource locks, git facts, and test results decide what can
-happen. LLMs propose, implement, review, and summarize. They do not referee the
-system.
+![mmux deterministic agent loop](docs/assets/mmux-loop.svg)
+
+Unlike model-chat agent frameworks where LLMs negotiate outcomes, mmux keeps the
+referee outside the model loop. Codex and Claude Code can write, review, and
+discuss in visible tmux panes; a deterministic supervisor decides state
+transitions with timers, role leases, resource locks, git facts, and test
+results.
+
+> Alpha: mmux is ready for controlled experiments and demo runs. It is not yet a
+> production-grade unattended coding system.
+
+Quick install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | sh
+```
+
+Demo and launch materials:
+
+- [Demo guide](docs/demo.md)
+- [Launch copy](docs/launch.md)
 
 ## Current Scope
 
@@ -71,6 +87,8 @@ when `--resident-agents --execute-agents` are used together, mmux opens a second
 agents remain available for discussion and human takeover.
 
 ## Install
+
+The same one-line installer is shown at the top of this README:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hanaukyo47/mmux/main/install.sh | sh
