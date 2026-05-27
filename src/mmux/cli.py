@@ -23,6 +23,7 @@ ROLES = ("driver", "reviewer", "scout", "tester", "summarizer")
 AGENTS = ("codex", "claude")
 RESIDENT_MESSAGE_KINDS = ("task", "review", "note")
 RESIDENT_PANE_INDEXES = {"codex": "1", "claude": "3"}
+RESIDENT_BLOCKED_ESCALATION_EVENTS = 2
 ROLE_LEASE_TTL_SECONDS = 2 * 60
 RESOURCE_LOCK_TTL_SECONDS = 10 * 60
 WORKER_REFRESH_SECONDS = 5
@@ -1280,7 +1281,7 @@ def finish_task(
     log_file: str = "",
     payload_updates: Optional[dict[str, object]] = None,
 ) -> None:
-    if status not in {"completed", "failed", "no_change", "rejected"}:
+    if status not in {"completed", "failed", "no_change", "rejected", "blocked"}:
         raise ValueError(f"unknown task terminal status: {status}")
     with database(project) as db:
         apply_schema(db)
@@ -1293,7 +1294,7 @@ def finish_task(
         if message:
             payload["last_message"] = message[:2000]
         now = utc_now()
-        last_error = message if status in {"failed", "rejected"} else ""
+        last_error = message if status in {"failed", "rejected", "blocked"} else ""
         db.execute(
             """
             update tasks
@@ -2258,6 +2259,22 @@ def record_resident_processing_event(project: Path, kind: str, event: ResidentPr
     record_project_event(project, kind, data)
 
 
+def resident_blocked_history(task: TaskRecord) -> list[dict[str, object]]:
+    raw_history = task.payload.get("resident_blocked_history")
+    if not isinstance(raw_history, list):
+        return []
+    return [item for item in raw_history if isinstance(item, dict)]
+
+
+def resident_blocked_agents(history: Iterable[dict[str, object]]) -> list[str]:
+    agents = []
+    for item in history:
+        agent = item.get("agent")
+        if isinstance(agent, str) and agent in AGENTS and agent not in agents:
+            agents.append(agent)
+    return agents
+
+
 def process_resident_done_event(project: Path, event: ResidentProtocolEvent) -> str:
     if event.task_id <= 0:
         record_resident_processing_event(project, "resident_done_ignored", event, {"reason": "missing task id"})
@@ -2393,13 +2410,49 @@ def process_resident_blocked_event(project: Path, event: ResidentProtocolEvent) 
         return f"ignored: task #{task.id} status is {task.status}"
 
     peer = peer_agent(event.agent)
+    history = resident_blocked_history(task)
+    history.append(
+        {
+            "agent": event.agent,
+            "message": event.message,
+            "event": event.line_hash,
+            "at": utc_now(),
+        }
+    )
+    blocked_agents = resident_blocked_agents(history)
     payload_updates = {
         "resident_blocked_by": event.agent,
         "resident_blocked_reason": event.message,
         "resident_blocked_at": utc_now(),
         "resident_blocked_event": event.line_hash,
         "resident_takeover_agent": peer,
+        "resident_blocked_count": len(history),
+        "resident_blocked_agents": blocked_agents,
+        "resident_blocked_history": history[-10:],
     }
+
+    if len(history) >= RESIDENT_BLOCKED_ESCALATION_EVENTS or len(blocked_agents) >= len(AGENTS):
+        reason = f"resident blocked {len(history)} time(s): {event.message}"
+        payload_updates.update(
+            {
+                "resident_escalated_at": utc_now(),
+                "resident_escalation_reason": reason,
+            }
+        )
+        finish_task(project, task.id, "blocked", message=reason, payload_updates=payload_updates)
+        record_resident_processing_event(
+            project,
+            "resident_blocked_escalated",
+            event,
+            {
+                "message": event.message,
+                "blocked_count": len(history),
+                "blocked_agents": blocked_agents,
+                "reason": reason,
+            },
+        )
+        return f"task #{task.id} escalated to blocked after {len(history)} resident block(s)"
+
     update_task_payload(project, task.id, payload_updates)
 
     delivered = False
@@ -2672,6 +2725,7 @@ TASK_STATUS_ORDER = (
     "failed",
     "rejected",
     "no_change",
+    "blocked",
 )
 OPEN_TASK_STATUSES = ("pending", "running", "awaiting_test", "running_test")
 

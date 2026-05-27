@@ -35,6 +35,8 @@ This repository starts as the control-plane skeleton:
   tester still gates acceptance.
 - Resident `MMUX_BLOCKED task=#N` records the blocked reason and sends the peer
   resident agent a deterministic `MMUX_TASK` takeover request through tmux.
+- A task that receives a second resident `MMUX_BLOCKED` is escalated to
+  `blocked`, freeing the timed run to continue with other work.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
 - `mmux roles` prints role leases and worker heartbeats.
@@ -159,6 +161,7 @@ mmux stop /path/to/project
 - Resident agent communication is a tmux protocol line, not a model judge.
 - Resident `MMUX_DONE` can hand work to tester; it is not treated as acceptance.
 - Resident `MMUX_BLOCKED` requests peer takeover without failing the task.
+- Repeated resident blocks stop ping-pong by moving the task to `blocked`.
 - Diff policy rejects protected paths and files outside the task resource.
 - Tester gate infers zero-config local checks before applying accepted patches.
 - Pending or awaiting-test work gets deterministic `driver/tester` priority
