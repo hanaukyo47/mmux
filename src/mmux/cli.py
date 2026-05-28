@@ -125,6 +125,15 @@ class ReviewResult:
 
 
 @dataclass(frozen=True)
+class PlanResult:
+    decision: str
+    log_file: str
+    plan_text: str
+    message: str
+    adapter_ok: bool
+
+
+@dataclass(frozen=True)
 class ResidentProtocolEvent:
     agent: str
     kind: str
@@ -2335,23 +2344,81 @@ def run_tester_gate(
             remove_git_worktree(project, baseline_worktree)
 
 
-def build_agent_prompt(agent: str, task: TaskRecord, role_generation: int, resource: str) -> str:
+def build_agent_prompt(
+    agent: str,
+    task: TaskRecord,
+    role_generation: int,
+    resource: str,
+    plan_text: str = "",
+) -> str:
+    lines = [
+        f"You are the {agent} worker running under mmux.",
+        "",
+        "The mmux supervisor is deterministic and has already granted you:",
+        f"- role: driver",
+        f"- role generation: {role_generation}",
+        f"- resource lock: {resource}",
+        "- execution root: isolated git worktree",
+        "",
+        f"Task #{task.id}: {task.title}",
+        "",
+    ]
+    stripped_plan = plan_text.strip() if plan_text else ""
+    if stripped_plan:
+        lines.extend(
+            [
+                "An approved plan for this task is below. Follow it.",
+                "If the plan turns out to be wrong, keep the diff small and explain in your summary.",
+                "",
+                "--- approved plan ---",
+                stripped_plan,
+                "--- end plan ---",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "Work only inside this repository. Keep the change scoped to the task and the locked resource.",
+            "A deterministic diff policy gate will reject changes outside the locked resource.",
+            "Do not start a long-running service. Run focused tests or checks when practical.",
+            "When done, leave a concise final summary including changed files and verification.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_planner_prompt(agent: str, task: TaskRecord, role_generation: int, resource: str) -> str:
     return "\n".join(
         [
-            f"You are the {agent} worker running under mmux.",
+            f"You are the {agent} planner running under mmux.",
             "",
             "The mmux supervisor is deterministic and has already granted you:",
-            f"- role: driver",
+            f"- role: driver (planning sub-step)",
             f"- role generation: {role_generation}",
             f"- resource lock: {resource}",
             "- execution root: isolated git worktree",
             "",
             f"Task #{task.id}: {task.title}",
             "",
-            "Work only inside this repository. Keep the change scoped to the task and the locked resource.",
-            "A deterministic diff policy gate will reject changes outside the locked resource.",
-            "Do not start a long-running service. Run focused tests or checks when practical.",
-            "When done, leave a concise final summary including changed files and verification.",
+            "Plan only. Read code, search, inspect tests. Do NOT edit any files in this step.",
+            "Produce a small, verifiable plan that a separate driver step will execute.",
+            "Keep the plan scoped to the locked resource. Prefer the smallest change that addresses the task.",
+            "",
+            "Write a final block with exactly these three labeled sections, in order:",
+            "",
+            "READ:",
+            "<bullet list of files / paths / greps / tests you actually consulted>",
+            "",
+            "PLAN:",
+            "<2-6 short steps describing what to change and why>",
+            "",
+            "RISKS:",
+            "<bullet list of areas plausibly affected that you did not read; write 'none' if there are none>",
+            "",
+            "Finish with exactly one final protocol line:",
+            "MMUX_PLAN PROCEED",
+            "or",
+            "MMUX_PLAN ABORT: <short reason this task cannot be planned within scope>",
         ]
     )
 
@@ -2402,6 +2469,23 @@ def parse_reviewer_decision(text: str) -> tuple[str, str]:
         if upper.startswith("APPROVE"):
             return "approve", normalized[len("APPROVE") :].lstrip(" :-")
     return "invalid", "missing MMUX_REVIEW APPROVE or MMUX_REVIEW REQUEST_CHANGES"
+
+
+def parse_planner_decision(text: str) -> tuple[str, str]:
+    for line in reversed(text.splitlines()):
+        normalized = line.strip().strip("`").strip()
+        if not normalized:
+            continue
+        if normalized.upper().startswith("MMUX_PLAN"):
+            normalized = normalized[len("MMUX_PLAN") :].strip()
+        else:
+            continue
+        upper = normalized.upper()
+        if upper.startswith("PROCEED"):
+            return "proceed", normalized[len("PROCEED") :].lstrip(" :-")
+        if upper.startswith("ABORT"):
+            return "abort", normalized[len("ABORT") :].lstrip(" :-")
+    return "invalid", "missing MMUX_PLAN PROCEED or MMUX_PLAN ABORT"
 
 
 def build_agent_command(agent: str, project: Path, prompt: str, output_file: Path) -> list[str]:
@@ -2601,8 +2685,9 @@ def invoke_agent_adapter(
     *,
     timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
     no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+    plan_text: str = "",
 ) -> AdapterResult:
-    prompt = build_agent_prompt(agent, task, role_generation, resource)
+    prompt = build_agent_prompt(agent, task, role_generation, resource, plan_text=plan_text)
     log_file = run_log_path(project, agent, task.id)
     output_file = log_file.with_suffix(".last-message.txt")
     cmd = build_agent_command(agent, execution_root, prompt, output_file)
@@ -2657,6 +2742,44 @@ def invoke_reviewer_adapter(
         return ReviewResult("adapter_failed", relative_to_project(project, log_file), result.message, False)
     decision, message = parse_reviewer_decision(review_text)
     return ReviewResult(decision, relative_to_project(project, log_file), message, True)
+
+
+def invoke_planner_adapter(
+    project: Path,
+    worktree: Path,
+    agent: str,
+    task: TaskRecord,
+    role_generation: int,
+    resource: str,
+    *,
+    timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> PlanResult:
+    prompt = build_planner_prompt(agent, task, role_generation, resource)
+    log_file = run_log_path(project, f"{agent}-plan", task.id)
+    output_file = log_file.with_suffix(".last-message.txt")
+    cmd = build_agent_command(agent, worktree, prompt, output_file)
+    result = stream_agent_command(
+        worktree,
+        cmd,
+        log_file,
+        timeout_seconds=timeout_seconds,
+        no_output_timeout_seconds=no_output_timeout_seconds,
+    )
+    plan_text = ""
+    if output_file.exists():
+        plan_text = output_file.read_text(encoding="utf-8", errors="replace")
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("\n--- last message ---\n")
+            handle.write(plan_text)
+            handle.write("\n")
+    if not plan_text:
+        plan_text = log_file.read_text(encoding="utf-8", errors="replace")
+    relative_log = relative_to_project(project, log_file)
+    if not result.ok:
+        return PlanResult("adapter_failed", relative_log, plan_text, result.message, False)
+    decision, message = parse_planner_decision(plan_text)
+    return PlanResult(decision, relative_log, plan_text, message, True)
 
 
 def is_adapter_health_failure(result: AdapterResult) -> bool:
@@ -4092,7 +4215,8 @@ def execute_driver_task(
     task = claim_next_task(project, agent, "driver", generation)
     if task is None:
         return "no pending task"
-    role = acquire_role(project, "driver", agent, timeout_seconds + 60, renew_if_same=True)
+    stage_budget = 2 * timeout_seconds + 60
+    role = acquire_role(project, "driver", agent, stage_budget, renew_if_same=True)
     if not role.ok or role.generation != generation:
         release_task_claim(project, task.id, "driver role lease is stale")
         return f"task #{task.id} requeued: driver role lease is stale"
@@ -4102,7 +4226,7 @@ def execute_driver_task(
         project,
         resource,
         agent,
-        max(RESOURCE_LOCK_TTL_SECONDS, timeout_seconds + 60),
+        max(RESOURCE_LOCK_TTL_SECONDS, stage_budget),
         role="driver",
         role_generation=generation,
         renew_if_same=True,
@@ -4136,6 +4260,96 @@ def execute_driver_task(
         print(f"agent timeout: {timeout_seconds}s")
         print(f"no-output timeout: {no_output_timeout_seconds}s")
         sys.stdout.flush()
+
+        print(f"planning task #{task.id} ({agent})")
+        sys.stdout.flush()
+        try:
+            plan_result = invoke_planner_adapter(
+                project,
+                worktree,
+                agent,
+                task,
+                generation,
+                lock.resource,
+                timeout_seconds=timeout_seconds,
+                no_output_timeout_seconds=min(no_output_timeout_seconds, timeout_seconds),
+            )
+        except Exception as exc:
+            message = f"planner adapter failed: {exc}"
+            finish_task(
+                project,
+                task.id,
+                "failed",
+                message=message,
+                payload_updates={"worktree": relative_to_project(project, worktree)},
+            )
+            write_log(project, f"{agent} failed task #{task.id} during planning: {exc}")
+            return f"task #{task.id} failed: {exc}"
+
+        plan_payload: dict[str, object] = {
+            "worktree": relative_to_project(project, worktree),
+            "plan_log": plan_result.log_file,
+            "plan_decision": plan_result.decision,
+            "plan_agent": agent,
+            "plan_generation": generation,
+        }
+        if plan_result.plan_text.strip():
+            plan_payload["plan_text"] = plan_result.plan_text.strip()
+
+        if not plan_result.adapter_ok:
+            adapter_proxy = AdapterResult(False, 124, plan_result.log_file, plan_result.message)
+            if is_adapter_health_failure(adapter_proxy):
+                message = f"{agent} planner adapter unavailable: {plan_result.message}"
+                mark_agent_cooldown(project, agent, plan_result.message)
+                update_task_payload(
+                    project,
+                    task.id,
+                    {
+                        **plan_payload,
+                        "adapter_log": plan_result.log_file,
+                        "adapter_failure": plan_result.message,
+                        "adapter_cooldown_agent": agent,
+                    },
+                )
+                release_task_claim(project, task.id, message)
+                write_log(project, f"{agent} requeued task #{task.id} at plan: {message}")
+                return f"task #{task.id} requeued: {message}"
+            finish_task(
+                project,
+                task.id,
+                "failed",
+                message=plan_result.message,
+                log_file=plan_result.log_file,
+                payload_updates=plan_payload,
+            )
+            write_log(project, f"{agent} plan adapter failed task #{task.id}: {plan_result.message}")
+            return f"task #{task.id} failed at plan: {plan_result.message}"
+
+        if plan_result.decision == "abort":
+            finish_task(
+                project,
+                task.id,
+                "no_change",
+                message=f"plan abort: {plan_result.message}" if plan_result.message else "plan abort",
+                log_file=plan_result.log_file,
+                payload_updates=plan_payload,
+            )
+            write_log(project, f"{agent} aborted task #{task.id} at plan: {plan_result.message}")
+            return f"task #{task.id} no_change (plan abort) log={plan_result.log_file}"
+
+        if plan_result.decision != "proceed":
+            plan_payload["plan_invalid_reason"] = plan_result.message
+            write_log(
+                project,
+                f"{agent} plan output invalid for task #{task.id}: {plan_result.message}; proceeding without plan context",
+            )
+
+        update_task_payload(project, task.id, plan_payload)
+
+        driver_plan_text = plan_result.plan_text if plan_result.decision == "proceed" else ""
+
+        print(f"executing task #{task.id} ({agent})")
+        sys.stdout.flush()
         try:
             result = invoke_agent_adapter(
                 project,
@@ -4146,6 +4360,7 @@ def execute_driver_task(
                 lock.resource,
                 timeout_seconds=timeout_seconds,
                 no_output_timeout_seconds=min(no_output_timeout_seconds, timeout_seconds),
+                plan_text=driver_plan_text,
             )
         except Exception as exc:
             message = f"agent adapter failed: {exc}"
