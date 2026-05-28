@@ -119,14 +119,21 @@ def _fake_planner_proceed(_project, _worktree, _agent, _task, _generation, _reso
     )
 
 
+def _fake_plan_reviewer_approve(_project, _worktree, _agent, _task, _generation, _resource, _plan_text, **kwargs):
+    return cli.ReviewResult("approve", ".mmux/runs/fake-plan-review.log", "", True)
+
+
 @contextlib.contextmanager
-def patched_planner(stub=_fake_planner_proceed):
-    original = cli.invoke_planner_adapter
+def patched_planner(stub=_fake_planner_proceed, plan_reviewer_stub=_fake_plan_reviewer_approve):
+    original_planner = cli.invoke_planner_adapter
+    original_reviewer = cli.invoke_plan_reviewer_adapter
     cli.invoke_planner_adapter = stub
+    cli.invoke_plan_reviewer_adapter = plan_reviewer_stub
     try:
         yield
     finally:
-        cli.invoke_planner_adapter = original
+        cli.invoke_planner_adapter = original_planner
+        cli.invoke_plan_reviewer_adapter = original_reviewer
 
 
 def drive_task_to_review(project: Path, *, value: str = "value = 4\n", resource: str = "src") -> int:
@@ -1590,6 +1597,105 @@ exit 1
             self.assertEqual(tasks[-1].status, "no_change")
             self.assertEqual(tasks[-1].payload["plan_decision"], "abort")
             self.assertIn("MMUX_PLAN ABORT", tasks[-1].payload["plan_text"])
+
+    def test_execute_driver_task_requeues_on_plan_review_request_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "change src", resource="src")
+            lease = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            adapter_called = []
+
+            def fake_adapter(*_args, **_kwargs):
+                adapter_called.append(True)
+                return cli.AdapterResult(True, 0, ".mmux/runs/should-not-run.log", "ok")
+
+            def fake_plan_review_request_changes(_project, _worktree, _agent, _task, _generation, _resource, _plan_text, **kwargs):
+                return cli.ReviewResult("request_changes", ".mmux/runs/fake-plan-review.log", "READ list is empty", True)
+
+            original_adapter = cli.invoke_agent_adapter
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with patched_planner(plan_reviewer_stub=fake_plan_review_request_changes), contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_driver_task(project, "codex", lease.generation)
+            finally:
+                cli.invoke_agent_adapter = original_adapter
+
+            self.assertIn("requeued", message)
+            self.assertIn("plan rejected", message)
+            self.assertEqual(adapter_called, [], "driver adapter must not run after plan rejection")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "pending")
+            self.assertEqual(tasks[-1].payload["plan_review_decision"], "request_changes")
+            self.assertEqual(tasks[-1].payload["plan_review_attempts"], 1)
+            self.assertEqual(tasks[-1].payload["plan_review_last_reason"], "READ list is empty")
+
+    def test_execute_driver_task_blocks_after_repeated_plan_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "change src", resource="src")
+
+            adapter_called = []
+
+            def fake_adapter(*_args, **_kwargs):
+                adapter_called.append(True)
+                return cli.AdapterResult(True, 0, ".mmux/runs/should-not-run.log", "ok")
+
+            def fake_plan_review_request_changes(_project, _worktree, _agent, _task, _generation, _resource, _plan_text, **kwargs):
+                return cli.ReviewResult("request_changes", ".mmux/runs/fake-plan-review.log", "scope unclear", True)
+
+            original_adapter = cli.invoke_agent_adapter
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with patched_planner(plan_reviewer_stub=fake_plan_review_request_changes):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        first_lease = acquire_role(project, "driver", "codex", ttl_seconds=60)
+                        first_message = execute_driver_task(project, "codex", first_lease.generation)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        second_lease = acquire_role(project, "driver", "claude", ttl_seconds=60)
+                        second_message = execute_driver_task(project, "claude", second_lease.generation)
+            finally:
+                cli.invoke_agent_adapter = original_adapter
+
+            self.assertIn("requeued", first_message)
+            self.assertIn("blocked", second_message)
+            self.assertEqual(adapter_called, [], "driver adapter must not run when plan keeps being rejected")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "blocked")
+            self.assertEqual(tasks[-1].payload["plan_review_attempts"], 2)
+
+    def test_execute_driver_task_bypasses_plan_review_adapter_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "change src", resource="src")
+            lease = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            def fake_adapter(_project, execution_root, _agent, task, _generation, _resource, **kwargs):
+                (execution_root / "src" / "app.py").write_text("value = 4\n", encoding="utf-8")
+                return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
+
+            def fake_plan_review_adapter_failed(_project, _worktree, _agent, _task, _generation, _resource, _plan_text, **kwargs):
+                return cli.ReviewResult("adapter_failed", ".mmux/runs/fake-plan-review.log", "boom", False)
+
+            original_adapter = cli.invoke_agent_adapter
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with patched_planner(plan_reviewer_stub=fake_plan_review_adapter_failed), contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_driver_task(project, "codex", lease.generation)
+            finally:
+                cli.invoke_agent_adapter = original_adapter
+
+            self.assertIn("awaiting_review", message)
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "awaiting_review")
+            self.assertEqual(tasks[-1].payload["plan_review_decision"], "adapter_failed")
+            self.assertTrue(tasks[-1].payload["plan_review_bypassed"])
 
     def test_execute_driver_task_requeues_planner_health_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

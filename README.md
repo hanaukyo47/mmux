@@ -95,9 +95,13 @@ By default, workers record heartbeat and lease state without editing code. Use
 the worker holding `driver` claims a pending task, acquires its resource lock,
 creates an isolated git worktree, and runs a structured plan step (Codex or
 Claude Code outputs a `READ` / `PLAN` / `RISKS` artifact ending in
-`MMUX_PLAN PROCEED` or `MMUX_PLAN ABORT`). A `PROCEED` plan is saved to the
-task payload and passed as context to the subsequent diff step; an `ABORT`
-short-circuits the task to `no_change` without burning a diff attempt.
+`MMUX_PLAN PROCEED` or `MMUX_PLAN ABORT`). A `PROCEED` plan is then
+reviewed inline (same `MMUX_REVIEW APPROVE` / `REQUEST_CHANGES` protocol
+as the diff reviewer). Approved plans flow into the subsequent diff step
+as context; the first `REQUEST_CHANGES` requeues the task so the next
+driver can plan again, and a second rejection moves the task to
+`blocked`. `ABORT` short-circuits the task to `no_change` without
+burning a diff attempt.
 Accepted driver diffs move to `awaiting_review`; the peer `reviewer` can
 approve or request changes, and only reviewed or bypassed diffs move to
 `awaiting_test`. The worker holding `tester` runs deterministic checks and

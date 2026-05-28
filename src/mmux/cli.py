@@ -25,6 +25,7 @@ AGENTS = ("codex", "claude")
 RESIDENT_MESSAGE_KINDS = ("task", "review", "note")
 RESIDENT_PANE_INDEXES = {"codex": "1", "claude": "3"}
 RESIDENT_BLOCKED_ESCALATION_EVENTS = 2
+PLAN_REVIEW_ESCALATION_ATTEMPTS = 2
 REQUEUEABLE_TASK_STATUSES = ("blocked", "failed", "rejected", "no_change")
 ROLE_LEASE_TTL_SECONDS = 2 * 60
 RESOURCE_LOCK_TTL_SECONDS = 10 * 60
@@ -2387,6 +2388,45 @@ def build_agent_prompt(
     return "\n".join(lines)
 
 
+def build_plan_reviewer_prompt(
+    agent: str,
+    task: TaskRecord,
+    role_generation: int,
+    resource: str,
+    plan_text: str,
+) -> str:
+    plan_block = plan_text.strip() or "<empty plan>"
+    return "\n".join(
+        [
+            f"You are the {agent} plan reviewer running under mmux.",
+            "",
+            "The mmux supervisor is deterministic and has already granted you:",
+            "- role: plan reviewer (driver pre-flight)",
+            f"- role generation: {role_generation}",
+            f"- resource lock: {resource}",
+            "- execution root: the driver's isolated git worktree",
+            "",
+            f"Task #{task.id}: {task.title}",
+            "",
+            "Review the plan below. Do not edit files. Do not write new code.",
+            "Focus on three checks:",
+            "1. Is the READ list sufficient to justify the PLAN steps?",
+            "2. Is the PLAN scoped to the locked resource and reasonably small?",
+            "3. Are the RISKS realistic, or do they hide load-bearing surprises?",
+            "Approve only if the plan is concrete and verifiable. Request changes for vague plans, plans without enough reading, or plans that touch unrelated areas.",
+            "",
+            "--- plan to review ---",
+            plan_block,
+            "--- end plan ---",
+            "",
+            "Finish with exactly one final protocol line:",
+            "MMUX_REVIEW APPROVE",
+            "or",
+            "MMUX_REVIEW REQUEST_CHANGES: <short reason>",
+        ]
+    )
+
+
 def build_planner_prompt(agent: str, task: TaskRecord, role_generation: int, resource: str) -> str:
     return "\n".join(
         [
@@ -2720,6 +2760,44 @@ def invoke_reviewer_adapter(
 ) -> ReviewResult:
     prompt = build_reviewer_prompt(agent, task, role_generation, resource, changed_files)
     log_file = run_log_path(project, f"{agent}-review", task.id)
+    output_file = log_file.with_suffix(".last-message.txt")
+    cmd = build_agent_command(agent, worktree, prompt, output_file)
+    result = stream_agent_command(
+        worktree,
+        cmd,
+        log_file,
+        timeout_seconds=timeout_seconds,
+        no_output_timeout_seconds=no_output_timeout_seconds,
+    )
+    review_text = ""
+    if output_file.exists():
+        review_text = output_file.read_text(encoding="utf-8", errors="replace")
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("\n--- last message ---\n")
+            handle.write(review_text)
+            handle.write("\n")
+    if not review_text:
+        review_text = log_file.read_text(encoding="utf-8", errors="replace")
+    if not result.ok:
+        return ReviewResult("adapter_failed", relative_to_project(project, log_file), result.message, False)
+    decision, message = parse_reviewer_decision(review_text)
+    return ReviewResult(decision, relative_to_project(project, log_file), message, True)
+
+
+def invoke_plan_reviewer_adapter(
+    project: Path,
+    worktree: Path,
+    agent: str,
+    task: TaskRecord,
+    role_generation: int,
+    resource: str,
+    plan_text: str,
+    *,
+    timeout_seconds: int = AGENT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> ReviewResult:
+    prompt = build_plan_reviewer_prompt(agent, task, role_generation, resource, plan_text)
+    log_file = run_log_path(project, f"{agent}-plan-review", task.id)
     output_file = log_file.with_suffix(".last-message.txt")
     cmd = build_agent_command(agent, worktree, prompt, output_file)
     result = stream_agent_command(
@@ -4215,7 +4293,7 @@ def execute_driver_task(
     task = claim_next_task(project, agent, "driver", generation)
     if task is None:
         return "no pending task"
-    stage_budget = 2 * timeout_seconds + 60
+    stage_budget = 3 * timeout_seconds + 60
     role = acquire_role(project, "driver", agent, stage_budget, renew_if_same=True)
     if not role.ok or role.generation != generation:
         release_task_claim(project, task.id, "driver role lease is stale")
@@ -4344,9 +4422,76 @@ def execute_driver_task(
                 f"{agent} plan output invalid for task #{task.id}: {plan_result.message}; proceeding without plan context",
             )
 
-        update_task_payload(project, task.id, plan_payload)
-
         driver_plan_text = plan_result.plan_text if plan_result.decision == "proceed" else ""
+
+        if plan_result.decision == "proceed":
+            print(f"reviewing plan for task #{task.id} ({agent})")
+            sys.stdout.flush()
+            try:
+                plan_review = invoke_plan_reviewer_adapter(
+                    project,
+                    worktree,
+                    agent,
+                    task,
+                    generation,
+                    lock.resource,
+                    plan_result.plan_text,
+                    timeout_seconds=timeout_seconds,
+                    no_output_timeout_seconds=min(no_output_timeout_seconds, timeout_seconds),
+                )
+            except Exception as exc:
+                fallback_log = run_log_path(project, f"{agent}-plan-review", task.id)
+                fallback_log.write_text(f"{utc_now()} plan reviewer adapter failed: {exc}\n", encoding="utf-8")
+                plan_review = ReviewResult(
+                    "adapter_failed",
+                    relative_to_project(project, fallback_log),
+                    str(exc),
+                    False,
+                )
+
+            plan_payload["plan_review_log"] = plan_review.log_file
+            plan_payload["plan_review_decision"] = plan_review.decision
+            plan_payload["plan_review_message"] = plan_review.message
+
+            if plan_review.adapter_ok and plan_review.decision == "request_changes":
+                existing_attempts = 0
+                if task.payload and isinstance(task.payload.get("plan_review_attempts"), int):
+                    existing_attempts = task.payload["plan_review_attempts"]
+                new_attempts = existing_attempts + 1
+                plan_payload["plan_review_attempts"] = new_attempts
+                plan_payload["plan_review_last_reason"] = plan_review.message
+
+                if new_attempts >= PLAN_REVIEW_ESCALATION_ATTEMPTS:
+                    reason = f"plan rejected {new_attempts} time(s): {plan_review.message}".strip()
+                    finish_task(
+                        project,
+                        task.id,
+                        "blocked",
+                        message=reason,
+                        log_file=plan_review.log_file,
+                        payload_updates=plan_payload,
+                    )
+                    write_log(project, f"{agent} blocked task #{task.id} after repeated plan rejection: {plan_review.message}")
+                    return f"task #{task.id} blocked: {reason}"
+
+                update_task_payload(project, task.id, plan_payload)
+                requeue_reason = f"plan rejected: {plan_review.message}".strip(": ") or "plan rejected"
+                release_task_claim(project, task.id, requeue_reason)
+                write_log(project, f"{agent} requeued task #{task.id} after plan rejection: {plan_review.message}")
+                return f"task #{task.id} requeued: {requeue_reason}"
+
+            if not plan_review.adapter_ok or plan_review.decision != "approve":
+                plan_payload["plan_review_bypassed"] = True
+                if plan_review.decision == "adapter_failed" and (
+                    "timed out" in plan_review.message or "produced no output" in plan_review.message
+                ):
+                    mark_agent_cooldown(project, agent, plan_review.message)
+                write_log(
+                    project,
+                    f"{agent} plan review bypassed for task #{task.id}: {plan_review.decision} {plan_review.message}",
+                )
+
+        update_task_payload(project, task.id, plan_payload)
 
         print(f"executing task #{task.id} ({agent})")
         sys.stdout.flush()
