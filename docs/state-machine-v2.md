@@ -78,6 +78,21 @@ Three notable changes versus today:
    of today's `failed` / `no_change` / `rejected` outcomes are plan-stage
    problems the driver could not catch because there is no plan stage.
 
+   **Plan review reuses the existing reviewer adapter call** with a different
+   prompt and a different expected artifact (plan verdict instead of diff
+   verdict). No new adapter wiring; one less moving part. If we later want
+   to swap a cheaper model in for plan review, that's a prompt-routing
+   change, not a structural one.
+
+   **Plan-stage `outcome=blocked` follows the existing peer-takeover
+   escalation.** First time planner+reviewer cannot converge: rerouted to
+   the peer agent (codex ↔ claude). Different models do plan differently;
+   it's worth one retry on the other side before declaring the task
+   ill-posed. Second time: `outcome=blocked`, surfaced to human for
+   requeue or rescope. This mirrors what resident `MMUX_BLOCKED` does in
+   `RESIDENT_BLOCKED_ESCALATION_EVENTS` today, so we get one escalation
+   model across all stages instead of two.
+
 2. **Check unifies reviewer + tester.** Both are Check sub-steps with different
    fidelity — LLM review is fast, cheap, semantic; deterministic tests are
    slow, precise, syntactic. They do not need separate top-level stages; they
@@ -189,45 +204,58 @@ V2's Act adds two responsibilities:
    reflection source alongside the existing three static ones.
 
 The reflection source is LLM-driven, unlike the static three, so it must go
-through admission control before it can pollute the task queue:
+through admission control before it can pollute the task queue.
 
-- Reflection tasks default to a `proposed` state that is **not** part of the
-  conceptual stage machine — it is a queue admission gate, not a stage.
-- A reflection task that cites concrete evidence (a file, a failure event,
-  a reviewer note) gets auto-promoted to the Plan stage.
-- A reflection task that is vague stays in `proposed` until a human looks at
-  it, or until it is dropped by a TTL.
+**Reflection tasks are modeled as a separate `kind=reflection`**, not as a
+tag on ordinary tasks. Reasons:
+
+- Admission policy is genuinely different: every reflection task has to
+  cite concrete evidence (a file, a failure event, a reviewer note) before
+  promotion from `proposed` to Plan.
+- Execution policy is genuinely different: smaller diff cap, mandatory
+  reviewer (no `review_bypassed=True` shortcut), separate resource-lock
+  namespace for self-modifying runs touching `src/mmux/`.
+- Putting these as `if kind == "reflection"` branches scattered across the
+  codebase rots; putting them inside a kind boundary forces every future
+  policy decision to consider both kinds explicitly.
+
+Reflection-kind tasks default to a `proposed` state that is **not** part of
+the conceptual stage machine — it is a queue admission gate, not a stage.
+Evidence-citing tasks auto-promote to Plan; vague ones stay in `proposed`
+until a human looks at them, or until they age out by TTL.
 
 This is the only place where LLM judgment is allowed to influence the task
 queue. Every stage transition after admission is still owned by the
 deterministic referee.
 
-Tasks whose patches would touch `src/mmux/` itself (the self-iteration case)
-need a stricter admission policy on top of this: smaller diff cap, mandatory
-reviewer (no `review_bypassed=True` shortcut on adapter failure), and a
-separate resource-lock namespace so self-modifying runs can't race with
-ordinary work. That belongs in a follow-up doc, not here.
+## Migration: hard cut
+
+No dual-write. The new schema replaces `status` with `stage` + `outcome` in
+a single release. Trade-offs:
+
+- **Cleaner code.** No compatibility branches in the supervisor, no v1/v2
+  reconciliation logic, no temporary indexes.
+- **Existing `.mmux/state.db` files do not survive.** Users running mmux
+  alpha need to delete their state.db (or run a one-shot migration script
+  shipped with the release) before the new binary will start. Any tasks
+  in flight at migration time need to be re-frontiered from scratch.
+- **In-flight `running_*` tasks abort on upgrade.** The supervisor will
+  refuse to load a v1 schema; on next start with v2, frontier discovery
+  produces a fresh queue.
+
+This is the right trade for alpha: the user audience is small, the
+deployment count is low, and the cost of carrying a dual-write layer
+across an unknown number of releases is higher than the cost of asking
+users to reset state once.
+
+The migration script (`mmux migrate v1-to-v2` or similar) is in scope for
+the release that lands v2, but its design is not in scope for this doc.
 
 ## What this proposal does not commit to
 
-- Schema changes to `.mmux/state.db`. The `stage` + `outcome` split is a
-  conceptual claim; the migration plan is a separate doc.
 - The exact JSON shape of the Plan adapter's `read` / `plan` / `risks`
   contract, or of `act_summary`.
+- The reflection prompt or which model runs it.
 - Whether `proposed` is stored in the same table as `tasks` or its own.
 
 Those follow once we agree the conceptual split is correct.
-
-## Open questions
-
-1. Is the plan reviewer the **same** adapter call as today's diff reviewer,
-   just with a different prompt and artifact? Or a distinct adapter so we
-   can swap models (cheaper model for plan review, stronger for diff
-   review)?
-2. Reflection tasks as a separate task **kind** with its own policy, or
-   ordinary tasks with a `source=reflection` tag?
-3. Should Plan-stage `outcome=blocked` (planner + plan reviewer can't
-   converge) trigger the same peer-takeover escalation that resident
-   `MMUX_BLOCKED` does today, or fail faster?
-4. Migration shape: dual-write `status` (v1) and `stage`+`outcome` (v2) for
-   one release, then drop v1, or hard cut?
