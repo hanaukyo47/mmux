@@ -36,6 +36,7 @@ AGENT_TIMEOUT_SECONDS = 20 * 60
 AGENT_NO_OUTPUT_TIMEOUT_SECONDS = 2 * 60
 AGENT_ADAPTER_COOLDOWN_SECONDS = 10 * 60
 TEST_TIMEOUT_SECONDS = 10 * 60
+SUMMARIZER_TIMEOUT_SECONDS = 5 * 60
 RUN_SHUTDOWN_GRACE_SECONDS = 15
 MIN_EXECUTION_BUDGET_SECONDS = 30
 MIN_TMUX_VERSION = (3, 0)
@@ -130,6 +131,14 @@ class PlanResult:
     decision: str
     log_file: str
     plan_text: str
+    message: str
+    adapter_ok: bool
+
+
+@dataclass(frozen=True)
+class ActSummaryResult:
+    summary: str
+    log_file: str
     message: str
     adapter_ok: bool
 
@@ -2388,6 +2397,47 @@ def build_agent_prompt(
     return "\n".join(lines)
 
 
+def build_summarizer_prompt(agent: str, task: TaskRecord, context: dict[str, object]) -> str:
+    plan_text = str(context.get("plan_text") or "").strip() or "<no plan recorded>"
+    changed_files_raw = context.get("changed_files") or []
+    if isinstance(changed_files_raw, (list, tuple)):
+        changed_files = ", ".join(str(item) for item in changed_files_raw) or "<none>"
+    else:
+        changed_files = str(changed_files_raw) or "<none>"
+    review_message = str(context.get("review_message") or "<no review note>").strip() or "<no review note>"
+    tester_message = str(context.get("tester_message") or "<no tester message>").strip() or "<no tester message>"
+    baseline_raw = context.get("tester_baseline_failures") or []
+    if isinstance(baseline_raw, (list, tuple)) and baseline_raw:
+        baseline_text = "; ".join(str(item) for item in baseline_raw)
+    else:
+        baseline_text = "<none>"
+    return "\n".join(
+        [
+            f"You are the {agent} summarizer running under mmux.",
+            "",
+            f"Task #{task.id}: {task.title}",
+            "",
+            "A task just completed: driver wrote a diff, reviewer approved (or was bypassed), tester applied the patch.",
+            "Produce a tight act_summary (3-5 lines) that a future planner can learn from. Cover:",
+            "- what was actually changed (one line)",
+            "- what verified the change (tests, baseline, reviewer note)",
+            "- any surprise or friction (or write 'none')",
+            "- one watch-out for similar future work",
+            "",
+            "Output only the bullets. No preamble, no closing chatter, no code fences.",
+            "Keep it under 600 characters total.",
+            "",
+            "--- context ---",
+            f"plan: {plan_text}",
+            f"changed_files: {changed_files}",
+            f"review_message: {review_message}",
+            f"tester_message: {tester_message}",
+            f"tester_baseline_failures: {baseline_text}",
+            "--- end context ---",
+        ]
+    )
+
+
 def build_plan_reviewer_prompt(
     agent: str,
     task: TaskRecord,
@@ -2782,6 +2832,40 @@ def invoke_reviewer_adapter(
         return ReviewResult("adapter_failed", relative_to_project(project, log_file), result.message, False)
     decision, message = parse_reviewer_decision(review_text)
     return ReviewResult(decision, relative_to_project(project, log_file), message, True)
+
+
+def invoke_summarizer_adapter(
+    project: Path,
+    worktree: Path,
+    agent: str,
+    task: TaskRecord,
+    context: dict[str, object],
+    *,
+    timeout_seconds: int = SUMMARIZER_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> ActSummaryResult:
+    prompt = build_summarizer_prompt(agent, task, context)
+    log_file = run_log_path(project, f"{agent}-summary", task.id)
+    output_file = log_file.with_suffix(".last-message.txt")
+    cmd = build_agent_command(agent, worktree, prompt, output_file)
+    result = stream_agent_command(
+        worktree,
+        cmd,
+        log_file,
+        timeout_seconds=timeout_seconds,
+        no_output_timeout_seconds=no_output_timeout_seconds,
+    )
+    summary_text = ""
+    if output_file.exists():
+        summary_text = output_file.read_text(encoding="utf-8", errors="replace")
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("\n--- last message ---\n")
+            handle.write(summary_text)
+            handle.write("\n")
+    relative_log = relative_to_project(project, log_file)
+    if not result.ok:
+        return ActSummaryResult("", relative_log, result.message, False)
+    return ActSummaryResult(summary_text.strip(), relative_log, result.message, True)
 
 
 def invoke_plan_reviewer_adapter(
@@ -4785,7 +4869,8 @@ def execute_tester_task(
     task = claim_next_test_task(project, agent, generation)
     if task is None:
         return "no awaiting_test task"
-    role = acquire_role(project, "tester", agent, timeout_seconds + 60, renew_if_same=True)
+    tester_budget = timeout_seconds + SUMMARIZER_TIMEOUT_SECONDS + 60
+    role = acquire_role(project, "tester", agent, tester_budget, renew_if_same=True)
     if not role.ok or role.generation != generation:
         release_task_claim_to(
             project,
@@ -4801,7 +4886,7 @@ def execute_tester_task(
         project,
         resource,
         agent,
-        max(RESOURCE_LOCK_TTL_SECONDS, timeout_seconds + 60),
+        max(RESOURCE_LOCK_TTL_SECONDS, tester_budget),
         role="tester",
         role_generation=generation,
         renew_if_same=True,
@@ -4886,6 +4971,44 @@ def execute_tester_task(
             )
             write_log(project, f"{agent} tester failed to apply task #{task.id}: {exc}")
             return f"task #{task.id} failed: {message}"
+
+        summarizer_context = {
+            "plan_text": (task.payload or {}).get("plan_text"),
+            "changed_files": list(policy.changed_files),
+            "review_message": (task.payload or {}).get("review_message"),
+            "tester_message": test_result.message,
+            "tester_baseline_failures": list(test_result.baseline_failures),
+        }
+        print(f"summarizing task #{task.id} ({agent})")
+        sys.stdout.flush()
+        try:
+            summary_result = invoke_summarizer_adapter(
+                project,
+                worktree,
+                agent,
+                task,
+                summarizer_context,
+            )
+        except Exception as exc:
+            fallback_log = run_log_path(project, f"{agent}-summary", task.id)
+            fallback_log.write_text(f"{utc_now()} summarizer adapter failed: {exc}\n", encoding="utf-8")
+            summary_result = ActSummaryResult(
+                "",
+                relative_to_project(project, fallback_log),
+                f"summarizer adapter failed: {exc}",
+                False,
+            )
+
+        payload_updates["act_summary"] = summary_result.summary
+        payload_updates["act_summary_log"] = summary_result.log_file
+        payload_updates["act_summary_adapter_ok"] = summary_result.adapter_ok
+        payload_updates["act_summary_agent"] = agent
+        if not summary_result.adapter_ok:
+            payload_updates["act_summary_failure"] = summary_result.message
+            write_log(
+                project,
+                f"{agent} summarizer failed for task #{task.id}: {summary_result.message}",
+            )
 
         finish_task(
             project,

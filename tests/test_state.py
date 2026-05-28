@@ -123,6 +123,15 @@ def _fake_plan_reviewer_approve(_project, _worktree, _agent, _task, _generation,
     return cli.ReviewResult("approve", ".mmux/runs/fake-plan-review.log", "", True)
 
 
+def _fake_summarizer_ok(_project, _worktree, _agent, _task, _context, **kwargs):
+    return cli.ActSummaryResult(
+        "- did the thing\n- tested it\n- nothing surprising\n- watch the next one",
+        ".mmux/runs/fake-summary.log",
+        "ok",
+        True,
+    )
+
+
 @contextlib.contextmanager
 def patched_planner(stub=_fake_planner_proceed, plan_reviewer_stub=_fake_plan_reviewer_approve):
     original_planner = cli.invoke_planner_adapter
@@ -134,6 +143,16 @@ def patched_planner(stub=_fake_planner_proceed, plan_reviewer_stub=_fake_plan_re
     finally:
         cli.invoke_planner_adapter = original_planner
         cli.invoke_plan_reviewer_adapter = original_reviewer
+
+
+@contextlib.contextmanager
+def patched_summarizer(stub=_fake_summarizer_ok):
+    original = cli.invoke_summarizer_adapter
+    cli.invoke_summarizer_adapter = stub
+    try:
+        yield
+    finally:
+        cli.invoke_summarizer_adapter = original
 
 
 def drive_task_to_review(project: Path, *, value: str = "value = 4\n", resource: str = "src") -> int:
@@ -1947,7 +1966,7 @@ exit 1
             review_message = approve_review_task(project)
             self.assertIn("awaiting_test", review_message)
             tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
-            with contextlib.redirect_stdout(io.StringIO()):
+            with patched_summarizer(), contextlib.redirect_stdout(io.StringIO()):
                 message = execute_tester_task(project, "claude", tester.generation)
 
             self.assertIn("completed", message)
@@ -1956,6 +1975,9 @@ exit 1
             self.assertEqual(tasks[-1].status, "completed")
             self.assertEqual(tasks[-1].payload["patch_applied"], True)
             self.assertIn("tester_log", tasks[-1].payload)
+            self.assertIn("act_summary", tasks[-1].payload)
+            self.assertTrue(tasks[-1].payload["act_summary_adapter_ok"])
+            self.assertEqual(tasks[-1].payload["act_summary_agent"], "claude")
 
     def test_execute_tester_task_fails_invalid_python_without_applying_patch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2030,7 +2052,7 @@ exit 1
             review_message = approve_review_task(project)
             self.assertIn("awaiting_test", review_message)
             tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
-            with contextlib.redirect_stdout(io.StringIO()):
+            with patched_summarizer(), contextlib.redirect_stdout(io.StringIO()):
                 message = execute_tester_task(project, "claude", tester.generation)
 
             self.assertIn("completed", message)
@@ -2040,6 +2062,44 @@ exit 1
             failures = tasks[-1].payload.get("tester_baseline_failures")
             self.assertIsInstance(failures, list)
             self.assertIn("unittest", str(failures))
+
+    def test_execute_tester_task_records_summarizer_failure_without_blocking_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "change src", resource="src")
+            driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            original = cli.invoke_agent_adapter
+
+            def fake_adapter(_project, execution_root, _agent, _task, _generation, _resource, **kwargs):
+                (execution_root / "src" / "app.py").write_text("value = 4\n", encoding="utf-8")
+                return cli.AdapterResult(True, 0, ".mmux/runs/fake-driver.log", "ok")
+
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with patched_planner(), contextlib.redirect_stdout(io.StringIO()):
+                    execute_driver_task(project, "codex", driver.generation)
+            finally:
+                cli.invoke_agent_adapter = original
+
+            approve_review_task(project)
+
+            def fake_summary_fail(_project, _worktree, _agent, _task, _context, **kwargs):
+                return cli.ActSummaryResult("", ".mmux/runs/fake-summary.log", "agent command timed out", False)
+
+            tester = acquire_role(project, "tester", "claude", ttl_seconds=60)
+            with patched_summarizer(fake_summary_fail), contextlib.redirect_stdout(io.StringIO()):
+                message = execute_tester_task(project, "claude", tester.generation)
+
+            self.assertIn("completed", message)
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "completed")
+            self.assertEqual(tasks[-1].payload["patch_applied"], True)
+            self.assertEqual(tasks[-1].payload["act_summary"], "")
+            self.assertFalse(tasks[-1].payload["act_summary_adapter_ok"])
+            self.assertIn("timed out", tasks[-1].payload["act_summary_failure"])
 
     def test_execute_tester_task_fails_unittest_regression_when_baseline_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

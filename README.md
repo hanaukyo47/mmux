@@ -105,7 +105,12 @@ burning a diff attempt.
 Accepted driver diffs move to `awaiting_review`; the peer `reviewer` can
 approve or request changes, and only reviewed or bypassed diffs move to
 `awaiting_test`. The worker holding `tester` runs deterministic checks and
-only then applies the patch back to the main worktree.
+only then applies the patch back to the main worktree. After the patch
+applies, a summarizer call writes a compact `act_summary` into the task
+payload (3-5 bullets covering what changed, what verified it, surprises,
+and one watch-out for next time). The summary is best-effort: a
+summarizer failure logs but never blocks task completion. Reflection
+that turns these summaries back into new tasks is not yet wired up.
 
 Resident mode is for visibility and long-lived agent context. With
 `--resident-agents`, the visible Codex and Claude panes are real interactive
