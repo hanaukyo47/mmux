@@ -45,7 +45,11 @@ from mmux.cli import (
     module_command,
     parse_resident_protocol_line,
     parse_planner_decision,
+    parse_reflection_tasks,
     parse_reviewer_decision,
+    perform_reflection,
+    evidence_is_concrete,
+    recent_completions_with_summary,
     parse_tmux_version,
     process_resident_protocol_events,
     read_agent_brief,
@@ -1825,6 +1829,154 @@ exit 1
 
         decision, message = parse_planner_decision("MMUX_PLAN WHATEVER")
         self.assertEqual(decision, "invalid")
+
+    def test_parse_reflection_tasks_extracts_quoted_fields(self) -> None:
+        text = "\n".join(
+            [
+                "preamble",
+                'MMUX_REFLECT_TASK title="add empty-string test" resource="tests/test_todo_core.py" evidence="task #1"',
+                'MMUX_REFLECT_TASK resource="src" evidence="no title here"',
+                'MMUX_REFLECT_TASK title="vague proposal" resource="." evidence=""',
+                "MMUX_REFLECT END",
+            ]
+        )
+        proposals = parse_reflection_tasks(text)
+        self.assertEqual(len(proposals), 2)
+        self.assertEqual(proposals[0].title, "add empty-string test")
+        self.assertEqual(proposals[0].resource, "tests/test_todo_core.py")
+        self.assertEqual(proposals[0].evidence, "task #1")
+        self.assertEqual(proposals[1].title, "vague proposal")
+        self.assertEqual(proposals[1].evidence, "")
+
+    def test_evidence_is_concrete_for_task_reference_and_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "src").mkdir()
+            (project / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
+            self.assertTrue(evidence_is_concrete(project, "task #7"))
+            self.assertTrue(evidence_is_concrete(project, "see src/app.py:3"))
+            self.assertFalse(evidence_is_concrete(project, "vibes"))
+            self.assertFalse(evidence_is_concrete(project, "src/missing.py"))
+            self.assertFalse(evidence_is_concrete(project, "../../etc/passwd"))
+
+    def test_recent_completions_with_summary_returns_only_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            with cli.database(project) as db:
+                cli.apply_schema(db)
+                db.execute(
+                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
+                    ("with summary", "completed", cli.encode_payload({"resource": "src", "act_summary": "did the thing"}), "now", "now"),
+                )
+                db.execute(
+                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
+                    ("no summary", "completed", cli.encode_payload({"resource": "src"}), "now", "now"),
+                )
+                db.execute(
+                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
+                    ("not done", "pending", cli.encode_payload({"resource": "src", "act_summary": "shouldn't count"}), "now", "now"),
+                )
+            completions = recent_completions_with_summary(project, limit=10)
+            self.assertEqual([entry["title"] for entry in completions], ["with summary"])
+            self.assertEqual(completions[0]["act_summary"], "did the thing")
+
+    def test_perform_reflection_auto_promotes_evidence_and_proposes_vague_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            with cli.database(project) as db:
+                cli.apply_schema(db)
+                db.execute(
+                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
+                    (
+                        "Resolve TODO in src/app.py",
+                        "completed",
+                        cli.encode_payload({"resource": "src", "act_summary": "trimmed whitespace; no empty-string test"}),
+                        "now",
+                        "now",
+                    ),
+                )
+
+            def fake_reflection(_project, _agent, _completions, **_kwargs):
+                proposals = (
+                    cli.ReflectionProposal("add empty-string test", "tests/", "task #1"),
+                    cli.ReflectionProposal("audit overall vibes", ".", ""),
+                )
+                return cli.ReflectionResult(proposals, ".mmux/runs/fake-reflect.log", "ok", True)
+
+            original = cli.invoke_reflection_adapter
+            cli.invoke_reflection_adapter = fake_reflection
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    outcome = perform_reflection(project, "claude")
+            finally:
+                cli.invoke_reflection_adapter = original
+
+            self.assertTrue(outcome.adapter_ok)
+            self.assertEqual(len(outcome.promoted_ids), 1)
+            self.assertEqual(len(outcome.proposed_ids), 1)
+            tasks_by_id = {task.id: task for task in list_tasks(project)}
+            promoted = tasks_by_id[outcome.promoted_ids[0]]
+            self.assertEqual(promoted.status, "pending")
+            self.assertEqual(promoted.payload["kind"], "reflection")
+            self.assertTrue(promoted.payload["reflection_auto_promoted"])
+            self.assertEqual(promoted.payload["reflection_evidence"], "task #1")
+            proposed_task = tasks_by_id[outcome.proposed_ids[0]]
+            self.assertEqual(proposed_task.status, "proposed")
+            self.assertFalse(proposed_task.payload["reflection_auto_promoted"])
+
+    def test_perform_reflection_handles_no_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            calls = []
+
+            def fake_reflection(*_args, **_kwargs):
+                calls.append(True)
+                return cli.ReflectionResult((), "", "should-not-run", True)
+
+            original = cli.invoke_reflection_adapter
+            cli.invoke_reflection_adapter = fake_reflection
+            try:
+                outcome = perform_reflection(project, "claude")
+            finally:
+                cli.invoke_reflection_adapter = original
+
+            self.assertTrue(outcome.adapter_ok)
+            self.assertEqual(outcome.source_task_ids, ())
+            self.assertEqual(outcome.promoted_ids, ())
+            self.assertEqual(outcome.proposed_ids, ())
+            self.assertEqual(calls, [], "reflection adapter must not run when there are no summaries")
+
+    def test_requeue_promotes_proposed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            with cli.database(project) as db:
+                cli.apply_schema(db)
+                cursor = db.execute(
+                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
+                    (
+                        "vague reflection proposal",
+                        "proposed",
+                        cli.encode_payload({"resource": ".", "kind": "reflection"}),
+                        "now",
+                        "now",
+                    ),
+                )
+                task_id = int(cursor.lastrowid)
+            outcome = cli.requeue_task(project, task_id, reason="human approves the proposal")
+            self.assertTrue(outcome.ok)
+            self.assertEqual(outcome.from_status, "proposed")
+            self.assertEqual(outcome.to_status, "pending")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "pending")
+            self.assertEqual(tasks[-1].payload["requeued_from"], "proposed")
 
     def test_execute_reviewer_task_approves_patch_for_tester(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

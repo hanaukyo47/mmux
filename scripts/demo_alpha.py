@@ -219,6 +219,44 @@ def main() -> int:
                 print("act_summary recorded in task payload:")
                 for line in str(task.payload["act_summary"]).splitlines():
                     print(f"  {line}")
+
+            original_reflection = cli.invoke_reflection_adapter
+
+            def fake_reflection(_project, _agent, _completions, **_kwargs):
+                proposals = (
+                    cli.ReflectionProposal(
+                        title="add empty-string unit test",
+                        resource="tests/test_todo_core.py",
+                        evidence="task #1",
+                    ),
+                    cli.ReflectionProposal(
+                        title="audit normalize_title for unicode",
+                        resource=".",
+                        evidence="",
+                    ),
+                )
+                return cli.ReflectionResult(proposals, ".mmux/runs/demo-reflect.log", "ok", True)
+
+            cli.invoke_reflection_adapter = fake_reflection
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    reflection = cli.perform_reflection(project, "claude")
+            finally:
+                cli.invoke_reflection_adapter = original_reflection
+
+            print()
+            print("reflection over completed tasks:")
+            print(f"  sources:  {[f'#{tid}' for tid in reflection.source_task_ids]}")
+            print(f"  promoted: {[f'#{tid}' for tid in reflection.promoted_ids]}  (evidence cited)")
+            print(f"  proposed: {[f'#{tid}' for tid in reflection.proposed_ids]}  (need human review)")
+
+            for tid in (*reflection.promoted_ids, *reflection.proposed_ids):
+                proposal_task = cli.get_task(project, tid)
+                if proposal_task is None:
+                    continue
+                print(f"  task #{tid} [{proposal_task.status}]: {proposal_task.title}")
+                evidence = proposal_task.payload.get("reflection_evidence") or "<none>"
+                print(f"           evidence: {evidence}")
         finally:
             cli.invoke_agent_adapter = original_driver
             cli.invoke_reviewer_adapter = original_reviewer

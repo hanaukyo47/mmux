@@ -83,7 +83,14 @@ This repository starts as the control-plane skeleton:
   request changes, or be bypassed on invalid output without blocking the run.
 - `mmux status` prints deterministic state from `.mmux/state.db`.
 - `mmux tasks` prints the deterministic task queue.
-- `mmux task requeue #N` moves a blocked or failed task back to `pending`.
+- `mmux task requeue #N` moves a blocked, failed, rejected, no_change, or
+  proposed task back to `pending` (use this to promote a reflection
+  proposal a human wants to approve).
+- `mmux reflect` runs an LLM reflector over recent completed tasks'
+  `act_summary` fields, proposes 0-5 follow-up tasks, and either
+  auto-promotes them to `pending` (when evidence cites a task `#N` or a
+  real file path) or leaves them as `proposed` for human review. This
+  is the Act->Plan feedback edge.
 - `mmux roles` prints role leases and worker heartbeats.
 - `mmux locks` prints resource locks.
 - `mmux lease acquire/release` exercises deterministic role leasing.

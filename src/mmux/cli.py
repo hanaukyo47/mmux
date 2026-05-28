@@ -26,7 +26,10 @@ RESIDENT_MESSAGE_KINDS = ("task", "review", "note")
 RESIDENT_PANE_INDEXES = {"codex": "1", "claude": "3"}
 RESIDENT_BLOCKED_ESCALATION_EVENTS = 2
 PLAN_REVIEW_ESCALATION_ATTEMPTS = 2
-REQUEUEABLE_TASK_STATUSES = ("blocked", "failed", "rejected", "no_change")
+REQUEUEABLE_TASK_STATUSES = ("blocked", "failed", "rejected", "no_change", "proposed")
+REFLECTION_RECENT_LIMIT = 10
+REFLECTION_MAX_PROPOSALS = 5
+REFLECTION_TIMEOUT_SECONDS = 5 * 60
 ROLE_LEASE_TTL_SECONDS = 2 * 60
 RESOURCE_LOCK_TTL_SECONDS = 10 * 60
 WORKER_REFRESH_SECONDS = 5
@@ -138,6 +141,31 @@ class PlanResult:
 @dataclass(frozen=True)
 class ActSummaryResult:
     summary: str
+    log_file: str
+    message: str
+    adapter_ok: bool
+
+
+@dataclass(frozen=True)
+class ReflectionProposal:
+    title: str
+    resource: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class ReflectionResult:
+    proposals: tuple[ReflectionProposal, ...]
+    log_file: str
+    message: str
+    adapter_ok: bool
+
+
+@dataclass(frozen=True)
+class ReflectionOutcome:
+    promoted_ids: tuple[int, ...]
+    proposed_ids: tuple[int, ...]
+    source_task_ids: tuple[int, ...]
     log_file: str
     message: str
     adapter_ok: bool
@@ -2397,6 +2425,256 @@ def build_agent_prompt(
     return "\n".join(lines)
 
 
+def build_reflection_prompt(agent: str, completions: list[dict[str, object]]) -> str:
+    if not completions:
+        body = "<no recent completions>"
+    else:
+        chunks = []
+        for entry in completions:
+            chunks.append(f"[task #{entry['id']}] title: {entry['title']}")
+            chunks.append(f"resource: {entry.get('resource', '.')}")
+            chunks.append("act_summary:")
+            summary = str(entry.get("act_summary") or "").strip() or "<no summary recorded>"
+            chunks.append(summary)
+            chunks.append("")
+        body = "\n".join(chunks).rstrip()
+    return "\n".join(
+        [
+            f"You are the {agent} reflector running under mmux.",
+            "",
+            "Below are act_summaries from the last completed tasks. Each summary already noted what was done, what verified it, surprises, and a watch-out.",
+            "",
+            "Read across them and propose follow-up tasks. Look for:",
+            "- watch-outs the same kind of code keeps producing",
+            "- gaps in verification (no tests added, baseline failures left in place)",
+            "- recurring scope drift, under-reading, or repeated blocked outcomes",
+            "",
+            "Each proposed task must:",
+            "- be concrete and small enough for a single driver claim",
+            "- cite at least one piece of evidence (a file path under this project, a task #N, or a verbatim phrase from a summary above)",
+            "",
+            "Output exactly one line per proposed task using this format:",
+            'MMUX_REFLECT_TASK title="<short title>" resource="<path under project, or .>" evidence="<file path or task #N or quoted phrase>"',
+            "",
+            f"Output at most {REFLECTION_MAX_PROPOSALS} lines. If nothing useful jumps out, output zero MMUX_REFLECT_TASK lines.",
+            "Finish with exactly one final line:",
+            "MMUX_REFLECT END",
+            "",
+            "--- recent completions ---",
+            body,
+            "--- end recent completions ---",
+        ]
+    )
+
+
+_REFLECT_FIELD_RE = re.compile(r'(title|resource|evidence)\s*=\s*"([^"]*)"', re.IGNORECASE)
+
+
+def parse_reflection_tasks(text: str) -> list[ReflectionProposal]:
+    proposals: list[ReflectionProposal] = []
+    for line in text.splitlines():
+        stripped = line.strip().strip("`").strip()
+        if not stripped.upper().startswith("MMUX_REFLECT_TASK"):
+            continue
+        fields: dict[str, str] = {"title": "", "resource": ".", "evidence": ""}
+        for match in _REFLECT_FIELD_RE.finditer(stripped):
+            fields[match.group(1).lower()] = match.group(2).strip()
+        if not fields["title"]:
+            continue
+        proposals.append(
+            ReflectionProposal(
+                title=fields["title"],
+                resource=fields["resource"] or ".",
+                evidence=fields["evidence"],
+            )
+        )
+        if len(proposals) >= REFLECTION_MAX_PROPOSALS:
+            break
+    return proposals
+
+
+def evidence_is_concrete(project: Path, evidence: str) -> bool:
+    text = evidence.strip()
+    if not text:
+        return False
+    if re.search(r"task\s*#?\s*\d+", text, re.IGNORECASE):
+        return True
+    for token in re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+", text):
+        candidate = (project / token).resolve()
+        try:
+            project_resolved = project.resolve()
+            candidate.relative_to(project_resolved)
+        except ValueError:
+            continue
+        if candidate.exists():
+            return True
+    return False
+
+
+def recent_completions_with_summary(project: Path, limit: int = REFLECTION_RECENT_LIMIT) -> list[dict[str, object]]:
+    completions: list[dict[str, object]] = []
+    with database(project) as db:
+        apply_schema(db)
+        rows = db.execute(
+            """
+            select id, title, payload
+            from tasks
+            where status = 'completed'
+            order by id desc
+            limit ?
+            """,
+            (limit,),
+        ).fetchall()
+    for row in rows:
+        payload = decode_payload(str(row[2]))
+        summary = str(payload.get("act_summary") or "").strip()
+        if not summary:
+            continue
+        completions.append(
+            {
+                "id": int(row[0]),
+                "title": str(row[1]),
+                "resource": str(payload.get("resource") or "."),
+                "act_summary": summary,
+            }
+        )
+    return completions
+
+
+def invoke_reflection_adapter(
+    project: Path,
+    agent: str,
+    completions: list[dict[str, object]],
+    *,
+    timeout_seconds: int = REFLECTION_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> ReflectionResult:
+    prompt = build_reflection_prompt(agent, completions)
+    log_file = run_log_path(project, f"{agent}-reflect", 0)
+    output_file = log_file.with_suffix(".last-message.txt")
+    cmd = build_agent_command(agent, project, prompt, output_file)
+    result = stream_agent_command(
+        project,
+        cmd,
+        log_file,
+        timeout_seconds=timeout_seconds,
+        no_output_timeout_seconds=no_output_timeout_seconds,
+    )
+    output_text = ""
+    if output_file.exists():
+        output_text = output_file.read_text(encoding="utf-8", errors="replace")
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("\n--- last message ---\n")
+            handle.write(output_text)
+            handle.write("\n")
+    if not output_text:
+        output_text = log_file.read_text(encoding="utf-8", errors="replace")
+    relative_log = relative_to_project(project, log_file)
+    if not result.ok:
+        return ReflectionResult((), relative_log, result.message, False)
+    proposals = tuple(parse_reflection_tasks(output_text))
+    return ReflectionResult(proposals, relative_log, result.message, True)
+
+
+def enqueue_proposal(
+    project: Path,
+    proposal: ReflectionProposal,
+    source_task_ids: list[int],
+    *,
+    auto_promote: bool,
+) -> tuple[int, str]:
+    normalized_resource = normalize_resource(project, proposal.resource)
+    status = "pending" if auto_promote else "proposed"
+    now = utc_now()
+    payload = {
+        "resource": normalized_resource,
+        "kind": "reflection",
+        "source": "reflect",
+        "reflection_evidence": proposal.evidence,
+        "reflection_from_tasks": list(source_task_ids),
+        "reflection_proposed_at": now,
+        "reflection_auto_promoted": auto_promote,
+    }
+    with database(project) as db:
+        apply_schema(db)
+        cursor = db.execute(
+            """
+            insert into tasks(title, status, payload, created_at, updated_at)
+            values (?, ?, ?, ?, ?)
+            """,
+            (proposal.title, status, encode_payload(payload), now, now),
+        )
+        task_id = int(cursor.lastrowid)
+        record_event(
+            db,
+            "task_added",
+            {
+                "id": task_id,
+                "title": proposal.title,
+                "resource": normalized_resource,
+                "kind": "reflection",
+                "status": status,
+                "auto_promoted": auto_promote,
+                "evidence": proposal.evidence,
+            },
+        )
+    return task_id, status
+
+
+def perform_reflection(
+    project: Path,
+    agent: str,
+    *,
+    limit: int = REFLECTION_RECENT_LIMIT,
+    timeout_seconds: int = REFLECTION_TIMEOUT_SECONDS,
+) -> ReflectionOutcome:
+    completions = recent_completions_with_summary(project, limit=limit)
+    if not completions:
+        return ReflectionOutcome(
+            promoted_ids=(),
+            proposed_ids=(),
+            source_task_ids=(),
+            log_file="",
+            message="no completed tasks with act_summary; nothing to reflect on",
+            adapter_ok=True,
+        )
+
+    reflection = invoke_reflection_adapter(
+        project,
+        agent,
+        completions,
+        timeout_seconds=timeout_seconds,
+    )
+    if not reflection.adapter_ok:
+        return ReflectionOutcome(
+            promoted_ids=(),
+            proposed_ids=(),
+            source_task_ids=tuple(int(item["id"]) for item in completions),
+            log_file=reflection.log_file,
+            message=reflection.message,
+            adapter_ok=False,
+        )
+
+    source_ids = [int(item["id"]) for item in completions]
+    promoted: list[int] = []
+    proposed: list[int] = []
+    for proposal in reflection.proposals:
+        auto = evidence_is_concrete(project, proposal.evidence)
+        task_id, status = enqueue_proposal(project, proposal, source_ids, auto_promote=auto)
+        if status == "pending":
+            promoted.append(task_id)
+        else:
+            proposed.append(task_id)
+    return ReflectionOutcome(
+        promoted_ids=tuple(promoted),
+        proposed_ids=tuple(proposed),
+        source_task_ids=tuple(source_ids),
+        log_file=reflection.log_file,
+        message=reflection.message,
+        adapter_ok=True,
+    )
+
+
 def build_summarizer_prompt(agent: str, task: TaskRecord, context: dict[str, object]) -> str:
     plan_text = str(context.get("plan_text") or "").strip() or "<no plan recorded>"
     changed_files_raw = context.get("changed_files") or []
@@ -3816,6 +4094,32 @@ def cmd_task_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reflect(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_existing_schema(project)
+    outcome = perform_reflection(
+        project,
+        args.agent,
+        limit=args.limit,
+        timeout_seconds=args.timeout,
+    )
+    if outcome.message:
+        print(outcome.message)
+    if not outcome.adapter_ok:
+        print(f"reflection adapter failed (log: {outcome.log_file})")
+        return 2
+    if not outcome.source_task_ids:
+        return 0
+    print(f"reflected over {len(outcome.source_task_ids)} completed task(s); log: {outcome.log_file}")
+    if outcome.promoted_ids:
+        print(f"promoted to pending: {[f'#{tid}' for tid in outcome.promoted_ids]}")
+    if outcome.proposed_ids:
+        print(f"left as proposed (need evidence or human review): {[f'#{tid}' for tid in outcome.proposed_ids]}")
+    if not outcome.promoted_ids and not outcome.proposed_ids:
+        print("reflector found nothing actionable")
+    return 0
+
+
 def cmd_task_requeue(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     ensure_existing_schema(project)
@@ -5192,11 +5496,24 @@ def build_parser() -> argparse.ArgumentParser:
     task_add.add_argument("--project", default=".")
     task_add.set_defaults(func=cmd_task_add)
 
-    task_requeue = task_subparsers.add_parser("requeue", help="move a blocked or failed task back to pending")
+    task_requeue = task_subparsers.add_parser(
+        "requeue",
+        help="move a blocked, failed, rejected, no_change, or proposed task back to pending",
+    )
     task_requeue.add_argument("task_id", type=positive_task_id)
     task_requeue.add_argument("--reason", default="manual requeue")
     task_requeue.add_argument("--project", default=".")
     task_requeue.set_defaults(func=cmd_task_requeue)
+
+    reflect = subparsers.add_parser(
+        "reflect",
+        help="run the LLM reflector over recent completed tasks and enqueue follow-up proposals",
+    )
+    reflect.add_argument("--project", default=".")
+    reflect.add_argument("--agent", default="claude", choices=["codex", "claude"], help="agent CLI to invoke")
+    reflect.add_argument("--limit", type=int, default=REFLECTION_RECENT_LIMIT, help="number of recent completions to read")
+    reflect.add_argument("--timeout", type=int, default=REFLECTION_TIMEOUT_SECONDS, help="adapter timeout in seconds")
+    reflect.set_defaults(func=cmd_reflect)
 
     roles = subparsers.add_parser("roles", help="show role leases and worker heartbeats")
     roles.add_argument("project", nargs="?", default=".")
