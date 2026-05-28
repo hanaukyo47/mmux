@@ -66,7 +66,53 @@ def main() -> int:
         task_id = cli.enqueue_task(project, "Resolve TODO in src/todo_core.py", resource="src")
         original_driver = cli.invoke_agent_adapter
         original_reviewer = cli.invoke_reviewer_adapter
+        original_planner = cli.invoke_planner_adapter
+        original_plan_reviewer = cli.invoke_plan_reviewer_adapter
+        original_summarizer = cli.invoke_summarizer_adapter
         driver_attempts = 0
+        plan_attempts = 0
+        plan_text_seen: list[str] = []
+        plan_review_decisions: list[str] = []
+        summaries_seen: list[str] = []
+
+        def fake_planner(_project, _worktree, _agent, _task, _generation, _resource, **_kwargs):
+            nonlocal plan_attempts
+            plan_attempts += 1
+            plan = (
+                "READ:\n"
+                "- src/todo_core.py\n"
+                "- tests/test_todo_core.py\n"
+                "PLAN:\n"
+                "- trim whitespace in normalize_title\n"
+                "- reject empty titles after trim\n"
+                "RISKS:\n"
+                "- none (resource locked to src/)\n"
+                "MMUX_PLAN PROCEED"
+            )
+            return cli.PlanResult("proceed", ".mmux/runs/demo-plan.log", plan, "", True)
+
+        def fake_plan_reviewer(_project, _worktree, _agent, _task, _generation, _resource, plan_text, **_kwargs):
+            plan_text_seen.append(plan_text)
+            decision = "approve" if "reject empty" in plan_text else "request_changes"
+            plan_review_decisions.append(decision)
+            if decision == "approve":
+                return cli.ReviewResult("approve", ".mmux/runs/demo-plan-review.log", "plan ok", True)
+            return cli.ReviewResult(
+                "request_changes",
+                ".mmux/runs/demo-plan-review.log",
+                "missing rejection of empty titles",
+                True,
+            )
+
+        def fake_summarizer(_project, _worktree, _agent, _task, context, **_kwargs):
+            summary = (
+                "- normalize_title now trims whitespace and rejects empty titles\n"
+                "- existing unittest still passes; no new tests added\n"
+                "- reviewer caught the missing empty-title check on first attempt\n"
+                "- next time: include an empty-string test in the plan"
+            )
+            summaries_seen.append(summary)
+            return cli.ActSummaryResult(summary, ".mmux/runs/demo-summary.log", "ok", True)
 
         def fake_driver(_project, execution_root, _agent, _task, _generation, _resource, **_kwargs):
             nonlocal driver_attempts
@@ -119,8 +165,11 @@ def main() -> int:
 
         cli.invoke_agent_adapter = fake_driver
         cli.invoke_reviewer_adapter = fake_reviewer
+        cli.invoke_planner_adapter = fake_planner
+        cli.invoke_plan_reviewer_adapter = fake_plan_reviewer
+        cli.invoke_summarizer_adapter = fake_summarizer
         try:
-            print("mmux alpha deterministic loop demo")
+            print("mmux alpha deterministic loop demo (PDCA pipeline)")
             print("project: <temporary demo repository>")
             print(f"task: #{task_id} Resolve TODO in src/todo_core.py")
             print()
@@ -129,41 +178,53 @@ def main() -> int:
             with contextlib.redirect_stdout(io.StringIO()):
                 cli.execute_driver_task(project, "codex", driver.generation)
             task = cli.get_task(project, task_id)
-            print(f"driver   codex  -> {task.status if task else 'missing'}  (trim-only diff)")
+            print(f"plan + plan-review + drive  codex  -> {task.status if task else 'missing'}  (trim-only diff)")
+            if plan_review_decisions:
+                print(f"                                    plan_review_decisions={plan_review_decisions}")
 
             reviewer = cli.acquire_role(project, "reviewer", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
                 cli.execute_reviewer_task(project, "claude", reviewer.generation)
             task = cli.get_task(project, task_id)
-            print(f"reviewer claude -> {task.status if task else 'missing'}  (request changes)")
-            print("                  reason: empty titles still accepted")
+            print(f"reviewer                    claude -> {task.status if task else 'missing'}  (request changes)")
+            print("                                    reason: empty titles still accepted")
 
             driver = cli.acquire_role(project, "driver", "codex", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
                 cli.execute_driver_task(project, "codex", driver.generation)
             task = cli.get_task(project, task_id)
-            print(f"driver   codex  -> {task.status if task else 'missing'}  (reject blank titles)")
+            print(f"plan + plan-review + drive  codex  -> {task.status if task else 'missing'}  (reject blank titles)")
 
             reviewer = cli.acquire_role(project, "reviewer", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
                 cli.execute_reviewer_task(project, "claude", reviewer.generation)
             task = cli.get_task(project, task_id)
-            print(f"reviewer claude -> {task.status if task else 'missing'}  (approve)")
+            print(f"reviewer                    claude -> {task.status if task else 'missing'}  (approve)")
 
             tester = cli.acquire_role(project, "tester", "claude", ttl_seconds=60)
             with contextlib.redirect_stdout(io.StringIO()):
                 cli.execute_tester_task(project, "claude", tester.generation)
             task = cli.get_task(project, task_id)
-            print(f"tester   claude -> {task.status if task else 'missing'}  (tests passed, patch applied)")
+            print(f"tester + summarize          claude -> {task.status if task else 'missing'}  (tests passed, patch applied, act_summary captured)")
 
             final_source = (project / "src" / "todo_core.py").read_text(encoding="utf-8")
             print()
-            print(f"final task status: {task.status if task else 'missing'}")
-            print("main worktree src/todo_core.py: rejects blank titles")
-            print(f"contains ValueError: {'ValueError' in final_source}")
+            print(f"final task status:           {task.status if task else 'missing'}")
+            print(f"plan_attempts:               {plan_attempts}")
+            print(f"plan_review_decisions:       {plan_review_decisions}")
+            print(f"driver_attempts:             {driver_attempts}")
+            print(f"contains ValueError:         {'ValueError' in final_source}")
+            if task and task.payload.get("act_summary"):
+                print()
+                print("act_summary recorded in task payload:")
+                for line in str(task.payload["act_summary"]).splitlines():
+                    print(f"  {line}")
         finally:
             cli.invoke_agent_adapter = original_driver
             cli.invoke_reviewer_adapter = original_reviewer
+            cli.invoke_planner_adapter = original_planner
+            cli.invoke_plan_reviewer_adapter = original_plan_reviewer
+            cli.invoke_summarizer_adapter = original_summarizer
 
     return 0
 
