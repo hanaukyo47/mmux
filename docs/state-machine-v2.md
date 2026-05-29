@@ -248,5 +248,10 @@ mapped from their legacy status when the schema is opened.
 
 - The exact JSON shape of the Plan adapter's `read` / `plan` / `risks`
   contract may still tighten.
-- `scout` currently proposes deterministic frontier work; it does not yet call
-  a model to discover research-style tasks.
+- `scout` now calls a model to discover research-style tasks from the project
+  profile and file tree, falling back to deterministic frontier work when the
+  model is unavailable or proposes nothing. Its proposals flow through the same
+  `kind=reflection` admission gate as the Act → Plan edge (concrete evidence
+  auto-promotes; vague ones wait as `proposed`). What is still open: scout does
+  not yet **cache research notes across tasks**, which is the precondition (noted
+  above) for promoting research to a peer stage.

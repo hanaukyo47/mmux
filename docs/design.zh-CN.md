@@ -251,6 +251,7 @@ tmux 用于观察和人工接管。数据库仍然是事实源。
 当前实现已经支持受控任务执行，但还不是完整无人值守系统。仍需补齐：
 
 - 可配置 tester 命令。
-- worktree 清理和归档策略。
 - commit/checkpoint/rollback 策略。
 - 自动提交和远端协作策略。
+
+终态任务现在会把 diff 归档到 `.mmux/archive/` 并自动删除其 worktree；停止运行时会清理不再属于待 review/待 test 工作的 worktree。设置 `MMUX_KEEP_WORKTREES=1` 可保留 worktree 用于调试。

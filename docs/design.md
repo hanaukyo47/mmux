@@ -362,6 +362,9 @@ The current implementation supports controlled task execution, but it is not a
 complete unattended system yet. Remaining work:
 
 - User-configurable tester commands.
-- Worktree cleanup and archival policy.
 - Commit, checkpoint, and rollback policy.
 - Automatic commit and remote collaboration policy.
+
+Terminal tasks now archive their diff to `.mmux/archive/` and remove their
+worktrees automatically; stopping a run prunes worktrees no longer tied to work
+awaiting review or test. Set `MMUX_KEEP_WORKTREES=1` to keep them for debugging.

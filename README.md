@@ -276,8 +276,16 @@ mmux stop /path/to/project
   cooldown, so another agent can take the next driver lease.
 - Stopping a run clears in-progress Plan/Do/Check claims and returns them to
   their waiting stage.
+- A task that reaches a terminal outcome archives its diff to `.mmux/archive/`
+  and removes its worktree; stopping a run prunes worktrees no longer tied to
+  work awaiting review or test. `MMUX_KEEP_WORKTREES=1` keeps them for debugging.
 - Time windows drive the loop; round counts are only internal diagnostics.
-- Queue replenishment prefers Act->Plan reflection, then deterministic frontier
+- When the queue is empty, the `scout` role asks a model to discover
+  research-style tasks from the project profile and file tree; its proposals go
+  through the same reflection admission gate (concrete evidence auto-promotes,
+  vague ones wait as `proposed`), and it falls back to deterministic frontier
+  candidates when the model is unavailable or proposes nothing.
+- Queue replenishment prefers Act->Plan reflection, then scout/frontier
   candidates, then generic default tasks.
 - tmux is the observation layer, not the source of truth.
 

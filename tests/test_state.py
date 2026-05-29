@@ -370,7 +370,7 @@ class StateTests(unittest.TestCase):
 
             self.assertEqual(supervisor_role_plan_for_project(project, now), (("summarizer", "codex"), ("scout", "claude")))
 
-    def test_worker_scout_role_adds_frontier_task(self) -> None:
+    def test_worker_scout_role_falls_back_to_frontier_when_model_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             init_git_project(project)
@@ -378,16 +378,24 @@ class StateTests(unittest.TestCase):
             ensure_layout(project)
             scout = acquire_role(project, "scout", "codex", ttl_seconds=60)
 
-            message = execute_worker_available_task(
-                project,
-                "codex",
-                [("scout", scout.generation, scout.lease_until)],
-                run_deadline="",
-                agent_timeout_seconds=60,
-                agent_no_output_seconds=30,
-                test_timeout_seconds=60,
-                shutdown_grace_seconds=15,
-            )
+            def unavailable(_project, _agent, _profile, _files, **_kwargs):
+                return cli.ReflectionResult((), ".mmux/runs/fake-scout.log", "model unavailable", False)
+
+            original = cli.invoke_scout_adapter
+            cli.invoke_scout_adapter = unavailable
+            try:
+                message = execute_worker_available_task(
+                    project,
+                    "codex",
+                    [("scout", scout.generation, scout.lease_until)],
+                    run_deadline="",
+                    agent_timeout_seconds=60,
+                    agent_no_output_seconds=30,
+                    test_timeout_seconds=60,
+                    shutdown_grace_seconds=15,
+                )
+            finally:
+                cli.invoke_scout_adapter = original
 
             self.assertIsNotNone(message)
             assert message is not None
@@ -395,6 +403,84 @@ class StateTests(unittest.TestCase):
             tasks = list_tasks(project)
             self.assertEqual(len(tasks), 1)
             self.assertIn("Resolve TODO", tasks[0].title)
+
+    def test_scout_model_promotes_proposal_with_concrete_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            scout = acquire_role(project, "scout", "codex", ttl_seconds=60)
+
+            def proposes(_project, _agent, _profile, _files, **_kwargs):
+                proposal = cli.ReflectionProposal(
+                    title="Add tests for app.py",
+                    resource="src",
+                    evidence="src/app.py",
+                )
+                return cli.ReflectionResult((proposal,), ".mmux/runs/fake-scout.log", "ok", True)
+
+            original = cli.invoke_scout_adapter
+            cli.invoke_scout_adapter = proposes
+            try:
+                message = execute_worker_available_task(
+                    project,
+                    "codex",
+                    [("scout", scout.generation, scout.lease_until)],
+                    run_deadline="",
+                    agent_timeout_seconds=60,
+                    agent_no_output_seconds=30,
+                    test_timeout_seconds=60,
+                    shutdown_grace_seconds=15,
+                )
+            finally:
+                cli.invoke_scout_adapter = original
+
+            self.assertIsNotNone(message)
+            assert message is not None
+            self.assertIn("scout proposed 1 task", message)
+            tasks = list_tasks(project)
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].status, "pending")
+            self.assertEqual(tasks[0].payload["kind"], "reflection")
+            self.assertEqual(tasks[0].payload["source"], "scout")
+
+    def test_scout_model_holds_vague_proposal_as_proposed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            scout = acquire_role(project, "scout", "codex", ttl_seconds=60)
+
+            def proposes(_project, _agent, _profile, _files, **_kwargs):
+                proposal = cli.ReflectionProposal(
+                    title="Improve the whole codebase",
+                    resource=".",
+                    evidence="general cleanup",
+                )
+                return cli.ReflectionResult((proposal,), ".mmux/runs/fake-scout.log", "ok", True)
+
+            original = cli.invoke_scout_adapter
+            cli.invoke_scout_adapter = proposes
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_worker_available_task(
+                        project,
+                        "codex",
+                        [("scout", scout.generation, scout.lease_until)],
+                        run_deadline="",
+                        agent_timeout_seconds=60,
+                        agent_no_output_seconds=30,
+                        test_timeout_seconds=60,
+                        shutdown_grace_seconds=15,
+                    )
+            finally:
+                cli.invoke_scout_adapter = original
+
+            self.assertIsNotNone(message)
+            tasks = list_tasks(project)
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].status, "proposed")
+            self.assertEqual(tasks[0].payload["source"], "scout")
 
     def test_worker_summarizer_role_backfills_missing_act_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1569,6 +1655,65 @@ exit 1
 
             self.assertTrue((worktree / "src" / "app.py").exists())
             self.assertEqual((worktree / "src" / "app.py").read_text(encoding="utf-8"), "value = 1\n")
+
+    def test_finish_task_removes_and_archives_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task = claim_driver_task(project, resource="src")
+            worktree = create_task_worktree(project, task, "codex")
+            (worktree / "src" / "app.py").write_text("value = 99\n", encoding="utf-8")
+            rel = cli.relative_to_project(project, worktree)
+
+            cli.finish_task(project, task.id, "completed", payload_updates={"worktree": rel})
+
+            self.assertFalse(worktree.exists())
+            archives = list(cli.archive_root(project).glob(f"task-{task.id}-*.patch"))
+            self.assertEqual(len(archives), 1)
+            self.assertIn("value = 99", archives[0].read_text(encoding="utf-8"))
+
+    def test_prune_orphan_worktrees_keeps_pipeline_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            keep_task = claim_driver_task(project, resource="src")
+            keep_wt = create_task_worktree(project, keep_task, "codex")
+            set_task_status_for_test(
+                project,
+                keep_task.id,
+                "awaiting_test",
+                payload={"worktree": cli.relative_to_project(project, keep_wt)},
+            )
+            orphan = cli.worktree_root(project) / "task-999-codex-gen0-1-stamp"
+            cli.run(["git", "worktree", "add", "--detach", str(orphan), "HEAD"], cwd=project)
+
+            removed = cli.prune_orphan_worktrees(project)
+
+            self.assertEqual(removed, 1)
+            self.assertTrue(keep_wt.exists())
+            self.assertFalse(orphan.exists())
+
+    def test_keep_worktrees_env_preserves_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task = claim_driver_task(project, resource="src")
+            worktree = create_task_worktree(project, task, "codex")
+            rel = cli.relative_to_project(project, worktree)
+            previous = os.environ.get("MMUX_KEEP_WORKTREES")
+            os.environ["MMUX_KEEP_WORKTREES"] = "1"
+            try:
+                cli.finish_task(project, task.id, "completed", payload_updates={"worktree": rel})
+            finally:
+                if previous is None:
+                    os.environ.pop("MMUX_KEEP_WORKTREES", None)
+                else:
+                    os.environ["MMUX_KEEP_WORKTREES"] = previous
+
+            self.assertTrue(worktree.exists())
 
     def test_diff_policy_accepts_changes_inside_resource(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
