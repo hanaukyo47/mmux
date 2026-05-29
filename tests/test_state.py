@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 
 import mmux.cli as cli
 from mmux.cli import (
@@ -41,6 +42,7 @@ from mmux.cli import (
     list_worker_heartbeats,
     mark_agent_cooldown,
     maybe_replenish_default_task,
+    maybe_replenish_reflection_task,
     MIN_EXECUTION_BUDGET_SECONDS,
     module_command,
     parse_resident_protocol_line,
@@ -96,6 +98,57 @@ def claim_driver_task(project: Path, *, resource: str = "."):
     task = claim_next_task(project, "codex", "driver", lease.generation)
     assert task is not None
     return task
+
+
+def set_task_status_for_test(
+    project: Path,
+    task_id: int,
+    status: str,
+    *,
+    payload: Optional[dict[str, object]] = None,
+    claimed_by: str = "",
+    claimed_role: str = "",
+    claimed_generation: int = 0,
+) -> None:
+    state = cli.task_state_for_status(status)
+    with database(project) as db:
+        cli.set_task_state_db(
+            db,
+            task_id,
+            stage=str(state["stage"]),
+            outcome=str(state["outcome"]),
+            in_progress=bool(state["in_progress"]),
+            check_step=str(state["check_step"]),
+            payload=payload,
+            claimed_by=claimed_by,
+            claimed_role=claimed_role,
+            claimed_generation=claimed_generation,
+            claimed_at="now" if claimed_by else "",
+        )
+
+
+def insert_task_for_test(project: Path, title: str, status: str, payload: dict[str, object]) -> int:
+    now = "now"
+    state = cli.task_state_for_status(status)
+    with database(project) as db:
+        cursor = db.execute(
+            """
+            insert into tasks(title, status, stage, outcome, in_progress, check_step, payload, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                title,
+                status,
+                state["stage"],
+                state["outcome"],
+                state["in_progress"],
+                state["check_step"],
+                cli.encode_payload(payload),
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
 
 
 def approve_review_task(project: Path, *, agent: str = "claude") -> str:
@@ -302,15 +355,10 @@ class StateTests(unittest.TestCase):
             mark_agent_cooldown(project, "claude", "silent adapter", ttl_seconds=60)
             self.assertEqual(supervisor_role_plan_for_project(project, second), (("driver", "codex"), ("tester", "claude")))
 
-            with database(project) as db:
-                db.execute("update tasks set status = ? where id = ?", ("awaiting_test", 1))
+            set_task_status_for_test(project, 1, "awaiting_test")
             self.assertEqual(supervisor_role_plan_for_project(project, first), (("tester", "claude"), ("driver", "codex")))
 
-            with database(project) as db:
-                db.execute(
-                    "update tasks set status = ?, payload = ? where id = ?",
-                    ("awaiting_review", cli.encode_payload({"driver_agent": "codex"}), 1),
-                )
+            set_task_status_for_test(project, 1, "awaiting_review", payload={"driver_agent": "codex"})
             self.assertEqual(supervisor_role_plan_for_project(project, first), (("reviewer", "claude"), ("driver", "codex")))
 
     def test_cleanup_runtime_state_releases_active_runtime_rows(self) -> None:
@@ -341,31 +389,30 @@ class StateTests(unittest.TestCase):
             running_id = enqueue_task(project, "driver task", resource=".")
             review_id = enqueue_task(project, "review task", resource=".")
             test_id = enqueue_task(project, "tester task", resource=".")
-            with database(project) as db:
-                db.execute(
-                    """
-                    update tasks
-                    set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?
-                    where id = ?
-                    """,
-                    ("running", "codex", "driver", 1, running_id),
-                )
-                db.execute(
-                    """
-                    update tasks
-                    set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?
-                    where id = ?
-                    """,
-                    ("running_review", "claude", "reviewer", 3, review_id),
-                )
-                db.execute(
-                    """
-                    update tasks
-                    set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?
-                    where id = ?
-                    """,
-                    ("running_test", "claude", "tester", 2, test_id),
-                )
+            set_task_status_for_test(
+                project,
+                running_id,
+                "running",
+                claimed_by="codex",
+                claimed_role="driver",
+                claimed_generation=1,
+            )
+            set_task_status_for_test(
+                project,
+                review_id,
+                "running_review",
+                claimed_by="claude",
+                claimed_role="reviewer",
+                claimed_generation=3,
+            )
+            set_task_status_for_test(
+                project,
+                test_id,
+                "running_test",
+                claimed_by="claude",
+                claimed_role="tester",
+                claimed_generation=2,
+            )
 
             cleanup_runtime_state(project)
             tasks = {task.id: task for task in list_tasks(project)}
@@ -1204,8 +1251,7 @@ exit 1
             init_git_project(project)
             ensure_layout(project)
             task_id = enqueue_task(project, "running task", resource="src")
-            with database(project) as db:
-                db.execute("update tasks set status = ? where id = ?", ("running", task_id))
+            set_task_status_for_test(project, task_id, "running")
 
             outcome = requeue_task(project, task_id)
 
@@ -1283,8 +1329,7 @@ exit 1
                 remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 15,
                 shutdown_grace_seconds=15,
             )
-            with database(project) as db:
-                db.execute("update tasks set status = ? where id = ?", ("completed", first))
+            set_task_status_for_test(project, int(first or 0), "completed")
             too_late = maybe_replenish_default_task(
                 project,
                 profile,
@@ -1864,20 +1909,9 @@ exit 1
             project = Path(tmp)
             init_git_project(project)
             ensure_layout(project)
-            with cli.database(project) as db:
-                cli.apply_schema(db)
-                db.execute(
-                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
-                    ("with summary", "completed", cli.encode_payload({"resource": "src", "act_summary": "did the thing"}), "now", "now"),
-                )
-                db.execute(
-                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
-                    ("no summary", "completed", cli.encode_payload({"resource": "src"}), "now", "now"),
-                )
-                db.execute(
-                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
-                    ("not done", "pending", cli.encode_payload({"resource": "src", "act_summary": "shouldn't count"}), "now", "now"),
-                )
+            insert_task_for_test(project, "with summary", "completed", {"resource": "src", "act_summary": "did the thing"})
+            insert_task_for_test(project, "no summary", "completed", {"resource": "src"})
+            insert_task_for_test(project, "not done", "pending", {"resource": "src", "act_summary": "shouldn't count"})
             completions = recent_completions_with_summary(project, limit=10)
             self.assertEqual([entry["title"] for entry in completions], ["with summary"])
             self.assertEqual(completions[0]["act_summary"], "did the thing")
@@ -1887,18 +1921,12 @@ exit 1
             project = Path(tmp)
             init_git_project(project)
             ensure_layout(project)
-            with cli.database(project) as db:
-                cli.apply_schema(db)
-                db.execute(
-                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
-                    (
-                        "Resolve TODO in src/app.py",
-                        "completed",
-                        cli.encode_payload({"resource": "src", "act_summary": "trimmed whitespace; no empty-string test"}),
-                        "now",
-                        "now",
-                    ),
-                )
+            insert_task_for_test(
+                project,
+                "Resolve TODO in src/app.py",
+                "completed",
+                {"resource": "src", "act_summary": "trimmed whitespace; no empty-string test"},
+            )
 
             def fake_reflection(_project, _agent, _completions, **_kwargs):
                 proposals = (
@@ -1952,24 +1980,121 @@ exit 1
             self.assertEqual(outcome.proposed_ids, ())
             self.assertEqual(calls, [], "reflection adapter must not run when there are no summaries")
 
+    def test_auto_reflection_replenishes_before_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            insert_task_for_test(
+                project,
+                "completed task",
+                "completed",
+                {"resource": "src", "act_summary": "task #1 left a test gap"},
+            )
+
+            def fake_reflection(_project, _agent, _completions, **_kwargs):
+                return cli.ReflectionResult(
+                    (cli.ReflectionProposal("add missing regression test", "tests", "task #1"),),
+                    ".mmux/runs/fake-reflect.log",
+                    "ok",
+                    True,
+                )
+
+            original = cli.invoke_reflection_adapter
+            cli.invoke_reflection_adapter = fake_reflection
+            try:
+                outcome = maybe_replenish_reflection_task(
+                    project,
+                    agent="claude",
+                    disabled=False,
+                    remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 20,
+                    shutdown_grace_seconds=15,
+                    timeout_seconds=5,
+                )
+                repeated = maybe_replenish_reflection_task(
+                    project,
+                    agent="claude",
+                    disabled=False,
+                    remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 20,
+                    shutdown_grace_seconds=15,
+                    timeout_seconds=5,
+                )
+            finally:
+                cli.invoke_reflection_adapter = original
+
+            self.assertIsNotNone(outcome)
+            assert outcome is not None
+            self.assertEqual(len(outcome.promoted_ids), 1)
+            self.assertIsNone(repeated)
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "pending")
+            self.assertEqual(tasks[-1].payload["kind"], "reflection")
+
+    def test_auto_reflection_advances_without_skipping_large_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            for index in range(12):
+                insert_task_for_test(
+                    project,
+                    f"completed task {index + 1}",
+                    "completed",
+                    {"resource": "src", "act_summary": f"summary {index + 1}"},
+                )
+
+            calls = []
+
+            def fake_reflection(_project, _agent, completions, **_kwargs):
+                calls.append([int(item["id"]) for item in completions])
+                return cli.ReflectionResult((), ".mmux/runs/fake-reflect.log", "ok", True)
+
+            original = cli.invoke_reflection_adapter
+            cli.invoke_reflection_adapter = fake_reflection
+            try:
+                first = maybe_replenish_reflection_task(
+                    project,
+                    agent="claude",
+                    disabled=False,
+                    remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 20,
+                    shutdown_grace_seconds=15,
+                    timeout_seconds=5,
+                )
+                second = maybe_replenish_reflection_task(
+                    project,
+                    agent="claude",
+                    disabled=False,
+                    remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 20,
+                    shutdown_grace_seconds=15,
+                    timeout_seconds=5,
+                )
+                third = maybe_replenish_reflection_task(
+                    project,
+                    agent="claude",
+                    disabled=False,
+                    remaining_seconds=MIN_EXECUTION_BUDGET_SECONDS + 20,
+                    shutdown_grace_seconds=15,
+                    timeout_seconds=5,
+                )
+            finally:
+                cli.invoke_reflection_adapter = original
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertIsNone(third)
+            self.assertEqual(calls, [list(range(1, 11)), [11, 12]])
+
     def test_requeue_promotes_proposed_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             init_git_project(project)
             ensure_layout(project)
-            with cli.database(project) as db:
-                cli.apply_schema(db)
-                cursor = db.execute(
-                    "insert into tasks(title, status, payload, created_at, updated_at) values (?, ?, ?, ?, ?)",
-                    (
-                        "vague reflection proposal",
-                        "proposed",
-                        cli.encode_payload({"resource": ".", "kind": "reflection"}),
-                        "now",
-                        "now",
-                    ),
-                )
-                task_id = int(cursor.lastrowid)
+            task_id = insert_task_for_test(
+                project,
+                "vague reflection proposal",
+                "proposed",
+                {"resource": ".", "kind": "reflection"},
+            )
             outcome = cli.requeue_task(project, task_id, reason="human approves the proposal")
             self.assertTrue(outcome.ok)
             self.assertEqual(outcome.from_status, "proposed")

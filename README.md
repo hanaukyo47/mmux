@@ -59,7 +59,8 @@ This repository starts as the control-plane skeleton:
 - `mmux start` creates a four-pane tmux workspace for supervisor, Codex worker,
   Claude worker, and logs.
 - `mmux run --minutes N` starts the tmux workspace for a bounded wall-clock
-  window, adds conservative default tasks when the open queue is empty and time
+  window, reflects over newly completed `act_summary` records when the open
+  queue is empty, falls back to deterministic frontier/default tasks when time
   remains, writes checkpoints, stops it automatically, and prints a task
   summary.
 - `mmux start/run --resident-agents` opens persistent interactive Codex and
@@ -73,8 +74,9 @@ This repository starts as the control-plane skeleton:
   from tmux panes as an observable fallback and records them as deterministic
   events.
 - Resident `MMUX_DONE task=#N` freezes the agent's resident diff into a task
-  worktree, resets the resident worktree, and moves the task to
-  `awaiting_review`; reviewer notes and tester still gate the path to main.
+  worktree, resets the resident worktree, and moves the task to Check's review
+  step (`awaiting_review` as the compatibility label); reviewer notes and
+  tester still gate the path to main.
 - Resident `MMUX_BLOCKED task=#N` records the blocked reason and sends the peer
   resident agent a deterministic `MMUX_TASK` takeover request through tmux.
 - A task that receives a second resident `MMUX_BLOCKED` is escalated to
@@ -90,7 +92,9 @@ This repository starts as the control-plane skeleton:
   `act_summary` fields, proposes 0-5 follow-up tasks, and either
   auto-promotes them to `pending` (when evidence cites a task `#N` or a
   real file path) or leaves them as `proposed` for human review. This
-  is the Act->Plan feedback edge.
+  is the Act->Plan feedback edge. Timed runs invoke this edge automatically
+  for newly completed summaries before falling back to static frontier/default
+  replenishment.
 - `mmux roles` prints role leases and worker heartbeats.
 - `mmux locks` prints resource locks.
 - `mmux lease acquire/release` exercises deterministic role leasing.
@@ -109,15 +113,17 @@ as context; the first `REQUEST_CHANGES` requeues the task so the next
 driver can plan again, and a second rejection moves the task to
 `blocked`. `ABORT` short-circuits the task to `no_change` without
 burning a diff attempt.
-Accepted driver diffs move to `awaiting_review`; the peer `reviewer` can
-approve or request changes, and only reviewed or bypassed diffs move to
-`awaiting_test`. The worker holding `tester` runs deterministic checks and
-only then applies the patch back to the main worktree. After the patch
+Accepted driver diffs move to Check's review step (`awaiting_review` as the
+compatibility label); the peer `reviewer` can approve or request changes, and
+only reviewed or bypassed diffs move to Check's test step (`awaiting_test`).
+The worker holding `tester` runs deterministic checks and only then applies the
+patch back to the main worktree. After the patch
 applies, a summarizer call writes a compact `act_summary` into the task
 payload (3-5 bullets covering what changed, what verified it, surprises,
 and one watch-out for next time). The summary is best-effort: a
-summarizer failure logs but never blocks task completion. Reflection
-that turns these summaries back into new tasks is not yet wired up.
+summarizer failure logs but never blocks task completion. Reflection turns
+new summaries back into `pending` or `proposed` follow-up tasks during timed
+runs, with vague proposals held for human review.
 
 Resident mode is for visibility and long-lived agent context. With
 `--resident-agents`, the visible Codex and Claude panes are real interactive
@@ -170,9 +176,9 @@ mmux run . --minutes 30
 
 This observes only. It initializes `.mmux/`, profiles the project, adds a
 conservative default task if the queue is empty, starts tmux, writes
-checkpoints, replenishes default tasks when the open queue is exhausted and time
-remains, and stops at the deadline. To let Codex and Claude Code actually edit
-code inside the deterministic gates:
+checkpoints, replenishes via reflection/frontier/default tasks when the open
+queue is exhausted and time remains, and stops at the deadline. To let Codex and
+Claude Code actually edit code inside the deterministic gates:
 
 ```bash
 mmux run . --minutes 30 --execute-agents
@@ -241,6 +247,8 @@ mmux stop /path/to/project
 - A role lease has a generation token; stale work is ignored.
 - Resource locks prevent concurrent writes to the same files or modules.
 - Agent execution happens in task git worktrees under `.mmux/worktrees/`.
+- Task state is stored as `stage`, `outcome`, `in_progress`, and `check_step`;
+  legacy status names are derived for CLI readability.
 - Resident agent context lives in fixed git worktrees under `.mmux/resident/`.
 - Resident agent outcome reporting prefers the `mmux report` state channel;
   tmux protocol lines remain a fallback for visibility.
@@ -260,11 +268,11 @@ mmux stop /path/to/project
   run deadline.
 - Adapter timeout/no-output failures requeue the task and put that agent on
   cooldown, so another agent can take the next driver lease.
-- Stopping a run requeues unfinished `running`, `running_review`, and
-  `running_test` tasks.
+- Stopping a run clears in-progress Plan/Do/Check claims and returns them to
+  their waiting stage.
 - Time windows drive the loop; round counts are only internal diagnostics.
-- Queue replenishment prefers deterministic frontier candidates before generic
-  default tasks.
+- Queue replenishment prefers Act->Plan reflection, then deterministic frontier
+  candidates, then generic default tasks.
 - tmux is the observation layer, not the source of truth.
 
 See [docs/design.md](docs/design.md) for the initial architecture.

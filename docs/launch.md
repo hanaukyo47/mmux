@@ -91,7 +91,7 @@ baseline-aware tester gates, and tmux for visibility/human takeover.
 
 Current alpha loop:
 
-pending -> driver -> awaiting_review -> reviewer -> awaiting_test -> tester -> completed
+Plan -> Do -> Check(review) -> Check(test) -> Act -> reflection proposals
 
 There is a small example repo with fake Codex/Claude commands for a zero-token
 first run:

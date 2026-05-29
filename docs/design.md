@@ -137,6 +137,12 @@ current generation token for stale-sensitive actions, and expired leases can be
 claimed by another worker. Worker heartbeat rows are operational status only;
 they make the tmux panes and CLI state observable but do not decide policy.
 
+Tasks store the v2 state machine directly: `stage` tracks Plan, Do, Check, Act,
+or queue-admission `proposed`; `outcome` records terminal results such as
+`completed`, `failed`, `no_change`, `rejected`, or `blocked`; `in_progress`
+marks an active worker claim; and `check_step` records whether Check is waiting
+on review or test. The older status labels are derived for CLI readability.
+
 The baseline role plan still rotates across role pairs to avoid fixed agent
 ownership. When executable work is present, the project plan overrides that
 rotation deterministically: `awaiting_test` tasks prioritize `tester`,
@@ -153,8 +159,8 @@ stored with the lock so stale driver work can be rejected deterministically.
 
 Task execution is explicit. `mmux start` only observes by default. With
 `--execute-agents`, the worker holding `driver` claims one pending task, acquires
-that task's resource lock, creates an isolated git worktree, and runs its local
-agent CLI non-interactively:
+that task's resource lock, creates an isolated git worktree, runs a structured
+Plan step, then runs its local agent CLI non-interactively for Do:
 
 - Codex: `codex exec`
 - Claude Code: `claude -p --verbose --output-format stream-json --include-partial-messages`
@@ -163,12 +169,12 @@ Claude uses streaming JSON output so long-running reasoning or tool use keeps
 the adapter heartbeat alive. Plain text mode only prints a final response, which
 can look silent to the no-output watchdog during substantial tasks.
 
-After driver execution, deterministic policy checks inspect the worktree diff:
+After the Do step, deterministic policy checks inspect the worktree diff:
 
 - No diff becomes `no_change`.
 - Protected paths such as `.git`, `.mmux`, and `.env*` are rejected.
 - Every changed path must be inside the task resource lock.
-- Accepted driver diffs move to `awaiting_review`.
+- Accepted driver diffs move to the Check pipeline's review step.
 
 The worker holding `reviewer` then inspects the same task worktree. Reviewer
 output is intentionally narrow and structured:
@@ -178,11 +184,11 @@ MMUX_REVIEW APPROVE
 MMUX_REVIEW REQUEST_CHANGES: <short reason>
 ```
 
-`APPROVE` moves the task to `awaiting_test`. `REQUEST_CHANGES` moves it back to
-`pending` with the review note in task payload. A reviewer may not review its
-own driver work, and reviewer edits to the task diff are discarded. Invalid
-review output, adapter failures, and timeouts are logged and bypassed to
-`awaiting_test` so review cannot become a second model-owned referee or a
+`APPROVE` moves the task to the Check pipeline's test step. `REQUEST_CHANGES`
+moves it back to Plan with the review note in task payload. A reviewer may not
+review its own driver work, and reviewer edits to the task diff are discarded.
+Invalid review output, adapter failures, and timeouts are logged and bypassed to
+the test step so review cannot become a second model-owned referee or a
 deadlock point.
 
 The worker holding `tester` then runs deterministic checks in the same task
@@ -257,11 +263,11 @@ downstream gate remains single-path.
 A done report for a pending task makes mmux inspect that agent's resident
 worktree diff. If deterministic diff policy accepts it, mmux freezes the patch
 into a normal task worktree under `.mmux/worktrees/`, resets the resident
-worktree back to `HEAD`, and moves the task to `awaiting_review`; reviewer
-notes and the existing tester gate still decide whether the patch can be
-applied to the main worktree. A blocked report records the blocked reason on
-the task payload and sends the peer resident agent a deterministic `MMUX_TASK`
-takeover request
+worktree back to `HEAD`, and moves the task to Check's review step
+(`awaiting_review` as the compatibility label); reviewer notes and the existing
+tester gate still decide whether the patch can be applied to the main worktree.
+A blocked report records the blocked reason on the task payload and sends the
+peer resident agent a deterministic `MMUX_TASK` takeover request
 through tmux. It does not fail the task or apply any partial diff from the
 blocked agent. A second resident block for the same task escalates the task to
 `blocked`, which removes it from the open queue and lets timed runs continue
@@ -282,20 +288,22 @@ panes keep their long-lived context.
 `mmux run PROJECT --minutes N` is the bounded top-level entry point for normal
 use. It initializes the local `.mmux/` layout when needed, refuses to reuse an
 existing tmux session, profiles the project, and adds one conservative default
-task when the queue has no pending or in-progress work. During the timed
-window, checkpoints replenish another conservative default task when all open
-work is exhausted and enough execution budget remains. `--no-default-task`
-disables that queue bootstrap and replenishment for observation-only runs. The
-command records a `run_started` event, starts the same four-pane workspace as
-`mmux start`, and then lets wall-clock time drive the window.
+task when the queue has no open work. During the timed window, checkpoints first
+run Act->Plan reflection over newly completed `act_summary` records when all
+open work is exhausted. Evidence-citing reflection proposals are promoted to
+Plan; vague proposals stay in `proposed` for human review. If reflection has no
+actionable pending work, queue replenishment falls back to deterministic
+frontier candidates and then a conservative default task while enough execution
+budget remains. `--no-default-task` disables that queue bootstrap and
+replenishment for observation-only runs. The command records a `run_started`
+event, starts the same four-pane workspace as `mmux start`, and then lets
+wall-clock time drive the window.
 
 During the window, it writes periodic checkpoints with remaining time and task
 status counts to stdout and the supervisor log. At the deadline, or on
 `KeyboardInterrupt`, it stops the tmux session, clears runtime leases, locks, and
-heartbeats, requeues unfinished `running` tasks to `pending`, requeues unfinished
-`running_review` tasks to `awaiting_review`, requeues unfinished `running_test`
-tasks to `awaiting_test`, records `run_finished`, and prints before/after/delta
-task counts.
+heartbeats, clears in-progress Plan/Do/Check claims back to their waiting stage,
+records `run_finished`, and prints before/after/delta task counts.
 
 By default, a timed run observes only. `--execute-agents` enables non-interactive
 Codex and Claude Code adapters inside the same deterministic gates described
@@ -341,6 +349,7 @@ an unexplored boundary:
 - A verification gap.
 - A failing test or CI signal.
 - A documented TODO/FIXME with evidence.
+- A concrete reflection from a recent `act_summary`.
 
 Recent touched files enter cooldown. Reviewers also review task selection, but
 the supervisor only accepts schema-valid candidates that pass deterministic
@@ -351,7 +360,6 @@ checks.
 The current implementation supports controlled task execution, but it is not a
 complete unattended system yet. Remaining work:
 
-- A real `reviewer` gate.
 - User-configurable tester commands.
 - Worktree cleanup and archival policy.
 - Commit, checkpoint, and rollback policy.

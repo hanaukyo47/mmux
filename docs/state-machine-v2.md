@@ -2,27 +2,27 @@
 
 ## Why this doc
 
-The current task state machine in `src/mmux/cli.py` exposes **11 task statuses**.
-Most of that surface area is not conceptual — it is three different concerns
-piled into one enum:
+The original task state machine in `src/mmux/cli.py` exposed **11 task
+statuses**. Most of that surface area was not conceptual — it was three
+different concerns piled into one enum:
 
 1. The conceptual loop work goes through (Plan → Do → Check → Act).
 2. Concurrency control (who currently holds which role, which paths are locked).
 3. Outcome / failure variants (blocked, rejected, no_change, escalated).
 
-This doc pulls them apart. Goals:
+The v2 implementation pulls them apart. Goals:
 
 - Show that the **conceptual** state machine is 4 stages.
 - Show what is **leaking** into the task status enum from the other two layers.
-- Identify the missing **Act → Plan** feedback edge — the actual gap behind
-  "self-iteration capability" on this branch.
+- Wire the **Act → Plan** feedback edge behind "self-iteration capability".
 
-This is a design discussion doc, not a refactor plan. No code changes follow
-from merging it.
+This is now the implementation note for the v2 model. The CLI still derives the
+old status labels for readability, but the durable task state is
+`stage + outcome + in_progress + check_step`.
 
-## Today: 11 task statuses
+## Previous model: 11 task statuses
 
-From `cli.py` (status column on the `tasks` table):
+The compatibility labels are:
 
 `pending`, `running`, `awaiting_review`, `running_review`, `awaiting_test`,
 `running_test`, `completed`, `failed`, `no_change`, `rejected`, `blocked`.
@@ -41,11 +41,11 @@ The three `running_*` statuses are pure concurrency bookkeeping — they answer
 any conceptual structure.
 
 The four outcome statuses are not stages either. They are *results* of a stage
-deciding it cannot continue. Today they sit next to real stages in the same
-enum, so when reading the code you cannot tell at a glance whether `rejected`
-is "a place the task is in" or "a verdict on the task".
+deciding it cannot continue. In the old enum they sat next to real stages, so
+when reading the code you could not tell at a glance whether `rejected` was "a
+place the task is in" or "a verdict on the task".
 
-## Proposed v2: 4 conceptual stages (PDCA)
+## V2: 4 conceptual stages (PDCA)
 
 ```
                 ┌──────────────────────────────────┐
@@ -57,12 +57,12 @@ is "a place the task is in" or "a verdict on the task".
 
 | Stage  | Purpose                                                       | Today's equivalent                                                          |
 | ------ | ------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Plan   | Read what's needed, decide what to change, size the change    | **Missing** — driver inlines plan+do inside one adapter invocation          |
+| Plan   | Read what's needed, decide what to change, size the change    | `stage=plan`                                                               |
 | Do     | Produce the diff                                              | `running` (driver)                                                          |
 | Check  | Verify the diff is reasonable and does not break things       | `running_review` + `running_test`                                           |
-| Act    | Apply patch back to main; emit a summary for next Plan        | `completed` applies the patch but emits nothing the loop consumes           |
+| Act    | Apply patch back to main; emit a summary for next Plan        | `stage=act, outcome=completed`                                             |
 
-Three notable changes versus today:
+Three notable changes versus the old model:
 
 1. **Plan becomes its own stage with a structured contract.** The Plan adapter
    produces three artifacts together:
@@ -98,10 +98,10 @@ Three notable changes versus today:
    slow, precise, syntactic. They do not need separate top-level stages; they
    are a check pipeline whose internal ordering is an implementation detail.
 
-3. **Act gains a feedback edge.** Today `completed` is terminal. In v2, Act
+3. **Act gains a feedback edge.** In the old model `completed` was terminal. In v2, Act
    has two responsibilities: apply the patch, *and* emit a structured summary
    that the next Plan stage can consume. This single edge is what turns the
-   current PDC**A**→stop pipeline into a real closed loop, and is the
+   old PDC**A**→stop pipeline into a real closed loop, and is the
    structural prerequisite for self-iteration.
 
 ## Rejected alternative: 5-stage RPDCA
@@ -154,13 +154,14 @@ The concurrency layer owns:
 
 A task in `Do` is just a task in `Do`. Separately, the supervisor knows the
 driver lease is held by codex and the resource lock on `src/foo.py` expires in
-N seconds. These two views change independently. Today they are entangled —
+N seconds. These two views change independently. Previously they were entangled —
 `running` versus `pending` is partly a stage and partly a "someone is working"
 flag, and you cannot read one without the other.
 
-Concrete proposal: collapse `running` / `running_review` / `running_test` into
-a single `in_progress` boolean attached to the **worker lease**, not the task.
-Task transitions only on stage boundaries.
+The implementation collapses `running` / `running_review` / `running_test` into
+`in_progress` plus the active role lease. `check_step=review|test` records the
+Check sub-step so scheduling can still prioritize reviewer and tester work
+without making them top-level task stages.
 
 The dormant `summarizer` role from `ASSIGNMENT_ROLE_PAIRS` finds a home in v2
 as the Act-stage summarizer: it compresses reviewer notes, tester logs, and
@@ -170,13 +171,13 @@ the context window on any non-trivial codebase.
 
 ## Outcome: a separate column
 
-`failed`, `no_change`, `rejected`, `blocked` are not stages; they are outcomes
-of a stage. Move them to an `outcome` column orthogonal to `stage`.
+`failed`, `no_change`, `rejected`, `blocked`, and `completed` are not stages;
+they are outcomes of a stage. They live in `outcome`, orthogonal to `stage`.
 
 A task is then described by two questions:
 
 - `stage=Check, outcome=null` — currently in Check.
-- `stage=Check, outcome=rejected_policy` — Check rejected the diff for policy.
+- `stage=Check, outcome=rejected` — Check rejected the diff for policy.
 - `stage=Do, outcome=no_change` — Do produced nothing.
 - `stage=Plan, outcome=blocked` — planner could not form a plan that reviewer
   would approve, even after retries.
@@ -184,15 +185,13 @@ A task is then described by two questions:
 Two columns, two questions, no ambiguity about whether `rejected` is a place
 the task sits or a verdict on the task.
 
-## The missing edge: Act → Plan
+## The Act → Plan edge
 
 This is the actual deliverable behind the branch name.
 
-Today's Act applies the patch back to the main worktree and stops. The next
-task is picked from `discover_frontier_candidates()`, which enumerates exactly
-three sources, all static: TODO/FIXME/XXX markers, source files without a
-matching test file, and suggested checks from the project profile. Nothing
-the previous run produced influences what the next run picks up.
+Act applies the patch back to the main worktree, records `act_summary`, and can
+feed the next Plan. Static frontier discovery still exists, but it is no longer
+the only queue source.
 
 V2's Act adds two responsibilities:
 
@@ -212,12 +211,12 @@ tag on ordinary tasks. Reasons:
 - Admission policy is genuinely different: every reflection task has to
   cite concrete evidence (a file, a failure event, a reviewer note) before
   promotion from `proposed` to Plan.
-- Execution policy is genuinely different: smaller diff cap, mandatory
-  reviewer (no `review_bypassed=True` shortcut), separate resource-lock
-  namespace for self-modifying runs touching `src/mmux/`.
-- Putting these as `if kind == "reflection"` branches scattered across the
-  codebase rots; putting them inside a kind boundary forces every future
-  policy decision to consider both kinds explicitly.
+- Execution policy may become genuinely different: smaller diff caps,
+  mandatory reviewer behavior, or stricter handling for self-modifying runs
+  touching `src/mmux/` can hang off this boundary without changing the core
+  PDCA state model.
+- Keeping the kind explicit prevents future policy decisions from silently
+  treating reflection tasks and ordinary tasks as identical.
 
 Reflection-kind tasks default to a `proposed` state that is **not** part of
 the conceptual stage machine — it is a queue admission gate, not a stage.
@@ -226,36 +225,27 @@ until a human looks at them, or until they age out by TTL.
 
 This is the only place where LLM judgment is allowed to influence the task
 queue. Every stage transition after admission is still owned by the
-deterministic referee.
+deterministic referee. Timed runs invoke this edge automatically once the open
+queue is empty and enough budget remains; `mmux reflect` exposes the same path
+manually.
 
-## Migration: hard cut
+## Migration
 
-No dual-write. The new schema replaces `status` with `stage` + `outcome` in
-a single release. Trade-offs:
+The v2 schema adds `stage`, `outcome`, `in_progress`, and `check_step` while
+keeping `status` as a derived compatibility label. Existing alpha state rows are
+mapped from their legacy status when the schema is opened.
 
-- **Cleaner code.** No compatibility branches in the supervisor, no v1/v2
-  reconciliation logic, no temporary indexes.
-- **Existing `.mmux/state.db` files do not survive.** Users running mmux
-  alpha need to delete their state.db (or run a one-shot migration script
-  shipped with the release) before the new binary will start. Any tasks
-  in flight at migration time need to be re-frontiered from scratch.
-- **In-flight `running_*` tasks abort on upgrade.** The supervisor will
-  refuse to load a v1 schema; on next start with v2, frontier discovery
-  produces a fresh queue.
+- **Durable state is v2.** New transitions write `stage`, `outcome`,
+  `in_progress`, and `check_step` first, then derive `status`.
+- **Existing `.mmux/state.db` files survive.** Legacy rows are migrated in
+  place from `pending`, `running`, `awaiting_review`, `awaiting_test`,
+  `completed`, `failed`, `no_change`, `rejected`, `blocked`, or `proposed`.
+- **In-flight work still resets on stop.** Runtime cleanup clears active
+  Plan/Do/Check claims back to the appropriate waiting stage.
 
-This is the right trade for alpha: the user audience is small, the
-deployment count is low, and the cost of carrying a dual-write layer
-across an unknown number of releases is higher than the cost of asking
-users to reset state once.
-
-The migration script (`mmux migrate v1-to-v2` or similar) is in scope for
-the release that lands v2, but its design is not in scope for this doc.
-
-## What this proposal does not commit to
+## What remains open
 
 - The exact JSON shape of the Plan adapter's `read` / `plan` / `risks`
-  contract, or of `act_summary`.
-- The reflection prompt or which model runs it.
-- Whether `proposed` is stored in the same table as `tasks` or its own.
-
-Those follow once we agree the conceptual split is correct.
+  contract may still tighten.
+- Reflection currently stores `kind=reflection` in task payload; stronger
+  per-kind execution policy is still future work.

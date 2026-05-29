@@ -52,6 +52,9 @@ ASSIGNMENT_ROLE_PAIRS = (
     ("reviewer", "driver"),
     ("tester", "summarizer"),
 )
+TASK_STAGES = ("proposed", "plan", "do", "check", "act")
+CHECK_STEPS = ("", "review", "test")
+TERMINAL_OUTCOMES = ("completed", "failed", "no_change", "rejected", "blocked")
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,10 @@ class TaskRecord:
     id: int
     title: str
     status: str
+    stage: str
+    outcome: str
+    in_progress: bool
+    check_step: str
     payload: dict[str, object]
     claimed_by: str = ""
     claimed_role: str = ""
@@ -301,10 +308,74 @@ def database(project: Path) -> Iterable[sqlite3.Connection]:
         db.close()
 
 
-def ensure_column(db: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+def ensure_column(db: sqlite3.Connection, table: str, column: str, declaration: str) -> bool:
     columns = {row[1] for row in db.execute(f"pragma table_info({table})").fetchall()}
     if column not in columns:
         db.execute(f"alter table {table} add column {column} {declaration}")
+        return True
+    return False
+
+
+def legacy_status_to_task_state(status: str) -> tuple[str, str, bool, str]:
+    if status == "proposed":
+        return "proposed", "", False, ""
+    if status == "pending":
+        return "plan", "", False, ""
+    if status == "running":
+        return "plan", "", True, ""
+    if status == "awaiting_review":
+        return "check", "", False, "review"
+    if status == "running_review":
+        return "check", "", True, "review"
+    if status == "awaiting_test":
+        return "check", "", False, "test"
+    if status == "running_test":
+        return "check", "", True, "test"
+    if status == "completed":
+        return "act", "completed", False, ""
+    if status in {"failed", "no_change", "rejected", "blocked"}:
+        return "plan", status, False, ""
+    return "plan", "", False, ""
+
+
+def task_status_from_state(stage: str, outcome: str, in_progress: bool, check_step: str = "") -> str:
+    if outcome:
+        return outcome
+    if stage == "proposed":
+        return "proposed"
+    if stage == "check":
+        if check_step == "test":
+            return "running_test" if in_progress else "awaiting_test"
+        return "running_review" if in_progress else "awaiting_review"
+    if in_progress:
+        return "running"
+    return "pending"
+
+
+def task_state_for_status(status: str) -> dict[str, object]:
+    stage, outcome, in_progress, check_step = legacy_status_to_task_state(status)
+    return {
+        "stage": stage,
+        "outcome": outcome,
+        "in_progress": 1 if in_progress else 0,
+        "check_step": check_step,
+        "status": task_status_from_state(stage, outcome, in_progress, check_step),
+    }
+
+
+def normalize_task_state(stage: str, outcome: str, in_progress: int | bool, check_step: str) -> tuple[str, str, bool, str]:
+    normalized_stage = stage if stage in TASK_STAGES else "plan"
+    normalized_outcome = outcome if outcome in TERMINAL_OUTCOMES else ""
+    normalized_in_progress = bool(in_progress)
+    normalized_check_step = check_step if check_step in CHECK_STEPS else ""
+    if normalized_outcome:
+        normalized_in_progress = False
+        if normalized_outcome == "completed":
+            normalized_stage = "act"
+        normalized_check_step = ""
+    elif normalized_stage != "check":
+        normalized_check_step = ""
+    return normalized_stage, normalized_outcome, normalized_in_progress, normalized_check_step
 
 
 def apply_schema(db: sqlite3.Connection) -> None:
@@ -319,6 +390,10 @@ def apply_schema(db: sqlite3.Connection) -> None:
           id integer primary key autoincrement,
           title text not null,
           status text not null,
+          stage text not null default 'plan',
+          outcome text not null default '',
+          in_progress integer not null default 0,
+          check_step text not null default '',
           payload text not null default '{}',
           created_at text not null,
           updated_at text not null,
@@ -374,6 +449,14 @@ def apply_schema(db: sqlite3.Connection) -> None:
         );
         """
     )
+    state_columns_added = any(
+        (
+            ensure_column(db, "tasks", "stage", "text not null default 'plan'"),
+            ensure_column(db, "tasks", "outcome", "text not null default ''"),
+            ensure_column(db, "tasks", "in_progress", "integer not null default 0"),
+            ensure_column(db, "tasks", "check_step", "text not null default ''"),
+        )
+    )
     ensure_column(db, "tasks", "claimed_by", "text not null default ''")
     ensure_column(db, "tasks", "claimed_role", "text not null default ''")
     ensure_column(db, "tasks", "claimed_generation", "integer not null default 0")
@@ -383,6 +466,25 @@ def apply_schema(db: sqlite3.Connection) -> None:
     ensure_column(db, "resource_locks", "role", "text not null default ''")
     ensure_column(db, "resource_locks", "role_generation", "integer not null default 0")
     ensure_column(db, "resource_locks", "status", "text not null default 'active'")
+    if state_columns_added:
+        rows = db.execute("select id, status from tasks").fetchall()
+        for task_id, status in rows:
+            state = task_state_for_status(str(status))
+            db.execute(
+                """
+                update tasks
+                set stage = ?, outcome = ?, in_progress = ?, check_step = ?, status = ?
+                where id = ?
+                """,
+                (
+                    state["stage"],
+                    state["outcome"],
+                    state["in_progress"],
+                    state["check_step"],
+                    state["status"],
+                    task_id,
+                ),
+            )
 
 
 def ensure_existing_schema(project: Path) -> None:
@@ -428,6 +530,10 @@ def resident_seen_key(agent: str) -> str:
 
 def resident_mode_key() -> str:
     return "resident_mode"
+
+
+def auto_reflection_key() -> str:
+    return "auto_reflection"
 
 
 def tmux_panes_key() -> str:
@@ -1137,15 +1243,110 @@ def list_worker_heartbeats(project: Path) -> list[tuple[str, int, str, Optional[
         ).fetchall()
 
 
+TASK_SELECT_COLUMNS = """
+id, title, stage, outcome, in_progress, check_step, status, payload,
+claimed_by, claimed_role, claimed_generation
+"""
+
+
+def task_row_select_sql(suffix: str = "") -> str:
+    return f"select {TASK_SELECT_COLUMNS} from tasks {suffix}"
+
+
+def set_task_state_db(
+    db: sqlite3.Connection,
+    task_id: int,
+    *,
+    stage: str,
+    outcome: str = "",
+    in_progress: bool = False,
+    check_step: str = "",
+    payload: Optional[dict[str, object]] = None,
+    claimed_by: str = "",
+    claimed_role: str = "",
+    claimed_generation: int = 0,
+    claimed_at: str = "",
+    finished_at: str = "",
+    last_error: str = "",
+    updated_at: Optional[str] = None,
+) -> str:
+    normalized_stage, normalized_outcome, normalized_in_progress, normalized_check_step = normalize_task_state(
+        stage,
+        outcome,
+        in_progress,
+        check_step,
+    )
+    status = task_status_from_state(
+        normalized_stage,
+        normalized_outcome,
+        normalized_in_progress,
+        normalized_check_step,
+    )
+    now = updated_at or utc_now()
+    payload_text = encode_payload(payload) if payload is not None else None
+    if payload_text is None:
+        db.execute(
+            """
+            update tasks
+            set stage = ?, outcome = ?, in_progress = ?, check_step = ?, status = ?,
+                claimed_by = ?, claimed_role = ?, claimed_generation = ?, claimed_at = ?,
+                finished_at = ?, updated_at = ?, last_error = ?
+            where id = ?
+            """,
+            (
+                normalized_stage,
+                normalized_outcome,
+                1 if normalized_in_progress else 0,
+                normalized_check_step,
+                status,
+                claimed_by,
+                claimed_role,
+                claimed_generation,
+                claimed_at,
+                finished_at,
+                now,
+                last_error,
+                task_id,
+            ),
+        )
+    else:
+        db.execute(
+            """
+            update tasks
+            set stage = ?, outcome = ?, in_progress = ?, check_step = ?, status = ?,
+                payload = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?,
+                claimed_at = ?, finished_at = ?, updated_at = ?, last_error = ?
+            where id = ?
+            """,
+            (
+                normalized_stage,
+                normalized_outcome,
+                1 if normalized_in_progress else 0,
+                normalized_check_step,
+                status,
+                payload_text,
+                claimed_by,
+                claimed_role,
+                claimed_generation,
+                claimed_at,
+                finished_at,
+                now,
+                last_error,
+                task_id,
+            ),
+        )
+    return status
+
+
 def enqueue_task_db(db: sqlite3.Connection, title: str, *, resource: str = ".") -> int:
     now = utc_now()
     payload = encode_payload({"resource": resource})
     cursor = db.execute(
         """
-        insert into tasks(title, status, payload, created_at, updated_at)
-        values (?, ?, ?, ?, ?)
+        insert into tasks(title, status, stage, outcome, in_progress, check_step, payload, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (title, "pending", payload, now, now),
+        (title, "pending", "plan", "", 0, "", payload, now, now),
     )
     task_id = int(cursor.lastrowid)
     record_event(db, "task_added", {"id": task_id, "title": title, "resource": resource})
@@ -1160,41 +1361,39 @@ def enqueue_task(project: Path, title: str, *, resource: str = ".") -> int:
 
 
 def task_from_row(row: tuple[object, ...]) -> TaskRecord:
+    stage, outcome, in_progress, check_step = normalize_task_state(
+        str(row[2]),
+        str(row[3] or ""),
+        int(row[4] or 0),
+        str(row[5] or ""),
+    )
+    status = task_status_from_state(stage, outcome, in_progress, check_step)
     return TaskRecord(
         id=int(row[0]),
         title=str(row[1]),
-        status=str(row[2]),
-        payload=decode_payload(str(row[3])),
-        claimed_by=str(row[4] or ""),
-        claimed_role=str(row[5] or ""),
-        claimed_generation=int(row[6] or 0),
+        status=status,
+        stage=stage,
+        outcome=outcome,
+        in_progress=in_progress,
+        check_step=check_step,
+        payload=decode_payload(str(row[7])),
+        claimed_by=str(row[8] or ""),
+        claimed_role=str(row[9] or ""),
+        claimed_generation=int(row[10] or 0),
     )
 
 
 def list_tasks(project: Path) -> list[TaskRecord]:
     with database(project) as db:
         apply_schema(db)
-        rows = db.execute(
-            """
-            select id, title, status, payload, claimed_by, claimed_role, claimed_generation
-            from tasks
-            order by id
-            """
-        ).fetchall()
+        rows = db.execute(task_row_select_sql("order by id")).fetchall()
         return [task_from_row(row) for row in rows]
 
 
 def get_task(project: Path, task_id: int) -> Optional[TaskRecord]:
     with database(project) as db:
         apply_schema(db)
-        row = db.execute(
-            """
-            select id, title, status, payload, claimed_by, claimed_role, claimed_generation
-            from tasks
-            where id = ?
-            """,
-            (task_id,),
-        ).fetchone()
+        row = db.execute(task_row_select_sql("where id = ?"), (task_id,)).fetchone()
     return task_from_row(row) if row else None
 
 
@@ -1203,14 +1402,7 @@ def requeue_task(project: Path, task_id: int, reason: str = "manual requeue") ->
     try:
         db.execute("begin immediate")
         apply_schema(db)
-        row = db.execute(
-            """
-            select id, title, status, payload, claimed_by, claimed_role, claimed_generation
-            from tasks
-            where id = ?
-            """,
-            (task_id,),
-        ).fetchone()
+        row = db.execute(task_row_select_sql("where id = ?"), (task_id,)).fetchone()
         if row is None:
             db.rollback()
             return TaskRequeueOutcome(False, task_id, "", "", "task not found")
@@ -1234,14 +1426,12 @@ def requeue_task(project: Path, task_id: int, reason: str = "manual requeue") ->
         payload["requeued_reason"] = reason
         payload["requeued_at"] = now
         payload["requeue_count"] = int(payload.get("requeue_count", 0) or 0) + 1
-        db.execute(
-            """
-            update tasks
-            set status = ?, payload = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
-                claimed_at = '', finished_at = '', updated_at = ?, last_error = ''
-            where id = ?
-            """,
-            ("pending", encode_payload(payload), now, task_id),
+        set_task_state_db(
+            db,
+            task_id,
+            stage="plan",
+            payload=payload,
+            updated_at=now,
         )
         record_event(
             db,
@@ -1276,29 +1466,40 @@ def claim_task_with_status(
         if not active_role_matches_db(db, role, agent, generation):
             db.rollback()
             return None
+        source_state = task_state_for_status(source_status)
         row = db.execute(
-            """
-            select id, title, status, payload, claimed_by, claimed_role, claimed_generation
-            from tasks
-            where status = ?
-            order by id
-            limit 1
-            """,
-            (source_status,),
+            task_row_select_sql(
+                """
+                where stage = ? and outcome = ? and in_progress = ? and check_step = ?
+                order by id
+                limit 1
+                """
+            ),
+            (
+                source_state["stage"],
+                source_state["outcome"],
+                source_state["in_progress"],
+                source_state["check_step"],
+            ),
         ).fetchone()
         if not row:
             db.rollback()
             return None
         task = task_from_row(row)
         now = utc_now()
-        db.execute(
-            """
-            update tasks
-            set status = ?, claimed_by = ?, claimed_role = ?, claimed_generation = ?,
-                claimed_at = ?, updated_at = ?, last_error = ''
-            where id = ? and status = ?
-            """,
-            (running_status, agent, role, generation, now, now, task.id, source_status),
+        running_state = task_state_for_status(running_status)
+        status = set_task_state_db(
+            db,
+            task.id,
+            stage=str(running_state["stage"]),
+            outcome=str(running_state["outcome"]),
+            in_progress=bool(running_state["in_progress"]),
+            check_step=str(running_state["check_step"]),
+            claimed_by=agent,
+            claimed_role=role,
+            claimed_generation=generation,
+            claimed_at=now,
+            updated_at=now,
         )
         record_event(
             db,
@@ -1309,11 +1510,23 @@ def claim_task_with_status(
                 "role": role,
                 "generation": generation,
                 "from": source_status,
-                "to": running_status,
+                "to": status,
             },
         )
         db.commit()
-        return TaskRecord(task.id, task.title, running_status, task.payload, agent, role, generation)
+        return TaskRecord(
+            task.id,
+            task.title,
+            status,
+            str(running_state["stage"]),
+            str(running_state["outcome"]),
+            bool(running_state["in_progress"]),
+            str(running_state["check_step"]),
+            task.payload,
+            agent,
+            role,
+            generation,
+        )
     except Exception:
         db.rollback()
         raise
@@ -1361,15 +1574,28 @@ def release_task_claim(project: Path, task_id: int, reason: str) -> None:
 def release_task_claim_to(project: Path, task_id: int, target_status: str, reason: str, *, running_status: str) -> None:
     with database(project) as db:
         apply_schema(db)
+        row = db.execute(task_row_select_sql("where id = ?"), (task_id,)).fetchone()
+        if row is None:
+            return
+        task = task_from_row(row)
+        if task.status != running_status:
+            record_event(
+                db,
+                "task_requeue_skipped",
+                {"id": task_id, "status": task.status, "expected": running_status, "reason": reason},
+            )
+            return
         now = utc_now()
-        db.execute(
-            """
-            update tasks
-            set status = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
-                claimed_at = '', updated_at = ?, last_error = ?
-            where id = ? and status = ?
-            """,
-            (target_status, now, reason, task_id, running_status),
+        target_state = task_state_for_status(target_status)
+        set_task_state_db(
+            db,
+            task_id,
+            stage=str(target_state["stage"]),
+            outcome=str(target_state["outcome"]),
+            in_progress=bool(target_state["in_progress"]),
+            check_step=str(target_state["check_step"]),
+            updated_at=now,
+            last_error=reason,
         )
         record_event(db, "task_requeued", {"id": task_id, "status": target_status, "reason": reason})
 
@@ -1395,16 +1621,58 @@ def move_task_to_status(
             payload["last_message"] = message[:2000]
         now = utc_now()
         last_error = message if status in {"failed", "rejected", "blocked"} else ""
-        db.execute(
-            """
-            update tasks
-            set status = ?, payload = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
-                claimed_at = '', updated_at = ?, last_error = ?
-            where id = ?
-            """,
-            (status, encode_payload(payload), now, last_error, task_id),
+        state = task_state_for_status(status)
+        actual_status = set_task_state_db(
+            db,
+            task_id,
+            stage=str(state["stage"]),
+            outcome=str(state["outcome"]),
+            in_progress=bool(state["in_progress"]),
+            check_step=str(state["check_step"]),
+            payload=payload,
+            updated_at=now,
+            last_error=last_error,
         )
-        record_event(db, "task_status_changed", {"id": task_id, "status": status, "log_file": log_file})
+        record_event(db, "task_status_changed", {"id": task_id, "status": actual_status, "log_file": log_file})
+
+
+def move_task_to_stage(
+    project: Path,
+    task_id: int,
+    stage: str,
+    *,
+    check_step: str = "",
+    in_progress: bool = False,
+    message: str = "",
+) -> None:
+    with database(project) as db:
+        apply_schema(db)
+        row = db.execute(
+            "select claimed_by, claimed_role, claimed_generation, claimed_at from tasks where id = ?",
+            (task_id,),
+        ).fetchone()
+        claimed_by, claimed_role, claimed_generation, claimed_at = (
+            (str(row[0] or ""), str(row[1] or ""), int(row[2] or 0), str(row[3] or ""))
+            if row
+            else ("", "", 0, "")
+        )
+        status = set_task_state_db(
+            db,
+            task_id,
+            stage=stage,
+            in_progress=in_progress,
+            check_step=check_step,
+            claimed_by=claimed_by,
+            claimed_role=claimed_role,
+            claimed_generation=claimed_generation,
+            claimed_at=claimed_at,
+            last_error=message,
+        )
+        record_event(
+            db,
+            "task_stage_changed",
+            {"id": task_id, "stage": stage, "check_step": check_step, "status": status},
+        )
 
 
 def update_task_payload(project: Path, task_id: int, updates: dict[str, object]) -> None:
@@ -1433,8 +1701,9 @@ def finish_task(
         raise ValueError(f"unknown task terminal status: {status}")
     with database(project) as db:
         apply_schema(db)
-        row = db.execute("select payload from tasks where id = ?", (task_id,)).fetchone()
+        row = db.execute("select payload, stage from tasks where id = ?", (task_id,)).fetchone()
         payload = decode_payload(row[0]) if row else {}
+        current_stage = str(row[1]) if row else "plan"
         if payload_updates:
             payload.update(payload_updates)
         if log_file:
@@ -1443,16 +1712,18 @@ def finish_task(
             payload["last_message"] = message[:2000]
         now = utc_now()
         last_error = message if status in {"failed", "rejected", "blocked"} else ""
-        db.execute(
-            """
-            update tasks
-            set status = ?, payload = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
-                claimed_at = '', updated_at = ?, finished_at = ?, last_error = ?
-            where id = ?
-            """,
-            (status, encode_payload(payload), now, now, last_error, task_id),
+        stage = "act" if status == "completed" else current_stage
+        actual_status = set_task_state_db(
+            db,
+            task_id,
+            stage=stage,
+            outcome=status,
+            payload=payload,
+            updated_at=now,
+            finished_at=now,
+            last_error=last_error,
         )
-        record_event(db, "task_finished", {"id": task_id, "status": status, "log_file": log_file})
+        record_event(db, "task_finished", {"id": task_id, "status": actual_status, "log_file": log_file})
 
 
 def write_log(project: Path, message: str) -> None:
@@ -1474,36 +1745,44 @@ def cleanup_runtime_state(project: Path) -> None:
     with database(project) as db:
         apply_schema(db)
         now = utc_now()
-        driver_rows = db.execute("select id from tasks where status = ?", ("running",)).fetchall()
-        reviewer_rows = db.execute("select id from tasks where status = ?", ("running_review",)).fetchall()
-        tester_rows = db.execute("select id from tasks where status = ?", ("running_test",)).fetchall()
-        db.execute(
-            """
-            update tasks
-            set status = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
-                claimed_at = '', updated_at = ?, last_error = ?
-            where status = ?
-            """,
-            ("pending", now, "runtime stopped before driver completed", "running"),
-        )
-        db.execute(
-            """
-            update tasks
-            set status = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
-                claimed_at = '', updated_at = ?, last_error = ?
-            where status = ?
-            """,
-            ("awaiting_review", now, "runtime stopped before reviewer completed", "running_review"),
-        )
-        db.execute(
-            """
-            update tasks
-            set status = ?, claimed_by = '', claimed_role = '', claimed_generation = 0,
-                claimed_at = '', updated_at = ?, last_error = ?
-            where status = ?
-            """,
-            ("awaiting_test", now, "runtime stopped before tester completed", "running_test"),
-        )
+        driver_rows = db.execute(
+            "select id from tasks where outcome = '' and in_progress = 1 and stage in (?, ?)",
+            ("plan", "do"),
+        ).fetchall()
+        reviewer_rows = db.execute(
+            "select id from tasks where outcome = '' and in_progress = 1 and stage = ? and check_step = ?",
+            ("check", "review"),
+        ).fetchall()
+        tester_rows = db.execute(
+            "select id from tasks where outcome = '' and in_progress = 1 and stage = ? and check_step = ?",
+            ("check", "test"),
+        ).fetchall()
+        for row in driver_rows:
+            set_task_state_db(
+                db,
+                int(row[0]),
+                stage="plan",
+                updated_at=now,
+                last_error="runtime stopped before driver completed",
+            )
+        for row in reviewer_rows:
+            set_task_state_db(
+                db,
+                int(row[0]),
+                stage="check",
+                check_step="review",
+                updated_at=now,
+                last_error="runtime stopped before reviewer completed",
+            )
+        for row in tester_rows:
+            set_task_state_db(
+                db,
+                int(row[0]),
+                stage="check",
+                check_step="test",
+                updated_at=now,
+                last_error="runtime stopped before tester completed",
+            )
         db.execute("update role_leases set status = ? where status = ?", ("released", "active"))
         db.execute("update resource_locks set status = ? where status = ?", ("released", "active"))
         db.execute(
@@ -2511,19 +2790,27 @@ def evidence_is_concrete(project: Path, evidence: str) -> bool:
     return False
 
 
-def recent_completions_with_summary(project: Path, limit: int = REFLECTION_RECENT_LIMIT) -> list[dict[str, object]]:
+def recent_completions_with_summary(
+    project: Path,
+    limit: int = REFLECTION_RECENT_LIMIT,
+    *,
+    after_task_id: int = 0,
+    oldest_first: bool = False,
+) -> list[dict[str, object]]:
     completions: list[dict[str, object]] = []
+    order_direction = "asc" if oldest_first else "desc"
     with database(project) as db:
         apply_schema(db)
         rows = db.execute(
-            """
+            f"""
             select id, title, payload
             from tasks
-            where status = 'completed'
-            order by id desc
+            where outcome = 'completed'
+              and id > ?
+            order by id {order_direction}
             limit ?
             """,
-            (limit,),
+            (after_task_id, limit),
         ).fetchall()
     for row in rows:
         payload = decode_payload(str(row[2]))
@@ -2585,6 +2872,7 @@ def enqueue_proposal(
 ) -> tuple[int, str]:
     normalized_resource = normalize_resource(project, proposal.resource)
     status = "pending" if auto_promote else "proposed"
+    state = task_state_for_status(status)
     now = utc_now()
     payload = {
         "resource": normalized_resource,
@@ -2599,10 +2887,20 @@ def enqueue_proposal(
         apply_schema(db)
         cursor = db.execute(
             """
-            insert into tasks(title, status, payload, created_at, updated_at)
-            values (?, ?, ?, ?, ?)
+            insert into tasks(title, status, stage, outcome, in_progress, check_step, payload, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (proposal.title, status, encode_payload(payload), now, now),
+            (
+                proposal.title,
+                status,
+                state["stage"],
+                state["outcome"],
+                state["in_progress"],
+                state["check_step"],
+                encode_payload(payload),
+                now,
+                now,
+            ),
         )
         task_id = int(cursor.lastrowid)
         record_event(
@@ -2627,8 +2925,15 @@ def perform_reflection(
     *,
     limit: int = REFLECTION_RECENT_LIMIT,
     timeout_seconds: int = REFLECTION_TIMEOUT_SECONDS,
+    after_task_id: int = 0,
+    oldest_first: bool = False,
 ) -> ReflectionOutcome:
-    completions = recent_completions_with_summary(project, limit=limit)
+    completions = recent_completions_with_summary(
+        project,
+        limit=limit,
+        after_task_id=after_task_id,
+        oldest_first=oldest_first,
+    )
     if not completions:
         return ReflectionOutcome(
             promoted_ids=(),
@@ -2673,6 +2978,60 @@ def perform_reflection(
         message=reflection.message,
         adapter_ok=True,
     )
+
+
+def last_auto_reflected_task_id(project: Path) -> int:
+    with database(project) as db:
+        apply_schema(db)
+        value = meta_json_db(db, auto_reflection_key())
+    raw = value.get("last_task_id")
+    return int(raw) if isinstance(raw, int) and raw > 0 else 0
+
+
+def mark_auto_reflected(project: Path, source_task_ids: Iterable[int], outcome: ReflectionOutcome) -> None:
+    ids = [int(task_id) for task_id in source_task_ids]
+    if not ids:
+        return
+    payload = {
+        "last_task_id": max(ids),
+        "source_task_ids": ids,
+        "promoted_ids": list(outcome.promoted_ids),
+        "proposed_ids": list(outcome.proposed_ids),
+        "adapter_ok": outcome.adapter_ok,
+        "updated_at": utc_now(),
+    }
+    with database(project) as db:
+        apply_schema(db)
+        set_meta_json_db(db, auto_reflection_key(), payload)
+        record_event(db, "auto_reflection_recorded", payload)
+
+
+def maybe_replenish_reflection_task(
+    project: Path,
+    *,
+    agent: str,
+    disabled: bool,
+    remaining_seconds: int,
+    shutdown_grace_seconds: int,
+    timeout_seconds: int = REFLECTION_TIMEOUT_SECONDS,
+) -> Optional[ReflectionOutcome]:
+    if disabled:
+        return None
+    if has_open_tasks(project):
+        return None
+    if remaining_seconds < MIN_EXECUTION_BUDGET_SECONDS + shutdown_grace_seconds:
+        return None
+    after_task_id = last_auto_reflected_task_id(project)
+    outcome = perform_reflection(
+        project,
+        agent,
+        timeout_seconds=min(timeout_seconds, max(1, remaining_seconds - shutdown_grace_seconds)),
+        after_task_id=after_task_id,
+        oldest_first=True,
+    )
+    if outcome.source_task_ids and outcome.adapter_ok:
+        mark_auto_reflected(project, outcome.source_task_ids, outcome)
+    return outcome if outcome.source_task_ids else None
 
 
 def build_summarizer_prompt(agent: str, task: TaskRecord, context: dict[str, object]) -> str:
@@ -3859,7 +4218,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         apply_schema(db)
         expire_role_leases_db(db, utc_now_dt())
         expire_resource_locks_db(db, utc_now_dt())
-        tasks = db.execute("select status, count(*) from tasks group by status").fetchall()
+        stage_rows = db.execute(
+            """
+            select stage, coalesce(nullif(outcome, ''), 'open') as outcome, in_progress, check_step, count(*)
+            from tasks
+            group by stage, outcome, in_progress, check_step
+            order by stage, outcome, in_progress, check_step
+            """
+        ).fetchall()
         leases = db.execute(
             "select role, holder, generation, lease_until, status from role_leases order by role"
         ).fetchall()
@@ -3876,14 +4242,26 @@ def cmd_status(args: argparse.Namespace) -> int:
         events = db.execute("select kind, created_at from events order by id desc limit 5").fetchall()
         resident_enabled = meta_json_db(db, resident_mode_key()).get("enabled") is True
     cooldowns = list_agent_cooldowns(project)
+    tasks = task_status_counts(project)
 
     print(f"project: {project}")
     print(f"session: {session_name(project)}")
     print(f"resident agents: {'enabled' if resident_enabled else 'disabled'}")
     print("tasks:")
     if tasks:
-        for status, count in tasks:
+        for status in ordered_statuses(tasks):
+            count = tasks.get(status, 0)
+            if not count:
+                continue
             print(f"  {status}: {count}")
+    else:
+        print("  none")
+    print("task stages:")
+    if stage_rows:
+        for stage, outcome, in_progress, check_step, count in stage_rows:
+            progress = "in_progress" if in_progress else "waiting"
+            step = f" step={check_step}" if check_step else ""
+            print(f"  {stage}: {count} outcome={outcome} {progress}{step}")
     else:
         print("  none")
     print("role leases:")
@@ -3933,7 +4311,14 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         claim = ""
         if task.claimed_by:
             claim = f" claimed_by={task.claimed_by} role={task.claimed_role} gen={task.claimed_generation}"
-        print(f"  #{task.id} {task.status} resource={resource}{claim} {task.title}")
+        state = f"stage={task.stage}"
+        if task.check_step:
+            state += f"/{task.check_step}"
+        if task.outcome:
+            state += f" outcome={task.outcome}"
+        if task.in_progress:
+            state += " in_progress=true"
+        print(f"  #{task.id} {task.status} {state} resource={resource}{claim} {task.title}")
     return 0
 
 
@@ -3954,10 +4339,10 @@ OPEN_TASK_STATUSES = ("pending", "running", "awaiting_review", "running_review",
 
 
 def task_status_counts(project: Path) -> dict[str, int]:
-    with database(project) as db:
-        apply_schema(db)
-        rows = db.execute("select status, count(*) from tasks group by status").fetchall()
-    return {status: int(count) for status, count in rows}
+    counts: dict[str, int] = {}
+    for task in list_tasks(project):
+        counts[task.status] = counts.get(task.status, 0) + 1
+    return counts
 
 
 def ordered_statuses(*counts: dict[str, int]) -> list[str]:
@@ -3982,8 +4367,17 @@ def format_task_delta(before: dict[str, int], after: dict[str, int]) -> str:
 
 
 def has_open_tasks(project: Path) -> bool:
-    counts = task_status_counts(project)
-    return any(counts.get(status, 0) > 0 for status in OPEN_TASK_STATUSES)
+    with database(project) as db:
+        apply_schema(db)
+        row = db.execute(
+            """
+            select 1
+            from tasks
+            where outcome = '' and stage in ('plan', 'do', 'check')
+            limit 1
+            """
+        ).fetchone()
+    return row is not None
 
 
 def available_driver_agents(project: Path, now: Optional[dt.datetime] = None) -> tuple[str, ...]:
@@ -4002,8 +4396,14 @@ def oldest_awaiting_review_driver(project: Path) -> str:
     with database(project) as db:
         apply_schema(db)
         row = db.execute(
-            "select payload from tasks where status = ? order by id limit 1",
-            ("awaiting_review",),
+            """
+            select payload
+            from tasks
+            where stage = ? and outcome = '' and in_progress = 0 and check_step = ?
+            order by id
+            limit 1
+            """,
+            ("check", "review"),
         ).fetchone()
     if row is None:
         return ""
@@ -4543,6 +4943,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 break
             time.sleep(min(checkpoint_seconds, remaining))
             remaining_seconds = max(0, int(deadline - time.monotonic()))
+            reflection_outcome = maybe_replenish_reflection_task(
+                project,
+                agent="claude",
+                disabled=args.no_default_task,
+                remaining_seconds=remaining_seconds,
+                shutdown_grace_seconds=args.shutdown_grace_seconds,
+                timeout_seconds=args.agent_timeout_seconds,
+            )
             replenished_task_id = maybe_replenish_default_task(
                 project,
                 profile,
@@ -4552,6 +4960,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
             counts = task_status_counts(project)
             message = f"run checkpoint remaining={remaining_seconds}s tasks={format_task_counts(counts)}"
+            if reflection_outcome is not None:
+                if reflection_outcome.promoted_ids:
+                    message += f" reflection_promoted={list(reflection_outcome.promoted_ids)}"
+                if reflection_outcome.proposed_ids:
+                    message += f" reflection_proposed={list(reflection_outcome.proposed_ids)}"
+                if not reflection_outcome.adapter_ok:
+                    message += " reflection_failed=true"
             if replenished_task_id is not None:
                 message += f" default_task_added=#{replenished_task_id}"
             write_log(project, message)
@@ -4881,6 +5296,7 @@ def execute_driver_task(
 
         update_task_payload(project, task.id, plan_payload)
 
+        move_task_to_stage(project, task.id, "do", in_progress=True)
         print(f"executing task #{task.id} ({agent})")
         sys.stdout.flush()
         try:
