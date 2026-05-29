@@ -55,6 +55,10 @@ ASSIGNMENT_ROLE_PAIRS = (
 TASK_STAGES = ("proposed", "plan", "do", "check", "act")
 CHECK_STEPS = ("", "review", "test")
 TERMINAL_OUTCOMES = ("completed", "failed", "no_change", "rejected", "blocked")
+SELF_MUTATION_RESOURCE = "src/mmux"
+SELF_MUTATION_LOCK_RESOURCE = ".mmux/self-mutation"
+SELF_MUTATION_MAX_CHANGED_FILES = 3
+SELF_MUTATION_MAX_CHANGED_LINES = 240
 
 
 @dataclass(frozen=True)
@@ -734,6 +738,20 @@ def resource_contains(resource: str, path: str) -> bool:
     return resource_is_prefix(resource, path)
 
 
+def resource_touches_self_mutation(resource: str) -> bool:
+    normalized = resource.strip()
+    if not normalized or normalized == ".":
+        return False
+    return resource_is_prefix(normalized, SELF_MUTATION_RESOURCE) or resource_is_prefix(
+        SELF_MUTATION_RESOURCE,
+        normalized,
+    )
+
+
+def changed_files_touch_self_mutation(changed_files: Iterable[str]) -> bool:
+    return any(resource_contains(SELF_MUTATION_RESOURCE, path) for path in changed_files)
+
+
 def is_protected_path(path: str) -> bool:
     return (
         path == ".git"
@@ -1194,6 +1212,41 @@ def release_resource_lock(
         raise
     finally:
         db.close()
+
+
+def acquire_self_mutation_lock_if_needed(
+    project: Path,
+    task: TaskRecord,
+    agent: str,
+    ttl_seconds: int,
+    *,
+    role: str,
+    role_generation: int,
+) -> Optional[LockOutcome]:
+    if not task_declares_self_mutation_policy(task):
+        return None
+    return acquire_resource_lock(
+        project,
+        SELF_MUTATION_LOCK_RESOURCE,
+        agent,
+        ttl_seconds,
+        role=role,
+        role_generation=role_generation,
+        renew_if_same=False,
+    )
+
+
+def release_self_mutation_lock(
+    project: Path,
+    lock: Optional[LockOutcome],
+    *,
+    holder: str,
+    role: str,
+    role_generation: int,
+) -> None:
+    if lock is None or not lock.ok:
+        return
+    release_resource_lock(project, lock.resource, holder=holder, role=role, role_generation=role_generation)
 
 
 def list_resource_locks(project: Path) -> list[tuple[str, str, str, str, str, int, str]]:
@@ -1965,7 +2018,68 @@ def collect_changed_files(worktree: Path) -> list[str]:
     return sorted(set(tracked + untracked))
 
 
-def check_diff_policy(project: Path, worktree: Path, resource: str) -> DiffPolicyResult:
+def task_is_reflection(task: TaskRecord) -> bool:
+    return task.payload.get("kind") == "reflection"
+
+
+def task_declares_self_mutation_policy(task: TaskRecord) -> bool:
+    if not task_is_reflection(task):
+        return False
+    if task.payload.get("reflection_self_modifying") is True:
+        return True
+    resource = task.payload.get("resource")
+    return isinstance(resource, str) and resource_touches_self_mutation(resource)
+
+
+def task_requires_self_mutation_policy(
+    task: Optional[TaskRecord],
+    changed_files: Iterable[str] = (),
+) -> bool:
+    if task is None or not task_is_reflection(task):
+        return False
+    return task_declares_self_mutation_policy(task) or changed_files_touch_self_mutation(changed_files)
+
+
+def positive_int_payload(payload: dict[str, object], key: str, default: int) -> int:
+    value = payload.get(key)
+    return value if isinstance(value, int) and value > 0 else default
+
+
+def worktree_changed_line_count(worktree: Path, changed_files: Iterable[str]) -> int:
+    total = 0
+    tracked_stats = run(["git", "diff", "--numstat", "HEAD", "--"], cwd=worktree).stdout
+    for line in tracked_stats.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        added, deleted = parts[0], parts[1]
+        if added.isdigit() and deleted.isdigit():
+            total += int(added) + int(deleted)
+        else:
+            total += SELF_MUTATION_MAX_CHANGED_LINES + 1
+
+    untracked = set(split_nul_paths(run(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=worktree).stdout))
+    for path in changed_files:
+        if path not in untracked:
+            continue
+        candidate = worktree / path
+        if not candidate.is_file():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            total += SELF_MUTATION_MAX_CHANGED_LINES + 1
+            continue
+        total += max(1, len(text.splitlines()))
+    return total
+
+
+def check_diff_policy(
+    project: Path,
+    worktree: Path,
+    resource: str,
+    task: Optional[TaskRecord] = None,
+) -> DiffPolicyResult:
     normalized_resource = normalize_resource(project, resource)
     changed_files = tuple(collect_changed_files(worktree))
     if not changed_files:
@@ -1988,6 +2102,25 @@ def check_diff_policy(project: Path, worktree: Path, resource: str) -> DiffPolic
             changed_files,
             f"changes outside locked resource {normalized_resource}: " + ", ".join(outside),
         )
+
+    if task_requires_self_mutation_policy(task, changed_files):
+        max_files = positive_int_payload(task.payload, "reflection_diff_max_files", SELF_MUTATION_MAX_CHANGED_FILES)
+        max_lines = positive_int_payload(task.payload, "reflection_diff_max_lines", SELF_MUTATION_MAX_CHANGED_LINES)
+        if len(changed_files) > max_files:
+            return DiffPolicyResult(
+                False,
+                "self_mutation_too_many_files",
+                changed_files,
+                f"self-modifying reflection changed {len(changed_files)} files; limit is {max_files}",
+            )
+        changed_lines = worktree_changed_line_count(worktree, changed_files)
+        if changed_lines > max_lines:
+            return DiffPolicyResult(
+                False,
+                "self_mutation_diff_too_large",
+                changed_files,
+                f"self-modifying reflection changed {changed_lines} lines; limit is {max_lines}",
+            )
 
     return DiffPolicyResult(True, "ok", changed_files)
 
@@ -2874,6 +3007,7 @@ def enqueue_proposal(
     status = "pending" if auto_promote else "proposed"
     state = task_state_for_status(status)
     now = utc_now()
+    self_modifying = resource_touches_self_mutation(normalized_resource)
     payload = {
         "resource": normalized_resource,
         "kind": "reflection",
@@ -2883,6 +3017,17 @@ def enqueue_proposal(
         "reflection_proposed_at": now,
         "reflection_auto_promoted": auto_promote,
     }
+    if self_modifying:
+        payload.update(
+            {
+                "reflection_self_modifying": True,
+                "reflection_policy": "self_mutation",
+                "reflection_diff_max_files": SELF_MUTATION_MAX_CHANGED_FILES,
+                "reflection_diff_max_lines": SELF_MUTATION_MAX_CHANGED_LINES,
+                "reflection_requires_explicit_review": True,
+                "reflection_lock_namespace": SELF_MUTATION_LOCK_RESOURCE,
+            }
+        )
     with database(project) as db:
         apply_schema(db)
         cursor = db.execute(
@@ -3803,7 +3948,7 @@ def process_resident_done_event(project: Path, event: ResidentProtocolEvent) -> 
         return f"ignored: {event.agent} resident worktree missing"
 
     resource = task_resource(task)
-    policy = check_diff_policy(project, resident_worktree, resource)
+    policy = check_diff_policy(project, resident_worktree, resource, task)
     payload_updates = {
         "resident_agent": event.agent,
         "resident_event": event.line_hash,
@@ -3852,7 +3997,7 @@ def process_resident_done_event(project: Path, event: ResidentProtocolEvent) -> 
         record_resident_processing_event(project, "resident_done_failed", event, {"reason": str(exc)})
         return f"task #{task.id} failed: resident snapshot failed: {exc}"
 
-    snapshot_policy = check_diff_policy(project, snapshot, resource)
+    snapshot_policy = check_diff_policy(project, snapshot, resource, task)
     payload_updates.update(
         {
             "worktree": relative_to_project(project, snapshot),
@@ -4319,6 +4464,50 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         if task.in_progress:
             state += " in_progress=true"
         print(f"  #{task.id} {task.status} {state} resource={resource}{claim} {task.title}")
+    return 0
+
+
+def cmd_proposed(args: argparse.Namespace) -> int:
+    project = resolve_project(args.project)
+    ensure_existing_schema(project)
+    proposed = [task for task in list_tasks(project) if task.status == "proposed"]
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "id": task.id,
+                        "title": task.title,
+                        "resource": str(task.payload.get("resource", ".")),
+                        "kind": str(task.payload.get("kind", "")),
+                        "evidence": str(task.payload.get("reflection_evidence", "")),
+                        "from_tasks": task.payload.get("reflection_from_tasks", []),
+                        "proposed_at": str(task.payload.get("reflection_proposed_at", "")),
+                    }
+                    for task in proposed
+                ],
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"project: {project}")
+    print("proposed tasks:")
+    if not proposed:
+        print("  none")
+        return 0
+    for task in proposed:
+        resource = str(task.payload.get("resource", "."))
+        kind = str(task.payload.get("kind", ""))
+        evidence = str(task.payload.get("reflection_evidence", "")).strip() or "<none>"
+        sources = task.payload.get("reflection_from_tasks", [])
+        source_text = ", ".join(f"#{item}" for item in sources) if isinstance(sources, list) else ""
+        source_suffix = f" from={source_text}" if source_text else ""
+        kind_suffix = f" kind={kind}" if kind else ""
+        print(f"  #{task.id}{kind_suffix} resource={resource}{source_suffix}")
+        print(f"    {task.title}")
+        print(f"    evidence: {evidence}")
+        print(f"    approve: mmux task requeue {task.id} --reason \"human approves proposal\" --project {project}")
     return 0
 
 
@@ -5117,10 +5306,37 @@ def execute_driver_task(
         release_role(project, "driver", holder=agent, generation=generation)
         return f"task #{task.id} requeued: {lock.reason}"
 
+    self_lock = acquire_self_mutation_lock_if_needed(
+        project,
+        task,
+        agent,
+        max(RESOURCE_LOCK_TTL_SECONDS, stage_budget),
+        role="driver",
+        role_generation=generation,
+    )
+    if self_lock is not None and not self_lock.ok:
+        release_task_claim(project, task.id, self_lock.reason)
+        release_resource_lock(
+            project,
+            lock.resource,
+            holder=agent,
+            role="driver",
+            role_generation=generation,
+        )
+        release_role(project, "driver", holder=agent, generation=generation)
+        return f"task #{task.id} requeued: {self_lock.reason}"
+
     try:
         worktree = create_task_worktree(project, task, agent)
     except Exception as exc:
         release_task_claim(project, task.id, f"worktree creation failed: {exc}")
+        release_self_mutation_lock(
+            project,
+            self_lock,
+            holder=agent,
+            role="driver",
+            role_generation=generation,
+        )
         release_resource_lock(
             project,
             lock.resource,
@@ -5174,6 +5390,7 @@ def execute_driver_task(
             "plan_agent": agent,
             "plan_generation": generation,
         }
+        self_mutation_policy = task_declares_self_mutation_policy(task)
         if plan_result.plan_text.strip():
             plan_payload["plan_text"] = plan_result.plan_text.strip()
 
@@ -5220,6 +5437,13 @@ def execute_driver_task(
 
         if plan_result.decision != "proceed":
             plan_payload["plan_invalid_reason"] = plan_result.message
+            if self_mutation_policy:
+                plan_payload["plan_review_required"] = True
+                update_task_payload(project, task.id, plan_payload)
+                reason = f"self-modifying reflection requires a valid plan: {plan_result.message}".strip()
+                release_task_claim(project, task.id, reason)
+                write_log(project, f"{agent} requeued self-modifying task #{task.id}: {reason}")
+                return f"task #{task.id} requeued: {reason}"
             write_log(
                 project,
                 f"{agent} plan output invalid for task #{task.id}: {plan_result.message}; proceeding without plan context",
@@ -5284,6 +5508,20 @@ def execute_driver_task(
                 return f"task #{task.id} requeued: {requeue_reason}"
 
             if not plan_review.adapter_ok or plan_review.decision != "approve":
+                if self_mutation_policy:
+                    plan_payload["plan_review_required"] = True
+                    if plan_review.decision == "adapter_failed" and (
+                        "timed out" in plan_review.message or "produced no output" in plan_review.message
+                    ):
+                        mark_agent_cooldown(project, agent, plan_review.message)
+                    update_task_payload(project, task.id, plan_payload)
+                    reason = (
+                        "self-modifying reflection requires explicit plan review approval: "
+                        f"{plan_review.decision}: {plan_review.message}"
+                    ).strip()
+                    release_task_claim(project, task.id, reason)
+                    write_log(project, f"{agent} requeued self-modifying task #{task.id}: {reason}")
+                    return f"task #{task.id} requeued: {reason}"
                 plan_payload["plan_review_bypassed"] = True
                 if plan_review.decision == "adapter_failed" and (
                     "timed out" in plan_review.message or "produced no output" in plan_review.message
@@ -5340,7 +5578,7 @@ def execute_driver_task(
             write_log(project, f"{agent} requeued task #{task.id}: {message}")
             return f"task #{task.id} requeued: {message}"
 
-        policy = check_diff_policy(project, worktree, lock.resource)
+        policy = check_diff_policy(project, worktree, lock.resource, task)
         payload_updates = {
             "worktree": relative_to_project(project, worktree),
             "diff_policy": policy.status,
@@ -5394,6 +5632,13 @@ def execute_driver_task(
         write_log(project, f"{agent} finished task #{task.id} ok={result.ok} log={result.log_file}")
         return f"task #{task.id} {'completed' if result.ok else 'failed'} log={result.log_file}"
     finally:
+        release_self_mutation_lock(
+            project,
+            self_lock,
+            holder=agent,
+            role="driver",
+            role_generation=generation,
+        )
         release_resource_lock(
             project,
             lock.resource,
@@ -5452,6 +5697,26 @@ def execute_reviewer_task(
         release_role(project, "reviewer", holder=agent, generation=generation)
         return f"task #{task.id} requeued: {lock.reason}"
 
+    self_lock = acquire_self_mutation_lock_if_needed(
+        project,
+        task,
+        agent,
+        max(RESOURCE_LOCK_TTL_SECONDS, timeout_seconds + 60),
+        role="reviewer",
+        role_generation=generation,
+    )
+    if self_lock is not None and not self_lock.ok:
+        release_task_claim_to(project, task.id, "awaiting_review", self_lock.reason, running_status="running_review")
+        release_resource_lock(
+            project,
+            lock.resource,
+            holder=agent,
+            role="reviewer",
+            role_generation=generation,
+        )
+        release_role(project, "reviewer", holder=agent, generation=generation)
+        return f"task #{task.id} requeued: {self_lock.reason}"
+
     try:
         worktree = task_worktree_path(project, task)
         if worktree is None or not worktree.exists():
@@ -5467,7 +5732,7 @@ def execute_reviewer_task(
         print(f"review timeout: {timeout_seconds}s")
         sys.stdout.flush()
 
-        policy = check_diff_policy(project, worktree, lock.resource)
+        policy = check_diff_policy(project, worktree, lock.resource, task)
         payload_updates = {
             "worktree": relative_to_project(project, worktree),
             "diff_policy": policy.status,
@@ -5541,6 +5806,24 @@ def execute_reviewer_task(
             return f"task #{task.id} pending: reviewer requested changes"
 
         if reviewer_modified_diff or review.decision != "approve":
+            if task_requires_self_mutation_policy(task, policy.changed_files):
+                payload_updates["review_required"] = True
+                payload_updates["review_bypassed_blocked"] = True
+                if review.decision == "adapter_failed" and (
+                    "timed out" in review.message or "produced no output" in review.message
+                ):
+                    mark_agent_cooldown(project, agent, review.message)
+                reason = "reviewer modified diff" if reviewer_modified_diff else review.message
+                move_task_to_status(
+                    project,
+                    task.id,
+                    "awaiting_review",
+                    message=f"explicit review required: {review.decision}: {reason}",
+                    log_file=review.log_file,
+                    payload_updates=payload_updates,
+                )
+                write_log(project, f"{agent} kept self-modifying task #{task.id} in review: {review.decision} {reason}")
+                return f"task #{task.id} awaiting_review review_required={review.decision}"
             payload_updates["review_bypassed"] = True
             if review.decision == "adapter_failed" and (
                 "timed out" in review.message or "produced no output" in review.message
@@ -5569,6 +5852,13 @@ def execute_reviewer_task(
         write_log(project, f"{agent} approved task #{task.id} for tester log={review.log_file}")
         return f"task #{task.id} awaiting_test review=approve log={review.log_file}"
     finally:
+        release_self_mutation_lock(
+            project,
+            self_lock,
+            holder=agent,
+            role="reviewer",
+            role_generation=generation,
+        )
         release_resource_lock(
             project,
             lock.resource,
@@ -5616,6 +5906,26 @@ def execute_tester_task(
         release_role(project, "tester", holder=agent, generation=generation)
         return f"task #{task.id} requeued: {lock.reason}"
 
+    self_lock = acquire_self_mutation_lock_if_needed(
+        project,
+        task,
+        agent,
+        max(RESOURCE_LOCK_TTL_SECONDS, tester_budget),
+        role="tester",
+        role_generation=generation,
+    )
+    if self_lock is not None and not self_lock.ok:
+        release_task_claim_to(project, task.id, "awaiting_test", self_lock.reason, running_status="running_test")
+        release_resource_lock(
+            project,
+            lock.resource,
+            holder=agent,
+            role="tester",
+            role_generation=generation,
+        )
+        release_role(project, "tester", holder=agent, generation=generation)
+        return f"task #{task.id} requeued: {self_lock.reason}"
+
     try:
         worktree = task_worktree_path(project, task)
         if worktree is None or not worktree.exists():
@@ -5631,7 +5941,7 @@ def execute_tester_task(
         print(f"test timeout: {timeout_seconds}s")
         sys.stdout.flush()
 
-        policy = check_diff_policy(project, worktree, lock.resource)
+        policy = check_diff_policy(project, worktree, lock.resource, task)
         payload_updates = {
             "worktree": relative_to_project(project, worktree),
             "diff_policy": policy.status,
@@ -5741,6 +6051,13 @@ def execute_tester_task(
         write_log(project, f"{agent} tester completed task #{task.id} log={test_result.log_file}")
         return f"task #{task.id} completed log={test_result.log_file}"
     finally:
+        release_self_mutation_lock(
+            project,
+            self_lock,
+            holder=agent,
+            role="tester",
+            role_generation=generation,
+        )
         release_resource_lock(
             project,
             lock.resource,
@@ -5902,6 +6219,11 @@ def build_parser() -> argparse.ArgumentParser:
     tasks = subparsers.add_parser("tasks", help="show task queue")
     tasks.add_argument("project", nargs="?", default=".")
     tasks.set_defaults(func=cmd_tasks)
+
+    proposed = subparsers.add_parser("proposed", help="show proposed tasks waiting for human review")
+    proposed.add_argument("project", nargs="?", default=".")
+    proposed.add_argument("--json", action="store_true")
+    proposed.set_defaults(func=cmd_proposed)
 
     task = subparsers.add_parser("task", help="manage tasks")
     task_subparsers = task.add_subparsers(dest="task_command", required=True)

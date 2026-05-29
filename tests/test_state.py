@@ -1956,6 +1956,27 @@ exit 1
             self.assertEqual(proposed_task.status, "proposed")
             self.assertFalse(proposed_task.payload["reflection_auto_promoted"])
 
+    def test_reflection_task_touching_mmux_marks_self_mutation_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+
+            task_id, status = cli.enqueue_proposal(
+                project,
+                cli.ReflectionProposal("tighten mmux state policy", "src/mmux", "task #1"),
+                [1],
+                auto_promote=True,
+            )
+
+            task = get_task(project, task_id)
+            assert task is not None
+            self.assertEqual(status, "pending")
+            self.assertTrue(task.payload["reflection_self_modifying"])
+            self.assertEqual(task.payload["reflection_policy"], "self_mutation")
+            self.assertEqual(task.payload["reflection_lock_namespace"], ".mmux/self-mutation")
+            self.assertTrue(task.payload["reflection_requires_explicit_review"])
+
     def test_perform_reflection_handles_no_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -2103,6 +2124,94 @@ exit 1
             self.assertEqual(tasks[-1].status, "pending")
             self.assertEqual(tasks[-1].payload["requeued_from"], "proposed")
 
+    def test_cmd_proposed_lists_only_proposals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            insert_task_for_test(project, "ordinary task", "pending", {"resource": "."})
+            insert_task_for_test(
+                project,
+                "vague reflection proposal",
+                "proposed",
+                {
+                    "resource": "src",
+                    "kind": "reflection",
+                    "reflection_evidence": "",
+                    "reflection_from_tasks": [1],
+                },
+            )
+
+            args = type("Args", (), {"project": str(project), "json": False})()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                cli.cmd_proposed(args)
+
+            text = output.getvalue()
+            self.assertIn("proposed tasks:", text)
+            self.assertIn("vague reflection proposal", text)
+            self.assertIn("approve: mmux task requeue", text)
+            self.assertNotIn("ordinary task", text)
+
+    def test_self_mutating_reflection_rejects_large_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "src" / "mmux").mkdir()
+            (project / "src" / "mmux" / "cli.py").write_text("value = 1\n", encoding="utf-8")
+            run(["git", "add", "src/mmux/cli.py"], cwd=project)
+            run(["git", "commit", "-m", "add mmux file"], cwd=project)
+            ensure_layout(project)
+            task_id = insert_task_for_test(
+                project,
+                "self mutate",
+                "pending",
+                {
+                    "resource": "src/mmux",
+                    "kind": "reflection",
+                    "reflection_self_modifying": True,
+                    "reflection_diff_max_lines": 2,
+                },
+            )
+            task = get_task(project, task_id)
+            assert task is not None
+            worktree = create_task_worktree(project, task, "codex")
+            try:
+                (worktree / "src" / "mmux" / "cli.py").write_text("a\nb\nc\nd\n", encoding="utf-8")
+                policy = check_diff_policy(project, worktree, "src/mmux", task)
+            finally:
+                cli.remove_git_worktree(project, worktree)
+
+            self.assertFalse(policy.ok)
+            self.assertEqual(policy.status, "self_mutation_diff_too_large")
+
+    def test_self_mutating_reflection_requires_extra_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "src" / "mmux").mkdir()
+            (project / "src" / "mmux" / "cli.py").write_text("value = 1\n", encoding="utf-8")
+            run(["git", "add", "src/mmux/cli.py"], cwd=project)
+            run(["git", "commit", "-m", "add mmux file"], cwd=project)
+            ensure_layout(project)
+            insert_task_for_test(
+                project,
+                "self mutate",
+                "pending",
+                {"resource": "src/mmux", "kind": "reflection", "reflection_self_modifying": True},
+            )
+            external = acquire_resource_lock(project, ".mmux/self-mutation", "claude", ttl_seconds=60)
+            self.assertTrue(external.ok)
+            driver = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                message = execute_driver_task(project, "codex", driver.generation)
+
+            task = list_tasks(project)[-1]
+            self.assertIn("requeued", message)
+            self.assertIn(".mmux/self-mutation", message)
+            self.assertEqual(task.status, "pending")
+
     def test_execute_reviewer_task_approves_patch_for_tester(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -2118,6 +2227,53 @@ exit 1
             self.assertIn("awaiting_test", message)
             self.assertEqual(task.status, "awaiting_test")
             self.assertEqual(task.payload.get("review_decision"), "approve")
+
+    def test_self_mutating_reflection_does_not_bypass_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "src" / "mmux").mkdir()
+            (project / "src" / "mmux" / "cli.py").write_text("value = 1\n", encoding="utf-8")
+            run(["git", "add", "src/mmux/cli.py"], cwd=project)
+            run(["git", "commit", "-m", "add mmux file"], cwd=project)
+            ensure_layout(project)
+            task_id = insert_task_for_test(
+                project,
+                "self mutate",
+                "awaiting_review",
+                {
+                    "resource": "src/mmux",
+                    "kind": "reflection",
+                    "reflection_self_modifying": True,
+                    "driver_agent": "codex",
+                },
+            )
+            task = get_task(project, task_id)
+            assert task is not None
+            worktree = create_task_worktree(project, task, "codex")
+            (worktree / "src" / "mmux" / "cli.py").write_text("value = 2\n", encoding="utf-8")
+            cli.update_task_payload(project, task_id, {"worktree": cli.relative_to_project(project, worktree)})
+            reviewer = acquire_role(project, "reviewer", "claude", ttl_seconds=60)
+            original = cli.invoke_reviewer_adapter
+
+            def fake_review(_project, _worktree, _agent, _task, _generation, _resource, _changed_files, **kwargs):
+                return cli.ReviewResult("invalid", ".mmux/runs/fake-review.log", "missing protocol", True)
+
+            cli.invoke_reviewer_adapter = fake_review
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_reviewer_task(project, "claude", reviewer.generation)
+            finally:
+                cli.invoke_reviewer_adapter = original
+
+            reviewed = get_task(project, task_id)
+            self.assertIsNotNone(reviewed)
+            assert reviewed is not None
+            self.assertIn("awaiting_review", message)
+            self.assertIn("review_required", message)
+            self.assertEqual(reviewed.status, "awaiting_review")
+            self.assertTrue(reviewed.payload.get("review_required"))
+            self.assertNotIn("review_bypassed", reviewed.payload)
 
     def test_execute_reviewer_task_requests_changes_to_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

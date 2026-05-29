@@ -163,11 +163,11 @@ The implementation collapses `running` / `running_review` / `running_test` into
 Check sub-step so scheduling can still prioritize reviewer and tester work
 without making them top-level task stages.
 
-The dormant `summarizer` role from `ASSIGNMENT_ROLE_PAIRS` finds a home in v2
-as the Act-stage summarizer: it compresses reviewer notes, tester logs, and
-agent struggles into the structured `act_summary` that feeds the next Plan.
-Without this compression, feeding raw Check output back into Plan would blow
-the context window on any non-trivial codebase.
+The Act-stage summarizer is currently an inline adapter call from tester, not a
+standalone role lease. It compresses reviewer notes, tester logs, and agent
+struggles into the structured `act_summary` that feeds the next Plan. Without
+this compression, feeding raw Check output back into Plan would blow the
+context window on any non-trivial codebase.
 
 ## Outcome: a separate column
 
@@ -211,10 +211,11 @@ tag on ordinary tasks. Reasons:
 - Admission policy is genuinely different: every reflection task has to
   cite concrete evidence (a file, a failure event, a reviewer note) before
   promotion from `proposed` to Plan.
-- Execution policy may become genuinely different: smaller diff caps,
-  mandatory reviewer behavior, or stricter handling for self-modifying runs
-  touching `src/mmux/` can hang off this boundary without changing the core
-  PDCA state model.
+- Self-modifying reflection tasks touching `src/mmux/` get a stricter execution
+  policy: a smaller diff cap, an extra `.mmux/self-mutation` lock, and no
+  reviewer-bypass path.
+- Other execution-policy differences can hang off this boundary later without
+  changing the core PDCA state model.
 - Keeping the kind explicit prevents future policy decisions from silently
   treating reflection tasks and ordinary tasks as identical.
 
@@ -247,5 +248,5 @@ mapped from their legacy status when the schema is opened.
 
 - The exact JSON shape of the Plan adapter's `read` / `plan` / `risks`
   contract may still tighten.
-- Reflection currently stores `kind=reflection` in task payload; stronger
-  per-kind execution policy is still future work.
+- `scout` and a standalone `summarizer` lease are still dormant roles; the
+  summarizer currently runs inline from tester.
