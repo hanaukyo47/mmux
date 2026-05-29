@@ -146,8 +146,7 @@ stage the work is in*, not *who is currently doing it*.
 
 The concurrency layer owns:
 
-- Role leases (`driver`, `reviewer`, `tester` — plus the dormant `scout` and
-  `summarizer` defined in `ASSIGNMENT_ROLE_PAIRS`).
+- Role leases (`driver`, `reviewer`, `tester`, `scout`, and `summarizer`).
 - Resource locks with path-prefix conflict detection.
 - The 5-minute assignment slot rotation.
 - Worker heartbeats and lease TTLs.
@@ -163,11 +162,12 @@ The implementation collapses `running` / `running_review` / `running_test` into
 Check sub-step so scheduling can still prioritize reviewer and tester work
 without making them top-level task stages.
 
-The Act-stage summarizer is currently an inline adapter call from tester, not a
-standalone role lease. It compresses reviewer notes, tester logs, and agent
-struggles into the structured `act_summary` that feeds the next Plan. Without
-this compression, feeding raw Check output back into Plan would blow the
-context window on any non-trivial codebase.
+The Act-stage summarizer runs inline from tester on the hot path, and the
+standalone `summarizer` lease backfills older completed tasks that do not yet
+have an `act_summary`. It compresses reviewer notes, tester logs, and agent
+struggles into the structured summary that feeds the next Plan. Without this
+compression, feeding raw Check output back into Plan would blow the context
+window on any non-trivial codebase.
 
 ## Outcome: a separate column
 
@@ -248,5 +248,5 @@ mapped from their legacy status when the schema is opened.
 
 - The exact JSON shape of the Plan adapter's `read` / `plan` / `risks`
   contract may still tighten.
-- `scout` and a standalone `summarizer` lease are still dormant roles; the
-  summarizer currently runs inline from tester.
+- `scout` currently proposes deterministic frontier work; it does not yet call
+  a model to discover research-style tasks.

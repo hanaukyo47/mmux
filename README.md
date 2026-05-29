@@ -125,7 +125,9 @@ patch back to the main worktree. After the patch
 applies, a summarizer call writes a compact `act_summary` into the task
 payload (3-5 bullets covering what changed, what verified it, surprises,
 and one watch-out for next time). The summary is best-effort: a
-summarizer failure logs but never blocks task completion. Reflection turns
+summarizer failure logs but never blocks task completion; the standalone
+`summarizer` role can later backfill completed tasks that are missing an
+`act_summary`. Reflection turns
 new summaries back into `pending` or `proposed` follow-up tasks during timed
 runs, with vague proposals held for human review.
 

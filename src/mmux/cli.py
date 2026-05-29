@@ -4624,7 +4624,9 @@ def supervisor_role_plan_for_project(project: Path, now: Optional[dt.datetime] =
         driver = driver_agents[0]
         tester = paired_tester_agent(driver, agents)
         return (("driver", driver), ("tester", tester))
-    return supervisor_role_plan(now)
+    if completed_task_needing_summary(project) is not None:
+        return (("summarizer", agents[0]), ("scout", agents[1]))
+    return (("scout", agents[0]), ("reviewer", agents[1]))
 
 
 def default_task_title(profile: ProjectProfile) -> str:
@@ -4673,6 +4675,16 @@ def maybe_replenish_default_task(
     if remaining_seconds < MIN_EXECUTION_BUDGET_SECONDS + shutdown_grace_seconds:
         return None
     return ensure_default_task(project, profile)
+
+
+def completed_task_needing_summary(project: Path) -> Optional[TaskRecord]:
+    for task in list_tasks(project):
+        if task.status != "completed":
+            continue
+        if "act_summary" in task.payload:
+            continue
+        return task
+    return None
 
 
 def cmd_task_add(args: argparse.Namespace) -> int:
@@ -6068,6 +6080,94 @@ def execute_tester_task(
         release_role(project, "tester", holder=agent, generation=generation)
 
 
+def execute_scout_task(project: Path, agent: str, generation: int) -> str:
+    role = acquire_role(project, "scout", agent, ROLE_LEASE_TTL_SECONDS, renew_if_same=True)
+    if not role.ok or role.generation != generation:
+        return "scout role lease is stale"
+
+    try:
+        update_worker_heartbeat(project, agent, "scouting", role="scout", generation=generation)
+        if has_open_tasks(project):
+            return "scout idle: open tasks exist"
+        profile = inspect_project(project)
+        task_id = ensure_frontier_task(project, profile)
+        if task_id is None:
+            write_log(project, f"{agent} scout found no frontier candidates")
+            return "scout found no frontier candidates"
+        write_log(project, f"{agent} scout added frontier task #{task_id}")
+        return f"scout added frontier task #{task_id}"
+    finally:
+        release_role(project, "scout", holder=agent, generation=generation)
+
+
+def execute_summarizer_task(
+    project: Path,
+    agent: str,
+    generation: int,
+    *,
+    timeout_seconds: int = SUMMARIZER_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> str:
+    role = acquire_role(project, "summarizer", agent, timeout_seconds + 60, renew_if_same=True)
+    if not role.ok or role.generation != generation:
+        return "summarizer role lease is stale"
+
+    try:
+        task = completed_task_needing_summary(project)
+        if task is None:
+            return "no completed task needs act_summary"
+        update_worker_heartbeat(project, agent, "summarizing", role="summarizer", generation=generation)
+        worktree = task_worktree_path(project, task)
+        execution_root = worktree if worktree is not None and worktree.exists() else project
+        context = {
+            "plan_text": task.payload.get("plan_text", ""),
+            "changed_files": task.payload.get("changed_files", []),
+            "review_message": task.payload.get("review_message", ""),
+            "tester_message": task.payload.get("last_message", ""),
+            "tester_baseline_failures": task.payload.get("tester_baseline_failures", []),
+        }
+        try:
+            summary = invoke_summarizer_adapter(
+                project,
+                execution_root,
+                agent,
+                task,
+                context,
+                timeout_seconds=timeout_seconds,
+                no_output_timeout_seconds=min(no_output_timeout_seconds, timeout_seconds),
+            )
+        except Exception as exc:
+            fallback_log = run_log_path(project, f"{agent}-summary", task.id)
+            fallback_log.write_text(f"{utc_now()} summarizer adapter failed: {exc}\n", encoding="utf-8")
+            summary = ActSummaryResult(
+                "",
+                relative_to_project(project, fallback_log),
+                f"summarizer adapter failed: {exc}",
+                False,
+            )
+
+        updates: dict[str, object] = {
+            "act_summary": summary.summary,
+            "act_summary_log": summary.log_file,
+            "act_summary_adapter_ok": summary.adapter_ok,
+            "act_summary_agent": agent,
+            "act_summary_backfilled": True,
+            "act_summary_backfilled_at": utc_now(),
+        }
+        if not summary.adapter_ok:
+            updates["act_summary_failure"] = summary.message
+        update_task_payload(project, task.id, updates)
+        record_project_event(
+            project,
+            "act_summary_backfilled",
+            {"id": task.id, "agent": agent, "adapter_ok": summary.adapter_ok, "log_file": summary.log_file},
+        )
+        write_log(project, f"{agent} summarizer backfilled task #{task.id} ok={summary.adapter_ok}")
+        return f"task #{task.id} act_summary backfilled log={summary.log_file}"
+    finally:
+        release_role(project, "summarizer", holder=agent, generation=generation)
+
+
 def execute_worker_available_task(
     project: Path,
     agent: str,
@@ -6083,6 +6183,8 @@ def execute_worker_available_task(
     tester = next((role for role in roles if role[0] == "tester"), None)
     reviewer = next((role for role in roles if role[0] == "reviewer"), None)
     driver = next((role for role in roles if role[0] == "driver"), None)
+    summarizer = next((role for role in roles if role[0] == "summarizer"), None)
+    scout = next((role for role in roles if role[0] == "scout"), None)
 
     if tester and counts.get("awaiting_test", 0) > 0:
         budget = execution_budget_seconds(run_deadline, test_timeout_seconds, shutdown_grace_seconds)
@@ -6118,6 +6220,25 @@ def execute_worker_available_task(
             no_output_timeout_seconds=min(agent_no_output_seconds, budget),
         )
         if message != "no pending task":
+            return message
+
+    if summarizer and completed_task_needing_summary(project) is not None:
+        budget = execution_budget_seconds(run_deadline, agent_timeout_seconds, shutdown_grace_seconds)
+        if budget < MIN_EXECUTION_BUDGET_SECONDS:
+            return f"not enough run time for summarizer budget={budget}s"
+        message = execute_summarizer_task(
+            project,
+            agent,
+            summarizer[1],
+            timeout_seconds=min(budget, SUMMARIZER_TIMEOUT_SECONDS),
+            no_output_timeout_seconds=min(agent_no_output_seconds, budget),
+        )
+        if message != "no completed task needs act_summary":
+            return message
+
+    if scout and not has_open_tasks(project):
+        message = execute_scout_task(project, agent, scout[1])
+        if message != "scout idle: open tasks exist":
             return message
 
     return None

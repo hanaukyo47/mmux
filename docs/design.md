@@ -23,13 +23,14 @@ The system must prevent:
 Agents are workers. Roles are seats.
 
 ```text
-codex  -> may hold driver/reviewer/scout/tester leases
-claude -> may hold driver/reviewer/scout/tester leases
+codex  -> may hold driver/reviewer/scout/tester/summarizer leases
+claude -> may hold driver/reviewer/scout/tester/summarizer leases
 
 driver lease   -> only holder may write code
 reviewer lease -> reads diff and writes review
 scout lease    -> proposes frontier candidates
 tester lease   -> runs deterministic validation
+summarizer lease -> backfills missing act_summary records
 ```
 
 The supervisor owns:

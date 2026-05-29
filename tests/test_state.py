@@ -361,6 +361,89 @@ class StateTests(unittest.TestCase):
             set_task_status_for_test(project, 1, "awaiting_review", payload={"driver_agent": "codex"})
             self.assertEqual(supervisor_role_plan_for_project(project, first), (("reviewer", "claude"), ("driver", "codex")))
 
+    def test_supervisor_project_plan_prioritizes_summary_backlog_when_queue_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            ensure_layout(project)
+            now = dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
+            insert_task_for_test(project, "completed without summary", "completed", {"resource": "src"})
+
+            self.assertEqual(supervisor_role_plan_for_project(project, now), (("summarizer", "codex"), ("scout", "claude")))
+
+    def test_worker_scout_role_adds_frontier_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            (project / "src" / "app.py").write_text("value = 1\n# TODO: cover edge case\n", encoding="utf-8")
+            ensure_layout(project)
+            scout = acquire_role(project, "scout", "codex", ttl_seconds=60)
+
+            message = execute_worker_available_task(
+                project,
+                "codex",
+                [("scout", scout.generation, scout.lease_until)],
+                run_deadline="",
+                agent_timeout_seconds=60,
+                agent_no_output_seconds=30,
+                test_timeout_seconds=60,
+                shutdown_grace_seconds=15,
+            )
+
+            self.assertIsNotNone(message)
+            assert message is not None
+            self.assertIn("scout added frontier task", message)
+            tasks = list_tasks(project)
+            self.assertEqual(len(tasks), 1)
+            self.assertIn("Resolve TODO", tasks[0].title)
+
+    def test_worker_summarizer_role_backfills_missing_act_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            task_id = insert_task_for_test(
+                project,
+                "completed without summary",
+                "completed",
+                {"resource": "src", "changed_files": ["src/app.py"], "last_message": "tester passed"},
+            )
+            summarizer = acquire_role(project, "summarizer", "claude", ttl_seconds=60)
+
+            def fake_summary(_project, _worktree, _agent, _task, _context, **_kwargs):
+                return cli.ActSummaryResult(
+                    "- backfilled summary\n- tester passed",
+                    ".mmux/runs/fake-summary.log",
+                    "ok",
+                    True,
+                )
+
+            original = cli.invoke_summarizer_adapter
+            cli.invoke_summarizer_adapter = fake_summary
+            try:
+                message = execute_worker_available_task(
+                    project,
+                    "claude",
+                    [("summarizer", summarizer.generation, summarizer.lease_until)],
+                    run_deadline="",
+                    agent_timeout_seconds=60,
+                    agent_no_output_seconds=30,
+                    test_timeout_seconds=60,
+                    shutdown_grace_seconds=15,
+                )
+            finally:
+                cli.invoke_summarizer_adapter = original
+
+            self.assertIsNotNone(message)
+            assert message is not None
+            self.assertIn("act_summary backfilled", message)
+            task = get_task(project, task_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.status, "completed")
+            self.assertTrue(task.payload["act_summary_adapter_ok"])
+            self.assertTrue(task.payload["act_summary_backfilled"])
+            self.assertIn("backfilled summary", task.payload["act_summary"])
+
     def test_cleanup_runtime_state_releases_active_runtime_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
