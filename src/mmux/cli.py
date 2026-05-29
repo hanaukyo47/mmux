@@ -30,6 +30,8 @@ REQUEUEABLE_TASK_STATUSES = ("blocked", "failed", "rejected", "no_change", "prop
 REFLECTION_RECENT_LIMIT = 10
 REFLECTION_MAX_PROPOSALS = 5
 REFLECTION_TIMEOUT_SECONDS = 5 * 60
+SCOUT_TIMEOUT_SECONDS = 5 * 60
+SCOUT_MAX_FILES = 200
 ROLE_LEASE_TTL_SECONDS = 2 * 60
 RESOURCE_LOCK_TTL_SECONDS = 10 * 60
 WORKER_REFRESH_SECONDS = 5
@@ -59,6 +61,11 @@ SELF_MUTATION_RESOURCE = "src/mmux"
 SELF_MUTATION_LOCK_RESOURCE = ".mmux/self-mutation"
 SELF_MUTATION_MAX_CHANGED_FILES = 3
 SELF_MUTATION_MAX_CHANGED_LINES = 240
+WORKTREE_ARCHIVE_DIRNAME = "archive"
+KEEP_WORKTREES_ENV = "MMUX_KEEP_WORKTREES"
+# Statuses whose task worktree still holds a diff the pipeline needs (the
+# driver's change waiting for review/test). Everything else is disposable.
+WORKTREE_KEEP_STATUSES = ("awaiting_review", "running_review", "awaiting_test", "running_test")
 
 
 @dataclass(frozen=True)
@@ -1777,6 +1784,12 @@ def finish_task(
             last_error=last_error,
         )
         record_event(db, "task_finished", {"id": task_id, "status": actual_status, "log_file": log_file})
+    # A terminal task no longer needs its worktree; reclaim it best-effort so a
+    # failure here never blocks completion.
+    try:
+        cleanup_task_worktrees(project, task_id, payload)
+    except Exception as exc:  # pragma: no cover - defensive
+        write_log(project, f"worktree cleanup failed for task #{task_id}: {exc}")
 
 
 def write_log(project: Path, message: str) -> None:
@@ -1876,6 +1889,12 @@ def cleanup_runtime_state(project: Path) -> None:
                 },
             )
         record_event(db, "runtime_stopped", {})
+    # Reclaim worktrees from tasks that were reset out of an in-progress stage or
+    # never finished; keep only those whose diff is still awaiting review/test.
+    try:
+        prune_orphan_worktrees(project)
+    except Exception as exc:  # pragma: no cover - defensive
+        write_log(project, f"worktree prune on stop failed: {exc}")
 
 
 def require_project_state(project: Path) -> None:
@@ -2004,6 +2023,98 @@ def remove_git_worktree(project: Path, path: Path) -> None:
     run(["git", "worktree", "remove", "--force", str(path)], cwd=project, check=False)
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
+
+
+def prune_git_worktrees(project: Path) -> None:
+    run(["git", "worktree", "prune"], cwd=project, check=False)
+
+
+def archive_root(project: Path) -> Path:
+    return mmux_dir(project) / WORKTREE_ARCHIVE_DIRNAME
+
+
+def worktree_cleanup_enabled() -> bool:
+    """Cleanup is on by default; set MMUX_KEEP_WORKTREES=1 to keep them for debugging."""
+    value = os.environ.get(KEEP_WORKTREES_ENV, "").strip().lower()
+    return value not in {"1", "true", "yes", "on"}
+
+
+def task_worktree_candidates(project: Path, task_id: int, payload: dict[str, object]) -> list[Path]:
+    """Every worktree dir that belongs to a task: the recorded one plus any
+    task-{id}-* / baseline-{id}-* dirs left behind by earlier driver attempts."""
+    found: dict[str, Path] = {}
+    recorded = payload.get("worktree") if isinstance(payload, dict) else None
+    if isinstance(recorded, str) and recorded:
+        path = (project / recorded)
+        found[str(path.resolve())] = path
+    root = worktree_root(project)
+    if root.exists():
+        for child in root.iterdir():
+            if child.name.startswith(f"task-{task_id}-") or child.name.startswith(f"baseline-{task_id}-"):
+                found[str(child.resolve())] = child
+    return list(found.values())
+
+
+def archive_worktree_patch(project: Path, task_id: int, worktree: Path) -> str:
+    """Best-effort: snapshot a worktree's uncommitted diff into .mmux/archive
+    before the worktree is removed, so a human can inspect what an agent tried."""
+    try:
+        if not worktree.exists():
+            return ""
+        patch = export_worktree_patch(worktree)
+    except Exception:
+        return ""
+    if not patch.strip():
+        return ""
+    dest_dir = archive_root(project)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stamp = utc_now().replace(":", "").replace("+", "Z")
+    dest = dest_dir / f"task-{task_id}-{stamp}.patch"
+    dest.write_text(patch, encoding="utf-8")
+    return relative_to_project(project, dest)
+
+
+def cleanup_task_worktrees(project: Path, task_id: int, payload: dict[str, object]) -> list[str]:
+    """Archive the task's diff, then remove all of its worktrees. Called when a
+    task reaches a terminal outcome so worktrees do not accumulate across runs."""
+    if not worktree_cleanup_enabled():
+        return []
+    recorded = payload.get("worktree") if isinstance(payload, dict) else None
+    if isinstance(recorded, str) and recorded:
+        archive_worktree_patch(project, task_id, project / recorded)
+    removed: list[str] = []
+    for path in task_worktree_candidates(project, task_id, payload):
+        remove_git_worktree(project, path)
+        removed.append(relative_to_project(project, path))
+    if removed:
+        prune_git_worktrees(project)
+    return removed
+
+
+def prune_orphan_worktrees(project: Path) -> int:
+    """Remove worktree dirs not tied to a task that still needs its diff. Used on
+    stop to reclaim worktrees from crashed or abandoned runs."""
+    if not worktree_cleanup_enabled():
+        return 0
+    root = worktree_root(project)
+    if not root.exists():
+        return 0
+    keep: set[str] = set()
+    for task in list_tasks(project):
+        if task.status not in WORKTREE_KEEP_STATUSES:
+            continue
+        recorded = task.payload.get("worktree")
+        if isinstance(recorded, str) and recorded:
+            keep.add(str((project / recorded).resolve()))
+    removed = 0
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or str(child.resolve()) in keep:
+            continue
+        remove_git_worktree(project, child)
+        removed += 1
+    if removed:
+        prune_git_worktrees(project)
+    return removed
 
 
 def split_nul_paths(output: str) -> list[str]:
@@ -3002,16 +3113,19 @@ def enqueue_proposal(
     source_task_ids: list[int],
     *,
     auto_promote: bool,
+    source: str = "reflect",
 ) -> tuple[int, str]:
     normalized_resource = normalize_resource(project, proposal.resource)
     status = "pending" if auto_promote else "proposed"
     state = task_state_for_status(status)
     now = utc_now()
     self_modifying = resource_touches_self_mutation(normalized_resource)
+    # kind stays "reflection" regardless of source so LLM-proposed tasks share one
+    # admission gate and the self-mutation policy (see task_requires_self_mutation_policy).
     payload = {
         "resource": normalized_resource,
         "kind": "reflection",
-        "source": "reflect",
+        "source": source,
         "reflection_evidence": proposal.evidence,
         "reflection_from_tasks": list(source_task_ids),
         "reflection_proposed_at": now,
@@ -3056,6 +3170,7 @@ def enqueue_proposal(
                 "title": proposal.title,
                 "resource": normalized_resource,
                 "kind": "reflection",
+                "source": source,
                 "status": status,
                 "auto_promoted": auto_promote,
                 "evidence": proposal.evidence,
@@ -3177,6 +3292,132 @@ def maybe_replenish_reflection_task(
     if outcome.source_task_ids and outcome.adapter_ok:
         mark_auto_reflected(project, outcome.source_task_ids, outcome)
     return outcome if outcome.source_task_ids else None
+
+
+def build_scout_prompt(agent: str, profile: ProjectProfile, files: list[str]) -> str:
+    file_lines = "\n".join(f"- {path}" for path in files) if files else "<no files listed>"
+    profile_lines = [
+        f"ecosystems: {', '.join(profile.ecosystems) or '<none>'}",
+        f"languages: {', '.join(profile.languages) or '<none>'}",
+        f"markers: {', '.join(profile.markers) or '<none>'}",
+        f"active checks: {', '.join(check.name for check in profile.active_checks) or '<none>'}",
+        f"suggested checks: {', '.join(check.name for check in profile.suggested_checks) or '<none>'}",
+    ]
+    return "\n".join(
+        [
+            f"You are the {agent} scout running under mmux.",
+            "",
+            "The task queue is empty. Explore this repository and propose concrete,"
+            " small next tasks that push toward an unexplored boundary:",
+            "- a module or file that has no tests or thin coverage",
+            "- a verification gap one of the suggested checks above would close",
+            "- a risky or load-bearing area worth hardening",
+            "- a documented TODO/FIXME you can point to",
+            "",
+            "Do NOT propose vague rewrites or broad refactors. Each task must be small"
+            " enough for a single driver to complete and verify.",
+            "",
+            "Each proposed task must cite at least one piece of evidence: a file path"
+            " under this project, or a task #N.",
+            "",
+            "Output exactly one line per proposed task using this format:",
+            'MMUX_REFLECT_TASK title="<short title>" resource="<path under project, or .>" evidence="<file path or task #N>"',
+            "",
+            f"Output at most {REFLECTION_MAX_PROPOSALS} lines. If nothing useful jumps out, output zero MMUX_REFLECT_TASK lines.",
+            "Finish with exactly one final line:",
+            "MMUX_REFLECT END",
+            "",
+            "--- project profile ---",
+            *profile_lines,
+            "",
+            "--- repository files ---",
+            file_lines,
+            "--- end repository files ---",
+        ]
+    )
+
+
+def invoke_scout_adapter(
+    project: Path,
+    agent: str,
+    profile: ProjectProfile,
+    files: list[str],
+    *,
+    timeout_seconds: int = SCOUT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> ReflectionResult:
+    prompt = build_scout_prompt(agent, profile, files)
+    log_file = run_log_path(project, f"{agent}-scout", 0)
+    output_file = log_file.with_suffix(".last-message.txt")
+    cmd = build_agent_command(agent, project, prompt, output_file)
+    result = stream_agent_command(
+        project,
+        cmd,
+        log_file,
+        timeout_seconds=timeout_seconds,
+        no_output_timeout_seconds=no_output_timeout_seconds,
+    )
+    output_text = ""
+    if output_file.exists():
+        output_text = output_file.read_text(encoding="utf-8", errors="replace")
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("\n--- last message ---\n")
+            handle.write(output_text)
+            handle.write("\n")
+    if not output_text:
+        output_text = log_file.read_text(encoding="utf-8", errors="replace")
+    relative_log = relative_to_project(project, log_file)
+    if not result.ok:
+        return ReflectionResult((), relative_log, result.message, False)
+    proposals = tuple(parse_reflection_tasks(output_text))
+    return ReflectionResult(proposals, relative_log, result.message, True)
+
+
+def scout_with_model(
+    project: Path,
+    agent: str,
+    profile: ProjectProfile,
+    *,
+    timeout_seconds: int = SCOUT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> Optional[str]:
+    """Ask a model to discover research-style tasks. Returns a status message when
+    it admits at least one proposal, else None so the caller falls back to the
+    deterministic frontier. Proposals go through the same admission gate as
+    reflection: concrete evidence auto-promotes, vague ones wait as proposed."""
+    files = list_project_files(project, limit=SCOUT_MAX_FILES)
+    try:
+        scouted = invoke_scout_adapter(
+            project,
+            agent,
+            profile,
+            files,
+            timeout_seconds=timeout_seconds,
+            no_output_timeout_seconds=no_output_timeout_seconds,
+        )
+    except Exception as exc:
+        write_log(project, f"{agent} scout model unavailable: {exc}")
+        return None
+    if not scouted.adapter_ok:
+        write_log(project, f"{agent} scout model failed: {scouted.message}")
+        return None
+    if not scouted.proposals:
+        return None
+    promoted: list[int] = []
+    proposed: list[int] = []
+    for proposal in scouted.proposals:
+        auto = evidence_is_concrete(project, proposal.evidence)
+        task_id, status = enqueue_proposal(project, proposal, [], auto_promote=auto, source="scout")
+        if status == "pending":
+            promoted.append(task_id)
+        else:
+            proposed.append(task_id)
+    parts = [f"scout proposed {len(scouted.proposals)} task(s)"]
+    if promoted:
+        parts.append("promoted=" + ",".join(f"#{tid}" for tid in promoted))
+    if proposed:
+        parts.append("proposed=" + ",".join(f"#{tid}" for tid in proposed))
+    return " ".join(parts)
 
 
 def build_summarizer_prompt(agent: str, task: TaskRecord, context: dict[str, object]) -> str:
@@ -6080,7 +6321,14 @@ def execute_tester_task(
         release_role(project, "tester", holder=agent, generation=generation)
 
 
-def execute_scout_task(project: Path, agent: str, generation: int) -> str:
+def execute_scout_task(
+    project: Path,
+    agent: str,
+    generation: int,
+    *,
+    timeout_seconds: int = SCOUT_TIMEOUT_SECONDS,
+    no_output_timeout_seconds: int = AGENT_NO_OUTPUT_TIMEOUT_SECONDS,
+) -> str:
     role = acquire_role(project, "scout", agent, ROLE_LEASE_TTL_SECONDS, renew_if_same=True)
     if not role.ok or role.generation != generation:
         return "scout role lease is stale"
@@ -6090,6 +6338,17 @@ def execute_scout_task(project: Path, agent: str, generation: int) -> str:
         if has_open_tasks(project):
             return "scout idle: open tasks exist"
         profile = inspect_project(project)
+        scouted = scout_with_model(
+            project,
+            agent,
+            profile,
+            timeout_seconds=timeout_seconds,
+            no_output_timeout_seconds=no_output_timeout_seconds,
+        )
+        if scouted is not None:
+            write_log(project, f"{agent} scout {scouted}")
+            return scouted
+        # Model unavailable or produced nothing: fall back to deterministic frontier.
         task_id = ensure_frontier_task(project, profile)
         if task_id is None:
             write_log(project, f"{agent} scout found no frontier candidates")
@@ -6237,7 +6496,16 @@ def execute_worker_available_task(
             return message
 
     if scout and not has_open_tasks(project):
-        message = execute_scout_task(project, agent, scout[1])
+        budget = execution_budget_seconds(run_deadline, agent_timeout_seconds, shutdown_grace_seconds)
+        if budget < MIN_EXECUTION_BUDGET_SECONDS:
+            return f"not enough run time for scout budget={budget}s"
+        message = execute_scout_task(
+            project,
+            agent,
+            scout[1],
+            timeout_seconds=min(budget, SCOUT_TIMEOUT_SECONDS),
+            no_output_timeout_seconds=min(agent_no_output_seconds, budget),
+        )
         if message != "scout idle: open tasks exist":
             return message
 
