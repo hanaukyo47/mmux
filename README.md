@@ -109,14 +109,17 @@ By default, workers record heartbeat and lease state without editing code. Use
 `mmux start --execute-agents` for manual tmux control. With execution enabled,
 the worker holding `driver` claims a pending task, acquires its resource lock,
 creates an isolated git worktree, and runs a structured plan step (Codex or
-Claude Code outputs a `READ` / `PLAN` / `RISKS` artifact ending in
-`MMUX_PLAN PROCEED` or `MMUX_PLAN ABORT`). A `PROCEED` plan is then
-reviewed inline (same `MMUX_REVIEW APPROVE` / `REQUEST_CHANGES` protocol
-as the diff reviewer). Approved plans flow into the subsequent diff step
-as context; the first `REQUEST_CHANGES` requeues the task so the next
-driver can plan again, and a second rejection moves the task to
-`blocked`. `ABORT` short-circuits the task to `no_change` without
-burning a diff attempt.
+Claude Code outputs a JSON `{read, plan, risks}` contract ending in
+`MMUX_PLAN PROCEED` or `MMUX_PLAN ABORT`). A `PROCEED` plan first passes a
+deterministic gate (`read` must be non-empty and cite a real path under the
+project, `plan` must be non-empty), which catches a planner guessing without
+reading before any model reviewer runs; it is then reviewed inline (same
+`MMUX_REVIEW APPROVE` / `REQUEST_CHANGES` protocol as the diff reviewer). A
+contract that fails the gate is treated as a request-changes. Approved plans
+flow into the subsequent diff step as context; the first `REQUEST_CHANGES`
+requeues the task so the next driver can plan again, and a second rejection
+moves the task to `blocked`. `ABORT` short-circuits the task to `no_change`
+without burning a diff attempt.
 Accepted driver diffs move to Check's review step (`awaiting_review` as the
 compatibility label); the peer `reviewer` can approve or request changes, and
 only reviewed or bypassed diffs move to Check's test step (`awaiting_test`).

@@ -166,11 +166,14 @@ def approve_review_task(project: Path, *, agent: str = "claude") -> str:
         cli.invoke_reviewer_adapter = original
 
 
+_FAKE_PLAN_JSON = '{"read": ["src/app.py"], "plan": ["update value in src/app.py"], "risks": ["none"]}'
+
+
 def _fake_planner_proceed(_project, _worktree, _agent, _task, _generation, _resource, **kwargs):
     return cli.PlanResult(
         "proceed",
         ".mmux/runs/fake-plan.log",
-        "PLAN: do the thing\nMMUX_PLAN PROCEED",
+        f"{_FAKE_PLAN_JSON}\nMMUX_PLAN PROCEED",
         "",
         True,
     )
@@ -1824,8 +1827,8 @@ exit 1
             self.assertEqual(tasks[-1].payload["driver_agent"], "codex")
             self.assertIn("worktree", tasks[-1].payload)
             self.assertEqual(tasks[-1].payload["plan_decision"], "proceed")
-            self.assertIn("PLAN:", tasks[-1].payload["plan_text"])
-            self.assertEqual(captured_plan, ["PLAN: do the thing\nMMUX_PLAN PROCEED"])
+            self.assertEqual(tasks[-1].payload["plan_contract"]["read"], ["src/app.py"])
+            self.assertEqual(captured_plan, [f"{_FAKE_PLAN_JSON}\nMMUX_PLAN PROCEED"])
 
     def test_execute_driver_task_requeues_adapter_health_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1963,6 +1966,52 @@ exit 1
             tasks = list_tasks(project)
             self.assertEqual(tasks[-1].status, "blocked")
             self.assertEqual(tasks[-1].payload["plan_review_attempts"], 2)
+
+    def test_execute_driver_task_requeues_on_invalid_plan_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+            ensure_layout(project)
+            enqueue_task(project, "change src", resource="src")
+            lease = acquire_role(project, "driver", "codex", ttl_seconds=60)
+
+            adapter_called = []
+            reviewer_called = []
+
+            def fake_adapter(*_args, **_kwargs):
+                adapter_called.append(True)
+                return cli.AdapterResult(True, 0, ".mmux/runs/should-not-run.log", "ok")
+
+            def fake_planner_empty_read(_project, _worktree, _agent, _task, _generation, _resource, **kwargs):
+                return cli.PlanResult(
+                    "proceed",
+                    ".mmux/runs/fake-plan.log",
+                    '{"read": [], "plan": ["change it"], "risks": ["none"]}\nMMUX_PLAN PROCEED',
+                    "",
+                    True,
+                )
+
+            def recording_plan_reviewer(*_args, **_kwargs):
+                reviewer_called.append(True)
+                return cli.ReviewResult("approve", ".mmux/runs/fake-plan-review.log", "", True)
+
+            original_adapter = cli.invoke_agent_adapter
+            cli.invoke_agent_adapter = fake_adapter
+            try:
+                with patched_planner(fake_planner_empty_read, plan_reviewer_stub=recording_plan_reviewer), contextlib.redirect_stdout(io.StringIO()):
+                    message = execute_driver_task(project, "codex", lease.generation)
+            finally:
+                cli.invoke_agent_adapter = original_adapter
+
+            self.assertIn("requeued", message)
+            self.assertEqual(reviewer_called, [], "deterministic gate must reject before the LLM plan reviewer runs")
+            self.assertEqual(adapter_called, [], "driver adapter must not run after an invalid plan contract")
+            tasks = list_tasks(project)
+            self.assertEqual(tasks[-1].status, "pending")
+            self.assertEqual(tasks[-1].payload["plan_review_decision"], "request_changes")
+            self.assertEqual(tasks[-1].payload["plan_review_attempts"], 1)
+            self.assertIn("plan contract invalid", tasks[-1].payload["plan_review_last_reason"])
+            self.assertEqual(tasks[-1].payload["plan_contract"]["plan"], ["change it"])
 
     def test_execute_driver_task_bypasses_plan_review_adapter_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2102,6 +2151,40 @@ exit 1
 
         decision, message = parse_planner_decision("MMUX_PLAN WHATEVER")
         self.assertEqual(decision, "invalid")
+
+    def test_parse_plan_contract_reads_plain_and_fenced_json(self) -> None:
+        plain = cli.parse_plan_contract(
+            '{"read": ["src/app.py"], "plan": ["do it"], "risks": ["none"]}\nMMUX_PLAN PROCEED'
+        )
+        self.assertEqual(plain["read"], ["src/app.py"])
+        self.assertEqual(plain["plan"], ["do it"])
+
+        fenced = cli.parse_plan_contract(
+            'prose\n```json\n{"read": ["a.py"], "plan": ["x"], "risks": []}\n```\nMMUX_PLAN PROCEED'
+        )
+        self.assertEqual(fenced["read"], ["a.py"])
+        self.assertEqual(fenced["risks"], [])
+
+        missing = cli.parse_plan_contract("READ: foo\nPLAN: bar\nMMUX_PLAN PROCEED")
+        self.assertEqual(missing, {"read": [], "plan": [], "risks": []})
+
+    def test_plan_contract_problems_flags_missing_read_and_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            init_git_project(project)
+
+            self.assertEqual(
+                cli.plan_contract_problems(project, {"read": ["src/app.py"], "plan": ["change value"], "risks": []}),
+                [],
+            )
+            empty_read = cli.plan_contract_problems(project, {"read": [], "plan": ["x"], "risks": []})
+            self.assertTrue(any("read list is empty" in problem for problem in empty_read))
+
+            hallucinated = cli.plan_contract_problems(project, {"read": ["does/not/exist.py"], "plan": ["x"], "risks": []})
+            self.assertTrue(any("no real path" in problem for problem in hallucinated))
+
+            empty_plan = cli.plan_contract_problems(project, {"read": ["src/app.py"], "plan": [], "risks": []})
+            self.assertTrue(any("plan list is empty" in problem for problem in empty_plan))
 
     def test_parse_reflection_tasks_extracts_quoted_fields(self) -> None:
         text = "\n".join(

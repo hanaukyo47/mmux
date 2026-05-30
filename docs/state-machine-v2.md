@@ -246,8 +246,11 @@ mapped from their legacy status when the schema is opened.
 
 ## What remains open
 
-- The exact JSON shape of the Plan adapter's `read` / `plan` / `risks`
-  contract may still tighten.
+- The Plan adapter now emits a JSON `{read, plan, risks}` contract, gated
+  deterministically before the LLM plan reviewer (`read` non-empty and citing a
+  real path; `plan` non-empty); a deficient contract becomes a request-changes
+  and follows the existing escalation. Still open: the gate does not yet check
+  that `read` covers the files the `plan` proposes to touch.
 - `scout` now calls a model to discover research-style tasks from the project
   profile and file tree, falling back to deterministic frontier work when the
   model is unavailable or proposes nothing. Its proposals flow through the same
