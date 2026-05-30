@@ -3468,7 +3468,18 @@ def build_plan_reviewer_prompt(
     resource: str,
     plan_text: str,
 ) -> str:
-    plan_block = plan_text.strip() or "<empty plan>"
+    contract = parse_plan_contract(plan_text)
+    if contract["read"] or contract["plan"] or contract["risks"]:
+        def block(label: str, items: list[str]) -> list[str]:
+            return [label, *([f"- {item}" for item in items] or ["- <none>"])]
+
+        plan_block = "\n".join(
+            block("READ:", contract["read"])
+            + block("PLAN:", contract["plan"])
+            + block("RISKS:", contract["risks"])
+        )
+    else:
+        plan_block = plan_text.strip() or "<empty plan>"
     return "\n".join(
         [
             f"You are the {agent} plan reviewer running under mmux.",
@@ -3517,18 +3528,18 @@ def build_planner_prompt(agent: str, task: TaskRecord, role_generation: int, res
             "Produce a small, verifiable plan that a separate driver step will execute.",
             "Keep the plan scoped to the locked resource. Prefer the smallest change that addresses the task.",
             "",
-            "Write a final block with exactly these three labeled sections, in order:",
+            "Output a single JSON object (optionally inside a ```json fence) with exactly these keys:",
+            '  "read":  array of files / paths / greps / tests you actually consulted (use real paths under this project)',
+            '  "plan":  array of 2-6 short steps describing what to change and why',
+            '  "risks": array of areas plausibly affected that you did not read (use ["none"] if there are none)',
             "",
-            "READ:",
-            "<bullet list of files / paths / greps / tests you actually consulted>",
+            "Example:",
+            '{"read": ["src/foo.py", "tests/test_foo.py"], "plan": ["Guard foo() against empty input"], "risks": ["none"]}',
             "",
-            "PLAN:",
-            "<2-6 short steps describing what to change and why>",
+            "The supervisor checks this object deterministically before any human-style review:",
+            "read must be non-empty and cite a real path, and plan must be non-empty.",
             "",
-            "RISKS:",
-            "<bullet list of areas plausibly affected that you did not read; write 'none' if there are none>",
-            "",
-            "Finish with exactly one final protocol line:",
+            "After the JSON object, finish with exactly one final protocol line:",
             "MMUX_PLAN PROCEED",
             "or",
             "MMUX_PLAN ABORT: <short reason this task cannot be planned within scope>",
@@ -3599,6 +3610,70 @@ def parse_planner_decision(text: str) -> tuple[str, str]:
         if upper.startswith("ABORT"):
             return "abort", normalized[len("ABORT") :].lstrip(" :-")
     return "invalid", "missing MMUX_PLAN PROCEED or MMUX_PLAN ABORT"
+
+
+def _extract_json_object(text: str) -> Optional[dict[str, object]]:
+    candidates: list[str] = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start : end + 1])
+    for chunk in candidates:
+        try:
+            parsed = json.loads(chunk)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def parse_plan_contract(text: str) -> dict[str, list[str]]:
+    """Pull the structured {read, plan, risks} contract out of a planner's output.
+    Returns empty lists when no JSON object is present so callers can reject it."""
+
+    def as_list(value: object) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        return []
+
+    obj = _extract_json_object(text) or {}
+    return {
+        "read": as_list(obj.get("read")),
+        "plan": as_list(obj.get("plan")),
+        "risks": as_list(obj.get("risks")),
+    }
+
+
+def plan_contract_cites_real_path(project: Path, entries: Iterable[str]) -> bool:
+    project_resolved = project.resolve()
+    for entry in entries:
+        for token in re.findall(r"[A-Za-z0-9_./-]+", entry):
+            candidate = (project / token).resolve()
+            if candidate == project_resolved:
+                continue
+            try:
+                candidate.relative_to(project_resolved)
+            except ValueError:
+                continue
+            if candidate.exists():
+                return True
+    return False
+
+
+def plan_contract_problems(project: Path, contract: dict[str, list[str]]) -> list[str]:
+    """Deterministic checks that catch a planner guessing without reading. Run
+    before the LLM plan reviewer so a structurally deficient plan never reaches it."""
+    problems: list[str] = []
+    if not contract.get("read"):
+        problems.append("read list is empty (no files, greps, or tests consulted)")
+    elif not plan_contract_cites_real_path(project, contract["read"]):
+        problems.append("read list cites no real path under the project")
+    if not contract.get("plan"):
+        problems.append("plan list is empty")
+    return problems
 
 
 def build_agent_command(agent: str, project: Path, prompt: str, output_file: Path) -> list[str]:
@@ -5705,29 +5780,40 @@ def execute_driver_task(
         driver_plan_text = plan_result.plan_text if plan_result.decision == "proceed" else ""
 
         if plan_result.decision == "proceed":
+            contract = parse_plan_contract(plan_result.plan_text)
+            plan_payload["plan_contract"] = contract
+            contract_problems = plan_contract_problems(project, contract)
             print(f"reviewing plan for task #{task.id} ({agent})")
             sys.stdout.flush()
-            try:
-                plan_review = invoke_plan_reviewer_adapter(
-                    project,
-                    worktree,
-                    agent,
-                    task,
-                    generation,
-                    lock.resource,
-                    plan_result.plan_text,
-                    timeout_seconds=timeout_seconds,
-                    no_output_timeout_seconds=min(no_output_timeout_seconds, timeout_seconds),
-                )
-            except Exception as exc:
-                fallback_log = run_log_path(project, f"{agent}-plan-review", task.id)
-                fallback_log.write_text(f"{utc_now()} plan reviewer adapter failed: {exc}\n", encoding="utf-8")
-                plan_review = ReviewResult(
-                    "adapter_failed",
-                    relative_to_project(project, fallback_log),
-                    str(exc),
-                    False,
-                )
+            if contract_problems:
+                # Deterministic gate: a structurally deficient plan is rejected as a
+                # request_changes without spending an LLM reviewer call, then flows
+                # through the same peer-takeover escalation as a review rejection.
+                reason = "plan contract invalid: " + "; ".join(contract_problems)
+                plan_review = ReviewResult("request_changes", plan_result.log_file, reason, True)
+                write_log(project, f"{agent} plan contract rejected for task #{task.id}: {reason}")
+            else:
+                try:
+                    plan_review = invoke_plan_reviewer_adapter(
+                        project,
+                        worktree,
+                        agent,
+                        task,
+                        generation,
+                        lock.resource,
+                        plan_result.plan_text,
+                        timeout_seconds=timeout_seconds,
+                        no_output_timeout_seconds=min(no_output_timeout_seconds, timeout_seconds),
+                    )
+                except Exception as exc:
+                    fallback_log = run_log_path(project, f"{agent}-plan-review", task.id)
+                    fallback_log.write_text(f"{utc_now()} plan reviewer adapter failed: {exc}\n", encoding="utf-8")
+                    plan_review = ReviewResult(
+                        "adapter_failed",
+                        relative_to_project(project, fallback_log),
+                        str(exc),
+                        False,
+                    )
 
             plan_payload["plan_review_log"] = plan_review.log_file
             plan_payload["plan_review_decision"] = plan_review.decision
