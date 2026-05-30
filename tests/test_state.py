@@ -2899,3 +2899,31 @@ exit 1
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DemoSmokeTests(unittest.TestCase):
+    def test_alpha_demo_runs_to_completion(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        demo = repo_root / "scripts" / "demo_alpha.py"
+        env = dict(os.environ)
+        # The demo creates throwaway git repos and commits; neutralize any
+        # global git config (e.g. commit.gpgsign) so the smoke test is stable.
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env.setdefault("GIT_AUTHOR_NAME", "t")
+        env.setdefault("GIT_AUTHOR_EMAIL", "t@t")
+        env.setdefault("GIT_COMMITTER_NAME", "t")
+        env.setdefault("GIT_COMMITTER_EMAIL", "t@t")
+        env["PYTHONPATH"] = str(repo_root / "src")
+        result = subprocess.run(
+            [sys.executable, str(demo)],
+            cwd=str(repo_root),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"demo exited {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("final task status:           completed", result.stdout)

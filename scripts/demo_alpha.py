@@ -78,15 +78,16 @@ def main() -> int:
         def fake_planner(_project, _worktree, _agent, _task, _generation, _resource, **_kwargs):
             nonlocal plan_attempts
             plan_attempts += 1
+            # Emit the JSON {read, plan, risks} contract the deterministic plan
+            # gate now expects. read must cite a real path under the project
+            # (src/todo_core.py exists in the demo repo) and plan must be
+            # non-empty, otherwise the gate rejects before the plan reviewer.
             plan = (
-                "READ:\n"
-                "- src/todo_core.py\n"
-                "- tests/test_todo_core.py\n"
-                "PLAN:\n"
-                "- trim whitespace in normalize_title\n"
-                "- reject empty titles after trim\n"
-                "RISKS:\n"
-                "- none (resource locked to src/)\n"
+                '{\n'
+                '  "read": ["src/todo_core.py", "tests/test_todo_core.py"],\n'
+                '  "plan": ["trim whitespace in normalize_title", "reject empty titles after trim"],\n'
+                '  "risks": ["none (resource locked to src/)"]\n'
+                '}\n'
                 "MMUX_PLAN PROCEED"
             )
             return cli.PlanResult("proceed", ".mmux/runs/demo-plan.log", plan, "", True)
@@ -257,6 +258,21 @@ def main() -> int:
                 print(f"  task #{tid} [{proposal_task.status}]: {proposal_task.title}")
                 evidence = proposal_task.payload.get("reflection_evidence") or "<none>"
                 print(f"           evidence: {evidence}")
+
+            # Guardrail: the demo is not part of the unittest suite, so assert
+            # the expected end state here. A pipeline change that breaks the
+            # happy path (e.g. a new gate the stubs do not satisfy) then makes
+            # `python scripts/demo_alpha.py` exit non-zero instead of silently
+            # printing a wrong trace.
+            if task is None or task.status != "completed":
+                raise SystemExit(
+                    f"demo regression: expected task status 'completed', got "
+                    f"{task.status if task else 'missing'}"
+                )
+            if not reflection.promoted_ids or not reflection.proposed_ids:
+                raise SystemExit(
+                    "demo regression: expected reflection to both promote and propose tasks"
+                )
         finally:
             cli.invoke_agent_adapter = original_driver
             cli.invoke_reviewer_adapter = original_reviewer
